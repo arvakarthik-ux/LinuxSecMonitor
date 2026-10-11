@@ -3,6 +3,7 @@
 import json
 import shutil
 import subprocess
+import threading
 
 import pytest
 
@@ -243,6 +244,28 @@ def test_debian_provider_hydrates_repeated_advisory_once_and_keeps_associations(
     assert fetched.records_by_package[first.name][0].record is fetched.records_by_package[second.name][0].record
 
 
+def test_debian_provider_uses_complete_query_record_without_hydration_request():
+    record = advisory()
+    requested_urls = []
+
+    def opener(request, timeout):
+        requested_urls.append(request.full_url)
+        return FakeResponse({"results": [{"vulns": [{"id": record["id"]}, record]}]})
+
+    messages = []
+    fetched = OSVDebianProvider(
+        opener=opener, diagnostic=messages.append
+    ).fetch_records([package()], "Debian:12")
+
+    assert fetched.error is None
+    assert requested_urls == [OSV_QUERY_BATCH_URL]
+    assert fetched.records_by_package["openssh-server"][0].record == record
+    assert any(
+        "requested=2, cached=1, newly_fetched=0, inline=1, unique_ids=1" in message
+        for message in messages
+    )
+
+
 def test_debian_provider_diagnostics_report_batch_hydration_and_periodic_progress():
     record = advisory()
     stubs = [{"id": record["id"]} for _ in range(101)]
@@ -262,12 +285,46 @@ def test_debian_provider_diagnostics_report_batch_hydration_and_periodic_progres
     assert any(message.startswith("OSV query preparation completed in") for message in messages)
     assert "OSV batch 1/1 started: 1 queries." in messages
     assert any(message.startswith("OSV batch 1/1 completed in") for message in messages)
-    assert any("Advisory hydration progress: 100/101 references" in message for message in messages)
+    assert any("Advisory hydration progress: 101/101 references" in message for message in messages)
     assert any(
         "Advisory hydration completed" in message
-        and "requested=101, cached=100, newly_fetched=1" in message
+        and "requested=101, cached=100, newly_fetched=1, inline=0, unique_ids=1" in message
         for message in messages
     )
+
+
+def test_debian_provider_hydration_uses_configured_bounded_concurrency():
+    advisory_ids = [f"DEBIAN-CVE-2024-{index}" for index in range(1, 5)]
+    active = 0
+    peak_active = 0
+    lock = threading.Lock()
+    simultaneous_requests = threading.Barrier(2)
+
+    def opener(request, timeout):
+        nonlocal active, peak_active
+        if request.full_url == OSV_QUERY_BATCH_URL:
+            return FakeResponse({"results": [{"vulns": [{"id": item} for item in advisory_ids]}]})
+
+        advisory_id = request.full_url.removeprefix(OSV_VULN_URL)
+        with lock:
+            active += 1
+            peak_active = max(peak_active, active)
+        try:
+            simultaneous_requests.wait(timeout=3)
+            record = advisory()
+            record["id"] = advisory_id
+            return FakeResponse(record)
+        finally:
+            with lock:
+                active -= 1
+
+    fetched = OSVDebianProvider(
+        opener=opener, max_hydration_workers=2
+    ).fetch_records([package()], "Debian:12")
+
+    assert fetched.error is None
+    assert peak_active == 2
+    assert [item.record["id"] for item in fetched.records_by_package["openssh-server"]] == advisory_ids
 
 
 def test_diagnostic_callback_failure_does_not_change_debian_assessment():
