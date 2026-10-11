@@ -211,6 +211,57 @@ def test_debian_provider_queries_source_ecosystem_and_hydrates_record():
     assert result.records_by_package["openssh-server"][0].record == record
 
 
+def test_debian_provider_hydrates_repeated_advisory_once_and_keeps_associations():
+    first = Package("openssh-server", "1.0", "openssh", "1.0")
+    second = Package("openssl", "2.0", "openssl", "2.0")
+    record = advisory(source="openssh")
+    record["affected"].append({
+        "package": {"name": "openssl", "ecosystem": "Debian:12"},
+        "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}]}],
+    })
+    get_requests = []
+
+    def opener(request, timeout):
+        if request.full_url == OSV_QUERY_BATCH_URL:
+            assert len(json.loads(request.data)["queries"]) == 2
+            return FakeResponse({"results": [
+                {"vulns": [{"id": record["id"]}, {"id": record["id"]}]},
+                {"vulns": [{"id": record["id"]}]},
+            ]})
+        get_requests.append(request.full_url)
+        assert request.full_url == OSV_VULN_URL + record["id"]
+        return FakeResponse(record)
+
+    fetched = OSVDebianProvider(opener=opener).fetch_records(
+        [first, second], "Debian:12"
+    )
+
+    assert fetched.error is None
+    assert get_requests == [OSV_VULN_URL + record["id"]]
+    assert [item.source_package for item in fetched.records_by_package[first.name]] == ["openssh"]
+    assert [item.source_package for item in fetched.records_by_package[second.name]] == ["openssl"]
+    assert fetched.records_by_package[first.name][0].record is fetched.records_by_package[second.name][0].record
+
+
+def test_debian_provider_timeout_becomes_an_error_assessment():
+    record_id = "DEBIAN-CVE-2024-6387"
+
+    def opener(request, timeout):
+        if request.full_url == OSV_QUERY_BATCH_URL:
+            return FakeResponse({"results": [{"vulns": [{"id": record_id}]}]})
+        raise TimeoutError("OSV request timed out")
+
+    report = assess_packages(
+        [package()], "Debian GNU/Linux 12", "12",
+        OSVDebianProvider(opener=opener),
+    )
+
+    assert report.assessment_status == "error"
+    assert report.error.startswith("Debian OSV data retrieval failed:")
+    assert "timed out" in report.error
+    assert all(item.assessment_status == "error" for item in report.packages)
+
+
 def test_debian_provider_reports_network_and_malformed_record_errors():
     def offline(*args, **kwargs):
         raise OSError("offline")
