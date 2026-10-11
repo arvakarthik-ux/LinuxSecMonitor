@@ -1,6 +1,6 @@
 # LinuxSecMonitor
 
-LinuxSecMonitor is a defensive Linux security monitoring project. Sprint 1 collects basic host information and an installed package inventory. It does **not** identify vulnerabilities or claim complete security coverage.
+LinuxSecMonitor is a defensive Linux security monitoring project. Sprint 1 collects basic host information and an installed package inventory. Sprint 2 adds an early, Ubuntu-only vulnerability assessment foundation. Neither sprint claims complete security coverage.
 
 ## Sprint 1 features
 
@@ -10,7 +10,7 @@ LinuxSecMonitor is a defensive Linux security monitoring project. Sprint 1 colle
 - Graceful scan errors with a distinct successful empty inventory.
 - A separate, conservative vulnerability assessment foundation with structured results.
 
-The package scanner supports Debian and Ubuntu only. It invokes `dpkg-query` with an argument list (no shell) and performs no package modifications or privileged actions.
+The package scanner supports Debian, Ubuntu, and Kali Linux. It invokes `dpkg-query` with an argument list (no shell) and performs no package modifications or privileged actions.
 
 ## Setup and usage
 
@@ -32,7 +32,7 @@ Package inventory requires Debian, Ubuntu, or Kali Linux and the `dpkg-query` co
 
 The assessment uses Ubuntu's official OSV records served through the OSV API for Ubuntu releases only. Ubuntu records include release-specific package status, fixed versions, binary package names, and available severity. The scanner resolves Ubuntu binary package names to their source package through OSV, then compares Debian-style package versions locally. It reports `vulnerable`, `fixed`, `no_known_match`, `requires_review`, `unsupported`, or `error`; `no_known_match` is not a claim that a package is safe.
 
-Kali is explicitly unsupported for automatic matching because Ubuntu advisory records are not authoritative for Kali packages. Debian is reported as requiring review in this task: Debian has its own advisory data, but the current inventory does not include reliable source-package metadata needed to map its binary packages to the source-oriented OSV records. Ubuntu Pro/ESM-specific status is not detected, and records lacking a usable fixed binary version are sent to review. The assessment uses network access and fails visibly on timeouts, network errors, or malformed API data. It never installs or changes packages.
+**Distribution support:** package inventory supports Kali, Ubuntu, and Debian. Automated vulnerability matching in this task supports Ubuntu releases with suitable release metadata only. Kali is explicitly unsupported because Ubuntu advisory records are not authoritative for Kali packages. Debian and other distributions are reported as requiring review: this implementation does not yet map their binary packages to a distribution-specific advisory source. Ubuntu Pro/ESM-specific status is not detected, and records lacking a usable fixed binary version are sent to review. The assessment uses network access and distinguishes retrieval errors from a successful query with no known matching records. No match does not establish that a package is safe. The assessment never installs or changes packages.
 
 ## Tests
 
@@ -41,6 +41,23 @@ python -m pytest
 ```
 
 Tests mock operating-system metadata and package-manager calls, so they can run on Windows without `dpkg-query`.
+
+### Optional live Ubuntu OSV check
+
+The normal suite remains offline; the live integration test is skipped unless explicitly enabled. It checks a documented Ubuntu OSV record for `bash` on Ubuntu 22.04 LTS and verifies its advisory ID, affected status, release, and Canonical source reference. OSV's query-batch API can return advisory stubs, so the provider retrieves full advisory records before matching.
+
+```powershell
+$env:LINUXSECMONITOR_LIVE_OSV = "1"
+python -m pytest -m live_osv tests/integration -v
+```
+
+On Linux or macOS:
+
+```bash
+LINUXSECMONITOR_LIVE_OSV=1 python -m pytest -m live_osv tests/integration -v
+```
+
+The live check requires network access to `api.osv.dev`; it is intentionally separate from the deterministic unit suite.
 
 ## Project layout
 
