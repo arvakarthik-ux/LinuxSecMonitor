@@ -163,6 +163,33 @@ def test_debian_empty_success_is_no_known_match_and_kali_stays_unsupported():
     assert kali.packages[0].assessment_status == "unsupported"
 
 
+def test_assessment_summary_counts_each_package_entry_once():
+    first = package()
+    second = Package("unknown-package", "1.0", "unknown-source", "1.0")
+    report = assess_packages(
+        [first, second], "Debian GNU/Linux 12", "12", FakeProvider()
+    ).to_dict()
+    assert report["summary"]["total_assessed_packages"] == 2
+    assert report["summary"]["status_counts"] == {"no_known_match": 2}
+    assert report["summary"]["no_known_match_is_safe"] is False
+    assert "not proof" in report["summary"]["no_known_match_note"]
+
+
+def test_assessment_summary_handles_empty_results_and_unsupported_kali():
+    empty = assess_packages([], "Debian GNU/Linux 12", "12", FakeProvider()).to_dict()
+    kali = assess_packages(
+        [package()], "Kali GNU/Linux Rolling", "2025.1", FakeProvider()
+    ).to_dict()
+    assert empty["summary"]["total_assessed_packages"] == 0
+    assert empty["summary"]["status_counts"] == {}
+    assert kali["summary"]["total_assessed_packages"] == 1
+    assert kali["summary"]["status_counts"] == {"unsupported": 1}
+    assert kali["distribution"] == "Kali GNU/Linux Rolling"
+    assert kali["release"] == "2025.1"
+    assert kali["source"] is None
+    assert "not authoritative for Kali" in kali["error"]
+
+
 def test_debian_provider_queries_source_ecosystem_and_hydrates_record():
     record = advisory()
     requested = []

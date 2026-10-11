@@ -5,6 +5,10 @@ from io import StringIO
 
 import main
 from scanner.package_scanner import Package, PackageScanResult
+from scanner.vulnerability_assessment import (
+    PackageAssessment,
+    VulnerabilityAssessmentReport,
+)
 
 
 def test_json_output_format(monkeypatch):
@@ -48,6 +52,127 @@ def test_text_includes_vulnerability_assessment_when_available():
     text = main._render_text(report)
     assert "Vulnerability assessment:" in text
     assert "Status: no_known_match" in text
+
+
+def test_text_reports_assessment_summary_and_context():
+    report = {
+        "system_info": {},
+        "package_scan": {"success": True, "error": None, "packages": []},
+        "vulnerability_assessment": {
+            "assessment_status": "mixed", "distribution": "Debian GNU/Linux 12",
+            "release": "12", "source": "Debian OSV via osv.dev", "error": None,
+            "explanation": "Assessment completed.",
+            "summary": {
+                "total_assessed_packages": 2,
+                "status_counts": {"fixed": 1, "no_known_match": 1},
+                "no_known_match_note": "no_known_match is not proof that a package is safe.",
+            },
+            "packages": [],
+        },
+    }
+    text = main._render_text(report)
+    assert "Distribution: Debian GNU/Linux 12" in text
+    assert "Release: 12" in text
+    assert "Source: Debian OSV via osv.dev" in text
+    assert "Total assessed package entries: 2" in text
+    assert "fixed: 1" in text
+    assert "no_known_match: 1" in text
+    assert "not proof that a package is safe" in text
+
+
+def test_serialized_assessment_summary_matches_terminal_counts():
+    assessment = VulnerabilityAssessmentReport(
+        assessment_status="vulnerable",
+        distribution="Debian GNU/Linux 12",
+        release="12",
+        source="Debian OSV via osv.dev",
+        error=None,
+        packages=[
+            PackageAssessment("openssl", "1.0", "vulnerable", "Affected", []),
+            PackageAssessment("bash", "2.0", "no_known_match", "No match", []),
+            PackageAssessment("curl", "3.0", "vulnerable", "Affected", []),
+        ],
+    ).to_dict()
+    result = {
+        "system_info": {},
+        "package_scan": {"success": True, "error": None, "packages": []},
+        "vulnerability_assessment": assessment,
+    }
+
+    serialized = json.loads(json.dumps(assessment))
+    text = main._render_text(result)
+
+    assert serialized["summary"]["total_assessed_packages"] == 3
+    assert serialized["summary"]["status_counts"] == {
+        "vulnerable": 2,
+        "no_known_match": 1,
+    }
+    assert "Status: vulnerable" in text
+    assert "Total assessed package entries: 3" in text
+    assert "vulnerable: 2" in text
+    assert "no_known_match: 1" in text
+
+
+def test_text_falls_back_to_empty_summary_for_unsupported_assessment():
+    report = {
+        "system_info": {},
+        "package_scan": {"success": True, "error": None, "packages": []},
+        "vulnerability_assessment": {
+            "assessment_status": "unsupported", "distribution": "Kali GNU/Linux Rolling",
+            "release": "2025.1", "source": None, "error": "Unsupported for Kali.",
+            "packages": [],
+        },
+    }
+    text = main._render_text(report)
+    assert "Status: unsupported" in text
+    assert "Distribution: Kali GNU/Linux Rolling" in text
+    assert "Details: Unsupported for Kali." in text
+    assert "Total assessed package entries: 0" in text
+    assert "Package assessment counts:\n    None" in text
+
+
+def test_text_derives_counts_for_legacy_report_without_summary():
+    report = {
+        "system_info": {},
+        "package_scan": {"success": True, "error": None, "packages": []},
+        "vulnerability_assessment": {
+            "assessment_status": "requires_review", "error": None,
+            "packages": [
+                {"package_name": "openssl", "assessment_status": "no_known_match", "findings": []},
+                {"package_name": "bash", "assessment_status": "requires_review", "findings": []},
+                {"package_name": "curl", "assessment_status": "no_known_match", "findings": []},
+            ],
+        },
+    }
+
+    text = main._render_text(report)
+
+    assert "Total assessed package entries: 3" in text
+    assert "no_known_match: 2" in text
+    assert "requires_review: 1" in text
+
+
+def test_build_result_preserves_package_inventory_failure_in_json(monkeypatch):
+    monkeypatch.setattr(
+        main, "collect_system_info", lambda: type("Info", (), {"to_dict": lambda self: {
+            "operating_system": "Linux", "distribution": "Debian GNU/Linux 12",
+            "distribution_version": "12",
+        }})(),
+    )
+    monkeypatch.setattr(
+        main, "scan_installed_packages",
+        lambda: PackageScanResult([], "dpkg-query failed: database unavailable"),
+    )
+
+    result = main.build_result()
+    serialized = json.loads(json.dumps(result))
+    assessment = serialized["vulnerability_assessment"]
+
+    assert serialized["package_scan"]["success"] is False
+    assert serialized["package_scan"]["error"] == "dpkg-query failed: database unavailable"
+    assert assessment["assessment_status"] == "error"
+    assert assessment["summary"]["total_assessed_packages"] == 0
+    assert assessment["summary"]["status_counts"] == {}
 
 
 def test_build_result_uses_internal_source_metadata_without_changing_inventory_json(monkeypatch):

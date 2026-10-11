@@ -34,6 +34,8 @@ Ubuntu matching uses Ubuntu OSV records served through the OSV API and is limite
 
 **Distribution support:** package inventory supports Kali, Ubuntu, and Debian. Automated vulnerability assessment supports Ubuntu with suitable release metadata and Debian with a numeric release plus provable source package/version metadata. Kali remains explicitly unsupported; Debian and Ubuntu advisories are not applied to Kali. Other distributions require review. Packages with legacy inventory rows, malformed source metadata, unsupported range events, withdrawn advisories, or conflicting version evidence require review. Debian OSV records may omit severity. Ubuntu Pro/ESM status is not detected. `no_known_match` means no matching record was found in the queried data; it does not mean a package is safe. The scanner is read-only, requires no root privileges, and never modifies packages.
 
+The JSON vulnerability assessment and terminal report include a package-entry total and counts grouped by the existing assessment status. Each assessed package entry is counted once. The summary preserves the detected distribution, release, data source, and any assessment error or limitation. A `no_known_match` result is explicitly not proof that a package is safe.
+
 ## Tests
 
 ```bash

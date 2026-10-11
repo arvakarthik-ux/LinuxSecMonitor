@@ -31,6 +31,15 @@ def build_result() -> dict[str, object]:
             "source": None,
             "error": "Vulnerability assessment was not run because package inventory failed.",
             "packages": [],
+            "summary": {
+                "total_assessed_packages": 0,
+                "status_counts": {},
+                "no_known_match_is_safe": False,
+                "no_known_match_note": (
+                    "no_known_match means no matching record was found in the queried data; "
+                    "it is not proof that a package is safe."
+                ),
+            },
         }
     return {
         "system_info": system_info,
@@ -67,12 +76,40 @@ def _render_text(result: dict[str, object]) -> str:
     if isinstance(assessment, dict):
         lines.append("Vulnerability assessment:")
         lines.append(f"  Status: {assessment.get('assessment_status', 'Unavailable')}")
+        if assessment.get("distribution"):
+            lines.append(f"  Distribution: {assessment['distribution']}")
+        if assessment.get("release"):
+            lines.append(f"  Release: {assessment['release']}")
+        if assessment.get("source"):
+            lines.append(f"  Source: {assessment['source']}")
         if assessment.get("error"):
             lines.append(f"  Details: {assessment['error']}")
         else:
             lines.append(f"  Details: {assessment.get('explanation', 'See per-package assessments in JSON output.')}")
-            assessed = assessment.get("packages", [])
-            if isinstance(assessed, list):
+        assessed = assessment.get("packages", [])
+        if isinstance(assessed, list):
+            summary = assessment.get("summary")
+            if isinstance(summary, dict):
+                total = summary.get("total_assessed_packages", len(assessed))
+                counts = summary.get("status_counts", {})
+            else:
+                total = len(assessed)
+                counts = {}
+                for item in assessed:
+                    if isinstance(item, dict):
+                        status = item.get("assessment_status", "unknown")
+                        counts[status] = counts.get(status, 0) + 1
+            lines.append(f"  Total assessed package entries: {total}")
+            if isinstance(counts, dict):
+                lines.append("  Package assessment counts:")
+                if counts:
+                    lines.extend(f"    {status}: {count}" for status, count in sorted(counts.items()))
+                else:
+                    lines.append("    None")
+            note = summary.get("no_known_match_note") if isinstance(summary, dict) else None
+            if note:
+                lines.append(f"  Note: {note}")
+            if not assessment.get("error"):
                 findings = [finding for item in assessed if isinstance(item, dict)
                             for finding in item.get("findings", []) if isinstance(finding, dict)]
                 for finding in findings[:10]:
