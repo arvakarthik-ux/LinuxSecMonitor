@@ -4,6 +4,7 @@ import json
 from io import StringIO
 
 import main
+from scanner.package_scanner import Package, PackageScanResult
 
 
 def test_json_output_format(monkeypatch):
@@ -47,3 +48,30 @@ def test_text_includes_vulnerability_assessment_when_available():
     text = main._render_text(report)
     assert "Vulnerability assessment:" in text
     assert "Status: no_known_match" in text
+
+
+def test_build_result_uses_internal_source_metadata_without_changing_inventory_json(monkeypatch):
+    package = Package("openssh-server", "1:9.2p1-2", "openssh", "1:9.2p1-2")
+    monkeypatch.setattr(
+        main, "collect_system_info", lambda: type("Info", (), {"to_dict": lambda self: {
+            "operating_system": "Linux", "distribution": "Debian 12", "distribution_version": "12",
+        }})(),
+    )
+    monkeypatch.setattr(main, "scan_installed_packages", lambda: PackageScanResult([package]))
+    received = {}
+
+    class Assessment:
+        def to_dict(self):
+            return {"assessment_status": "no_known_match", "packages": []}
+
+    def assess(packages, distribution, release):
+        received["package"] = packages[0]
+        return Assessment()
+
+    monkeypatch.setattr(main, "assess_packages", assess)
+    result = main.build_result()
+    assert received["package"].source_name == "openssh"
+    assert received["package"].source_version == "1:9.2p1-2"
+    assert result["package_scan"]["packages"] == [
+        {"name": "openssh-server", "version": "1:9.2p1-2"}
+    ]

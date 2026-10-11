@@ -1,11 +1,11 @@
 # LinuxSecMonitor
 
-LinuxSecMonitor is a defensive Linux security monitoring project. Sprint 1 collects basic host information and an installed package inventory. Sprint 2 adds an early, Ubuntu-only vulnerability assessment foundation. Neither sprint claims complete security coverage.
+LinuxSecMonitor is a defensive Linux security monitoring project. It collects basic host information and installed package inventory, with conservative advisory matching for Ubuntu and Debian. It does not claim complete security coverage.
 
 ## Sprint 1 features
 
 - Read-only system information from Python's `platform` module and Linux `/etc/os-release`.
-- Debian/Ubuntu package names and versions from `dpkg-query`.
+- Debian/Ubuntu/Kali package inventory from `dpkg-query`; Debian source metadata is retained internally for advisory matching.
 - Human-readable output or structured JSON on standard output / in a file.
 - Graceful scan errors with a distinct successful empty inventory.
 - A separate, conservative vulnerability assessment foundation with structured results.
@@ -28,11 +28,11 @@ python main.py --json --output scan.json
 
 Package inventory requires Debian, Ubuntu, or Kali Linux and the `dpkg-query` command. System information remains available on other operating systems, but the package scan reports that it is unsupported.
 
-## Vulnerability assessment (initial Sprint 2 foundation)
+## Vulnerability assessment
 
-The assessment uses Ubuntu's official OSV records served through the OSV API for Ubuntu releases only. Ubuntu records include release-specific package status, fixed versions, binary package names, and available severity. The scanner resolves Ubuntu binary package names to their source package through OSV, then compares Debian-style package versions locally. It reports `vulnerable`, `fixed`, `no_known_match`, `requires_review`, `unsupported`, or `error`; `no_known_match` is not a claim that a package is safe.
+Ubuntu matching uses Ubuntu OSV records served through the OSV API and is limited to releases with suitable metadata. Debian matching uses Debian ecosystem records from OSV, requires an exact Debian release and source package identity, compares the source version against supported OSV affected ranges, and preserves the matching Debian Security Tracker reference. OSV query results can be abbreviated records, so full records are retrieved before matching. Debian severity remains unset when the source does not provide a severity.
 
-**Distribution support:** package inventory supports Kali, Ubuntu, and Debian. Automated vulnerability matching in this task supports Ubuntu releases with suitable release metadata only. Kali is explicitly unsupported because Ubuntu advisory records are not authoritative for Kali packages. Debian and other distributions are reported as requiring review: this implementation does not yet map their binary packages to a distribution-specific advisory source. Ubuntu Pro/ESM-specific status is not detected, and records lacking a usable fixed binary version are sent to review. The assessment uses network access and distinguishes retrieval errors from a successful query with no known matching records. No match does not establish that a package is safe. The assessment never installs or changes packages.
+**Distribution support:** package inventory supports Kali, Ubuntu, and Debian. Automated vulnerability assessment supports Ubuntu with suitable release metadata and Debian with a numeric release plus provable source package/version metadata. Kali remains explicitly unsupported; Debian and Ubuntu advisories are not applied to Kali. Other distributions require review. Packages with legacy inventory rows, malformed source metadata, unsupported range events, withdrawn advisories, or conflicting version evidence require review. Debian OSV records may omit severity. Ubuntu Pro/ESM status is not detected. `no_known_match` means no matching record was found in the queried data; it does not mean a package is safe. The scanner is read-only, requires no root privileges, and never modifies packages.
 
 ## Tests
 
@@ -58,6 +58,21 @@ LINUXSECMONITOR_LIVE_OSV=1 python -m pytest -m live_osv tests/integration -v
 ```
 
 The live check requires network access to `api.osv.dev`; it is intentionally separate from the deterministic unit suite.
+
+### Optional live Debian OSV check
+
+The Debian integration test is also skipped unless explicitly enabled. It validates the Debian 12 `openssh` source package against the OSV record for CVE-2024-6387, including the fixed source version and Debian Security Tracker reference.
+
+```powershell
+$env:LINUXSECMONITOR_LIVE_DEBIAN_OSV = "1"
+python -m pytest -m live_debian_osv tests/integration -v
+```
+
+On Linux or macOS:
+
+```bash
+LINUXSECMONITOR_LIVE_DEBIAN_OSV=1 python -m pytest -m live_debian_osv tests/integration -v
+```
 
 ## Project layout
 

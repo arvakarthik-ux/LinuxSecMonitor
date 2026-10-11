@@ -9,18 +9,17 @@ from pathlib import Path
 from typing import TextIO
 
 from scanner import collect_system_info, scan_installed_packages
-from scanner.package_scanner import Package
 from scanner.vulnerability_assessment import assess_packages
 
 
 def build_result() -> dict[str, object]:
     """Collect system and package data in a JSON-ready result structure."""
     system_info = collect_system_info().to_dict()
-    package_scan = scan_installed_packages().to_dict()
-    if package_scan["success"]:
-        packages = [Package(item["name"], item["version"]) for item in package_scan["packages"]]
+    package_scan_result = scan_installed_packages()
+    package_scan = package_scan_result.to_dict()
+    if package_scan_result.success:
         vulnerability_assessment = assess_packages(
-            packages,
+            package_scan_result.packages,
             system_info.get("distribution"),
             system_info.get("distribution_version"),
         ).to_dict()

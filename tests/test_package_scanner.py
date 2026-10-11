@@ -12,6 +12,32 @@ def test_parse_dpkg_output():
     ]
 
 
+def test_parse_dpkg_source_metadata_and_policy_defined_fallback():
+    packages = scanner.parse_dpkg_output(
+        "libopenssh-server\t1:9.2p1-2+deb12u2\topenssh (1:9.2p1-2+deb12u2)\n"
+        "same-name\t2.0-1\t\n"
+        "legacy\t3.0-1\n"
+        "bad-source\t4.0-1\tinvalid source field!\n"
+    )
+    assert packages[0].source_name == "openssh"
+    assert packages[0].source_version == "1:9.2p1-2+deb12u2"
+    # An omitted Source field is defined by Debian Policy as same source and
+    # binary name/version; old two-column data does not establish that.
+    assert packages[1].source_name == "same-name"
+    assert packages[1].source_version == "2.0-1"
+    assert packages[2].source_name is None
+    assert packages[2].source_version is None
+    assert packages[3].source_name is None
+    assert packages[3].source_version is None
+
+
+def test_internal_source_metadata_does_not_change_package_inventory_schema():
+    result = scanner.PackageScanResult([
+        scanner.Package("binary", "1.0", "source", "1.0")
+    ])
+    assert result.to_dict()["packages"] == [{"name": "binary", "version": "1.0"}]
+
+
 def test_empty_output_is_successful_empty_inventory(monkeypatch):
     monkeypatch.setattr(scanner.platform, "system", lambda: "Linux")
     monkeypatch.setattr(scanner, "_os_release_ids", lambda: {"ubuntu"})
@@ -72,6 +98,7 @@ def test_supported_distributions_use_dpkg_query(monkeypatch):
         assert result.success
         assert result.packages == [scanner.Package("pkg", "1.0")]
         assert calls[0][0][0][0] == "dpkg-query"
+        assert calls[0][0][0][2] == "-f=${binary:Package}\\t${Version}\\t${Source}\\n"
 
 
 def test_id_like_does_not_make_unknown_distribution_supported(monkeypatch):
