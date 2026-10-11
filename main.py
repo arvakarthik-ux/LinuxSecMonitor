@@ -9,13 +9,34 @@ from pathlib import Path
 from typing import TextIO
 
 from scanner import collect_system_info, scan_installed_packages
+from scanner.package_scanner import Package
+from scanner.vulnerability_assessment import assess_packages
 
 
 def build_result() -> dict[str, object]:
     """Collect system and package data in a JSON-ready result structure."""
+    system_info = collect_system_info().to_dict()
+    package_scan = scan_installed_packages().to_dict()
+    if package_scan["success"]:
+        packages = [Package(item["name"], item["version"]) for item in package_scan["packages"]]
+        vulnerability_assessment = assess_packages(
+            packages,
+            system_info.get("distribution"),
+            system_info.get("distribution_version"),
+        ).to_dict()
+    else:
+        vulnerability_assessment = {
+            "assessment_status": "error",
+            "distribution": system_info.get("distribution"),
+            "release": system_info.get("distribution_version"),
+            "source": None,
+            "error": "Vulnerability assessment was not run because package inventory failed.",
+            "packages": [],
+        }
     return {
-        "system_info": collect_system_info().to_dict(),
-        "package_scan": scan_installed_packages().to_dict(),
+        "system_info": system_info,
+        "package_scan": package_scan,
+        "vulnerability_assessment": vulnerability_assessment,
     }
 
 
@@ -43,6 +64,26 @@ def _render_text(result: dict[str, object]) -> str:
             lines.append(f"  … and {len(packages) - 10} more")
     else:
         lines.append(f"  Scan failed: {package_scan['error']}")
+    assessment = result.get("vulnerability_assessment")
+    if isinstance(assessment, dict):
+        lines.append("Vulnerability assessment:")
+        lines.append(f"  Status: {assessment.get('assessment_status', 'Unavailable')}")
+        if assessment.get("error"):
+            lines.append(f"  Details: {assessment['error']}")
+        else:
+            lines.append(f"  Details: {assessment.get('explanation', 'See per-package assessments in JSON output.')}")
+            assessed = assessment.get("packages", [])
+            if isinstance(assessed, list):
+                findings = [finding for item in assessed if isinstance(item, dict)
+                            for finding in item.get("findings", []) if isinstance(finding, dict)]
+                for finding in findings[:10]:
+                    lines.append(
+                        f"  {finding.get('assessment_status', 'unknown')}: "
+                        f"{finding.get('advisory_id', 'advisory')} — "
+                        f"{finding.get('package_name', 'package')} {finding.get('installed_version', '')}"
+                    )
+                if len(findings) > 10:
+                    lines.append(f"  … and {len(findings) - 10} more findings")
     return "\n".join(lines)
 
 
