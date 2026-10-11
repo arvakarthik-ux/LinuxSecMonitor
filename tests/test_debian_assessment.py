@@ -243,6 +243,64 @@ def test_debian_provider_hydrates_repeated_advisory_once_and_keeps_associations(
     assert fetched.records_by_package[first.name][0].record is fetched.records_by_package[second.name][0].record
 
 
+def test_debian_provider_diagnostics_report_batch_hydration_and_periodic_progress():
+    record = advisory()
+    stubs = [{"id": record["id"]} for _ in range(101)]
+    messages = []
+
+    def opener(request, timeout):
+        if request.full_url == OSV_QUERY_BATCH_URL:
+            return FakeResponse({"results": [{"vulns": stubs}]})
+        return FakeResponse(record)
+
+    fetched = OSVDebianProvider(opener=opener, diagnostic=messages.append).fetch_records(
+        [package()], "Debian:12"
+    )
+
+    assert fetched.error is None
+    assert any("OSV query preparation started for 1 package entries" in message for message in messages)
+    assert any(message.startswith("OSV query preparation completed in") for message in messages)
+    assert "OSV batch 1/1 started: 1 queries." in messages
+    assert any(message.startswith("OSV batch 1/1 completed in") for message in messages)
+    assert any("Advisory hydration progress: 100/101 references" in message for message in messages)
+    assert any(
+        "Advisory hydration completed" in message
+        and "requested=101, cached=100, newly_fetched=1" in message
+        for message in messages
+    )
+
+
+def test_diagnostic_callback_failure_does_not_change_debian_assessment():
+    def broken_diagnostics(_message):
+        raise RuntimeError("diagnostic stream failure")
+
+    report = assess_packages(
+        [package()], "Debian GNU/Linux 12", "12", FakeProvider(),
+        diagnostic=broken_diagnostics,
+    )
+
+    assert report.assessment_status == "no_known_match"
+    assert report.packages[0].assessment_status == "no_known_match"
+
+
+def test_debian_matching_diagnostics_report_count_based_progress():
+    packages = [
+        Package(f"sample-{index}", "1.0", "sample-source", "1.0")
+        for index in range(101)
+    ]
+    messages = []
+
+    report = assess_packages(
+        packages, "Debian GNU/Linux 12", "12", FakeProvider(),
+        diagnostic=messages.append,
+    )
+
+    assert report.assessment_status == "no_known_match"
+    assert any("Vulnerability matching started for 101 package entries" in message for message in messages)
+    assert "Vulnerability matching progress: 100/101 package entries." in messages
+    assert any(message.startswith("Vulnerability matching completed in") for message in messages)
+
+
 def test_debian_provider_timeout_becomes_an_error_assessment():
     record_id = "DEBIAN-CVE-2024-6387"
 
@@ -251,15 +309,19 @@ def test_debian_provider_timeout_becomes_an_error_assessment():
             return FakeResponse({"results": [{"vulns": [{"id": record_id}]}]})
         raise TimeoutError("OSV request timed out")
 
+    messages = []
     report = assess_packages(
         [package()], "Debian GNU/Linux 12", "12",
-        OSVDebianProvider(opener=opener),
+        OSVDebianProvider(opener=opener, diagnostic=messages.append),
+        diagnostic=messages.append,
     )
 
     assert report.assessment_status == "error"
     assert report.error.startswith("Debian OSV data retrieval failed:")
     assert "timed out" in report.error
     assert all(item.assessment_status == "error" for item in report.packages)
+    assert any("OSV advisory hydration failed after" in message for message in messages)
+    assert any("matching skipped" in message.lower() for message in messages)
 
 
 def test_debian_provider_reports_network_and_malformed_record_errors():

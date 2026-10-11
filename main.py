@@ -6,23 +6,76 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import TextIO
+from time import perf_counter
+from typing import Callable, TextIO, TypeVar
 
 from scanner import collect_system_info, scan_installed_packages
 from scanner.vulnerability_assessment import assess_packages
 
+T = TypeVar("T")
+DiagnosticCallback = Callable[[str], None]
 
-def build_result() -> dict[str, object]:
+
+def _diagnose(callback: DiagnosticCallback | None, message: str) -> None:
+    """Send optional progress details through the caller's stderr callback."""
+    if callback is not None:
+        try:
+            callback(message)
+        except Exception:
+            # A closed diagnostic stream must not change a scan result.
+            pass
+
+
+def _run_timed_stage(
+    name: str, operation: Callable[[], T], diagnostic: DiagnosticCallback | None,
+) -> T:
+    """Run one operation with optional start, elapsed, and failure diagnostics."""
+    if diagnostic is None:
+        return operation()
+    started = perf_counter()
+    _diagnose(diagnostic, f"{name} started.")
+    try:
+        result = operation()
+    except Exception as exc:
+        _diagnose(
+            diagnostic,
+            f"{name} failed in {perf_counter() - started:.3f}s "
+            f"({type(exc).__name__}); see the raised exception for details.",
+        )
+        raise
+    _diagnose(diagnostic, f"{name} completed in {perf_counter() - started:.3f}s.")
+    return result
+
+
+def build_result(diagnostic: DiagnosticCallback | None = None) -> dict[str, object]:
     """Collect system and package data in a JSON-ready result structure."""
-    system_info = collect_system_info().to_dict()
-    package_scan_result = scan_installed_packages()
+    system = _run_timed_stage("System information collection", collect_system_info, diagnostic)
+    system_info = system.to_dict()
+    _diagnose(
+        diagnostic,
+        f"Detected distribution={system_info.get('distribution') or 'unknown'}, "
+        f"release={system_info.get('distribution_version') or 'unknown'}.",
+    )
+    package_scan_result = _run_timed_stage("Package inventory", scan_installed_packages, diagnostic)
     package_scan = package_scan_result.to_dict()
+    if diagnostic is not None:
+        _diagnose(
+            diagnostic,
+            f"Package inventory result: success={package_scan_result.success}, "
+            f"package_entries={len(package_scan_result.packages)}"
+            + ("; see the report for the scan error." if package_scan_result.error else "."),
+        )
     if package_scan_result.success:
-        vulnerability_assessment = assess_packages(
+        assessment_args = (
             package_scan_result.packages,
             system_info.get("distribution"),
             system_info.get("distribution_version"),
-        ).to_dict()
+        )
+        assessment = (
+            assess_packages(*assessment_args, diagnostic=diagnostic)
+            if diagnostic is not None else assess_packages(*assessment_args)
+        )
+        vulnerability_assessment = assessment.to_dict()
     else:
         vulnerability_assessment = {
             "assessment_status": "error",
@@ -128,23 +181,35 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
     parser = argparse.ArgumentParser(description="Collect basic Linux system and package inventory data.")
     parser.add_argument("--json", action="store_true", help="Emit structured JSON instead of a text report.")
     parser.add_argument("-o", "--output", type=Path, help="Write JSON to this file (requires --json).")
+    parser.add_argument(
+        "--diagnostics", action="store_true",
+        help="Write stage progress and elapsed times to stderr.",
+    )
     args = parser.parse_args(argv)
     if args.output and not args.json:
         parser.error("--output requires --json")
 
-    result = build_result()
+    diagnostic = None
+    if args.diagnostics:
+        diagnostic = lambda message: print(f"[diagnostic] {message}", file=sys.stderr)
+    result = build_result(diagnostic=diagnostic) if diagnostic else build_result()
     if args.json:
-        rendered = json.dumps(result, indent=2) + "\n"
+        rendered = _run_timed_stage(
+            "Report serialization", lambda: json.dumps(result, indent=2) + "\n", diagnostic
+        )
         if args.output:
             try:
-                args.output.write_text(rendered, encoding="utf-8")
+                _run_timed_stage(
+                    "Report writing", lambda: args.output.write_text(rendered, encoding="utf-8"), diagnostic
+                )
             except OSError as exc:
                 print(f"Could not write JSON output: {exc}", file=sys.stderr)
                 return 2
         else:
-            stdout.write(rendered)
+            _run_timed_stage("Report writing to stdout", lambda: stdout.write(rendered), diagnostic)
     else:
-        stdout.write(_render_text(result) + "\n")
+        rendered = _run_timed_stage("Text report rendering", lambda: _render_text(result) + "\n", diagnostic)
+        _run_timed_stage("Report writing to stdout", lambda: stdout.write(rendered), diagnostic)
     package_scan = result["package_scan"]
     return 0 if package_scan["success"] else 1  # type: ignore[index]
 

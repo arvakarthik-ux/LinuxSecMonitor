@@ -3,6 +3,8 @@
 import json
 from io import StringIO
 
+import pytest
+
 import main
 from scanner.package_scanner import Package, PackageScanResult
 from scanner.vulnerability_assessment import (
@@ -21,13 +23,65 @@ def test_json_output_format(monkeypatch):
     assert json.loads(output.getvalue())["package_scan"]["packages"][0]["name"] == "bash"
 
 
-def test_json_output_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(main, "build_result", lambda: {
+def test_json_output_file(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(main, "build_result", lambda diagnostic=None: {
         "system_info": {}, "package_scan": {"success": True, "error": None, "packages": []},
     })
     output_file = tmp_path / "scan.json"
-    assert main.main(["--json", "--output", str(output_file)], stdout=StringIO()) == 0
+    assert main.main(
+        ["--json", "--output", str(output_file), "--diagnostics"], stdout=StringIO()
+    ) == 0
     assert json.loads(output_file.read_text())["package_scan"]["success"] is True
+    stderr = capsys.readouterr().err
+    assert "[diagnostic] Report serialization completed in" in stderr
+    assert "[diagnostic] Report writing completed in" in stderr
+
+
+def test_diagnostics_stay_on_stderr_and_preserve_json_stdout(monkeypatch, capsys):
+    report = {
+        "system_info": {},
+        "package_scan": {"success": True, "error": None, "packages": []},
+        "vulnerability_assessment": {"assessment_status": "no_known_match", "packages": []},
+    }
+
+    def fake_build_result(diagnostic=None):
+        diagnostic("mock assessment stage completed in 0.001s.")
+        return report
+
+    monkeypatch.setattr(main, "build_result", fake_build_result)
+    stdout = StringIO()
+
+    assert main.main(["--json", "--diagnostics"], stdout=stdout) == 0
+
+    assert json.loads(stdout.getvalue()) == report
+    stderr = capsys.readouterr().err
+    assert "[diagnostic] mock assessment stage" in stderr
+    assert "[diagnostic] Report serialization completed in" in stderr
+    assert "[diagnostic] Report writing to stdout completed in" in stderr
+    assert "[diagnostic]" not in stdout.getvalue()
+
+
+def test_inventory_exception_is_diagnosed_and_propagated(monkeypatch):
+    monkeypatch.setattr(
+        main, "collect_system_info", lambda: type("Info", (), {"to_dict": lambda self: {
+            "distribution": "Debian GNU/Linux 12", "distribution_version": "12",
+        }})(),
+    )
+
+    def fail_inventory():
+        raise RuntimeError("mock dpkg-query exception")
+
+    monkeypatch.setattr(main, "scan_installed_packages", fail_inventory)
+    messages = []
+
+    with pytest.raises(RuntimeError, match="mock dpkg-query exception"):
+        main.build_result(diagnostic=messages.append)
+
+    assert any("Package inventory started" in message for message in messages)
+    assert any("Package inventory failed in" in message for message in messages)
+    assert any("RuntimeError" in message for message in messages)
+    assert any("System information collection started" in message for message in messages)
+    assert any("System information collection completed in" in message for message in messages)
 
 
 def test_text_reports_scan_failure(monkeypatch):
@@ -164,7 +218,8 @@ def test_build_result_preserves_package_inventory_failure_in_json(monkeypatch):
         lambda: PackageScanResult([], "dpkg-query failed: database unavailable"),
     )
 
-    result = main.build_result()
+    messages = []
+    result = main.build_result(diagnostic=messages.append)
     serialized = json.loads(json.dumps(result))
     assessment = serialized["vulnerability_assessment"]
 
@@ -173,6 +228,9 @@ def test_build_result_preserves_package_inventory_failure_in_json(monkeypatch):
     assert assessment["assessment_status"] == "error"
     assert assessment["summary"]["total_assessed_packages"] == 0
     assert assessment["summary"]["status_counts"] == {}
+    assert any("Package inventory result: success=False" in message for message in messages)
+    assert any("Package inventory started" in message for message in messages)
+    assert any("Package inventory completed in" in message for message in messages)
 
 
 def test_build_result_uses_internal_source_metadata_without_changing_inventory_json(monkeypatch):

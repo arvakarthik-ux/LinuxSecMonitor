@@ -24,6 +24,7 @@ python -m pip install -r requirements.txt
 python main.py
 python main.py --json
 python main.py --json --output scan.json
+python main.py --diagnostics --json --output scan.json
 ```
 
 Package inventory requires Debian, Ubuntu, or Kali Linux and the `dpkg-query` command. System information remains available on other operating systems, but the package scan reports that it is unsupported.
@@ -60,6 +61,16 @@ LINUXSECMONITOR_LIVE_OSV=1 python -m pytest -m live_osv tests/integration -v
 ```
 
 The live check requires network access to `api.osv.dev`; it is intentionally separate from the deterministic unit suite.
+
+### Scan diagnostics
+
+Pass `--diagnostics` to print stage progress and elapsed times to stderr while keeping report JSON unchanged and JSON stdout clean. Diagnostics include system information and package inventory, Debian OSV batch requests, advisory hydration counts (requested, cached, and newly fetched), vulnerability matching progress, and report serialization/writing. Package and advisory names are not included in progress messages.
+
+```bash
+python3 main.py --diagnostics --json --output debian-scan.json
+```
+
+Progress for longer loops is emitted every 100 package/advisory entries. Diagnostics are disabled unless requested.
 
 ### Optional live Debian OSV check
 
