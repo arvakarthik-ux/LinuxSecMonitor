@@ -82,11 +82,50 @@ def test_debian_confirmed_affected_source_version_has_traceable_reference():
     assert "source version" in finding.explanation
 
 
+def test_debian_tracker_reference_must_match_the_advisory_identity():
+    record = advisory()
+    record["references"] = [{
+        "type": "REPORT",
+        "url": f"{DEBIAN_TRACKER_URL}CVE-2024-0000",
+    }]
+
+    finding = assess(record).packages[0].findings[0]
+
+    # A wrong Tracker URL is ignored; a known Debian-CVE ID can be linked to
+    # its corresponding Tracker entry without trusting the unrelated URL.
+    assert finding.source_reference == f"{DEBIAN_TRACKER_URL}CVE-2024-6387"
+
+
 def test_debian_source_version_at_or_after_fixed_boundary_is_fixed():
     pkg = package("1:9.2p1-2+deb12u3")
     report = assess(advisory(), pkg)
     assert report.packages[0].assessment_status == "fixed"
     assert report.packages[0].findings[0].assessment_status == "fixed"
+
+
+@pytest.mark.parametrize(
+    ("source_version", "expected_status"),
+    [
+        ("1:9.2p1-2+deb12u3~rc1", "vulnerable"),
+        ("1:9.2p1-2+deb12u3", "fixed"),
+        ("1:9.2p1-2+deb12u3+b1", "fixed"),
+    ],
+)
+def test_debian_fixed_boundary_compares_revision_suffixes(source_version, expected_status):
+    report = assess(advisory(), package(source_version))
+    assert report.packages[0].assessment_status == expected_status
+    assert report.packages[0].findings[0].assessment_status == expected_status
+
+
+def test_explicit_debian_affected_version_is_vulnerable_without_ranges():
+    record = advisory()
+    record["affected"][0].pop("ranges")
+    record["affected"][0]["versions"] = ["1:9.2p1-2+deb12u2"]
+
+    finding = assess(record).packages[0].findings[0]
+
+    assert finding.assessment_status == "vulnerable"
+    assert finding.source_reference == f"{DEBIAN_TRACKER_URL}CVE-2024-6387"
 
 
 @pytest.mark.parametrize(
@@ -146,6 +185,32 @@ def test_explicit_affected_versions_conflicting_with_fixed_range_require_review(
     report = assess(record, pkg)
     assert report.packages[0].assessment_status == "requires_review"
     assert "conflicts" in report.packages[0].explanation
+
+
+def test_explicit_affected_version_conflicting_with_pre_introduction_range_requires_review():
+    record = advisory(ranges=[{"type": "ECOSYSTEM", "events": [
+        {"introduced": "2.0"}, {"fixed": "3.0"},
+    ]}])
+    record["affected"][0]["versions"] = ["1.0"]
+    pkg = Package("openssh-server", "1.0", "openssh", "1.0")
+
+    item = assess(record, pkg).packages[0]
+
+    assert item.assessment_status == "requires_review"
+    assert "conflicts" in item.explanation
+
+
+def test_explicit_affected_versions_use_debian_version_equivalence():
+    record = advisory(fixed="1.0")
+    record["affected"][0]["versions"] = ["1.0-0"]
+    pkg = Package("openssh-server", "1.0", "openssh", "1.0")
+
+    item = assess(record, pkg).packages[0]
+
+    # Debian treats a missing revision as revision zero. The explicit affected
+    # evidence therefore conflicts with a range whose fixed boundary is 1.0.
+    assert item.assessment_status == "requires_review"
+    assert "conflicts" in item.explanation
 
 
 def test_unsupported_range_event_requires_review():
@@ -242,6 +307,38 @@ def test_debian_provider_hydrates_repeated_advisory_once_and_keeps_associations(
     assert [item.source_package for item in fetched.records_by_package[first.name]] == ["openssh"]
     assert [item.source_package for item in fetched.records_by_package[second.name]] == ["openssl"]
     assert fetched.records_by_package[first.name][0].record is fetched.records_by_package[second.name][0].record
+
+
+def test_debian_findings_are_associated_with_binaries_sharing_a_source_package():
+    source_version = "1:2.48.1-1"
+    packages = [
+        Package("libwebkit2gtk-6.0-4", source_version, "webkit2gtk", source_version),
+        Package("webkit2gtk-driver", source_version, "webkit2gtk", source_version),
+    ]
+    record = advisory(
+        source="webkit2gtk", fixed="1:2.48.1-2",
+    )
+
+    def opener(request, timeout):
+        if request.full_url == OSV_QUERY_BATCH_URL:
+            queries = json.loads(request.data)["queries"]
+            assert len(queries) == 1
+            assert queries[0]["package"]["name"] == "webkit2gtk"
+            return FakeResponse({"results": [{"vulns": [{"id": record["id"]}]}]})
+        return FakeResponse(record)
+
+    report = assess_packages(
+        packages,
+        "Debian GNU/Linux 12",
+        "12",
+        OSVDebianProvider(opener=opener),
+    )
+
+    assert [item.assessment_status for item in report.packages] == ["vulnerable", "vulnerable"]
+    assert [item.findings[0].package_name for item in report.packages] == [
+        "libwebkit2gtk-6.0-4",
+        "webkit2gtk-driver",
+    ]
 
 
 def test_debian_provider_uses_complete_query_record_without_hydration_request():
