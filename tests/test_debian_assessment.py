@@ -1,14 +1,18 @@
 """Offline tests for conservative Debian OSV matching."""
 
+import hashlib
 import json
 import shutil
 import subprocess
 import threading
+import time
 
 import pytest
 
 from scanner.package_scanner import Package
+import scanner.vulnerability_assessment as vulnerability_assessment
 from scanner.vulnerability_assessment import (
+    DEFAULT_OSV_CACHE_TTL_SECONDS,
     DEBIAN_TRACKER_URL,
     OSV_QUERY_BATCH_URL,
     OSV_VULN_URL,
@@ -32,6 +36,13 @@ class FakeResponse:
 
     def read(self):
         return self.payload
+
+
+@pytest.fixture(autouse=True)
+def isolate_default_osv_cache(tmp_path, monkeypatch):
+    """Keep provider tests independent of a developer's persistent cache."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg-cache"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local-app-data"))
 
 
 class FakeProvider:
@@ -335,6 +346,210 @@ def test_debian_provider_queries_source_ecosystem_and_hydrates_record():
     assert result.error is None
     assert requested == [OSV_QUERY_BATCH_URL, OSV_VULN_URL + record["id"]]
     assert result.records_by_package["openssh-server"][0].record == record
+
+
+def test_debian_cache_miss_fetches_and_stores_valid_full_record(tmp_path):
+    record = advisory()
+    messages = []
+    requested = []
+
+    def opener(request, timeout):
+        requested.append(request.full_url)
+        if request.full_url == OSV_QUERY_BATCH_URL:
+            return FakeResponse({"results": [{"vulns": [{"id": record["id"]}]}]})
+        return FakeResponse(record)
+
+    provider = OSVDebianProvider(
+        opener=opener, cache_dir=tmp_path / "cache", diagnostic=messages.append
+    )
+    fetched = provider.fetch_records([package()], "Debian:12")
+
+    assert fetched.error is None
+    assert requested == [OSV_QUERY_BATCH_URL, OSV_VULN_URL + record["id"]]
+    cache_path = provider._cache.path_for(record["id"])
+    assert cache_path.name == hashlib.sha256(record["id"].encode("utf-8")).hexdigest() + ".json"
+    cached_entry = json.loads(cache_path.read_text())
+    assert cached_entry["record"] == record
+    assert any("hits=0, misses=1" in line and "writes=1" in line for line in messages)
+
+
+def test_debian_cache_ttl_defaults_to_one_day_and_is_configurable(tmp_path):
+    default_provider = OSVDebianProvider(cache_dir=tmp_path / "default")
+    configured_provider = OSVDebianProvider(
+        cache_dir=tmp_path / "custom", cache_ttl_seconds=90
+    )
+
+    assert default_provider._cache.ttl_seconds == 24 * 60 * 60
+    assert default_provider._cache.ttl_seconds == DEFAULT_OSV_CACHE_TTL_SECONDS
+    assert configured_provider._cache.ttl_seconds == 90
+
+
+def test_debian_cache_hit_skips_hydration_but_repeats_querybatch(tmp_path):
+    record = advisory()
+    requested = []
+    messages = []
+
+    def opener(request, timeout):
+        requested.append(request.full_url)
+        if request.full_url == OSV_QUERY_BATCH_URL:
+            return FakeResponse({"results": [{"vulns": [{"id": record["id"]}]}]})
+        return FakeResponse(record)
+
+    provider = OSVDebianProvider(
+        opener=opener, cache_dir=tmp_path / "cache", diagnostic=messages.append
+    )
+    first = provider.fetch_records([package()], "Debian:12")
+    messages.clear()
+    second = provider.fetch_records([package()], "Debian:12")
+
+    assert first.error is None and second.error is None
+    assert requested.count(OSV_QUERY_BATCH_URL) == 2
+    assert requested.count(OSV_VULN_URL + record["id"]) == 1
+    assert second.records_by_package["openssh-server"][0].record == record
+    assert any(
+        "OSV advisory cache: hits=1, misses=0, expired_or_invalid=0, writes=0" in line
+        for line in messages
+    )
+
+
+def test_debian_expired_cache_entry_is_refetched(tmp_path):
+    record = advisory()
+    requested_gets = []
+
+    def opener(request, timeout):
+        if request.full_url == OSV_QUERY_BATCH_URL:
+            return FakeResponse({"results": [{"vulns": [{"id": record["id"]}]}]})
+        requested_gets.append(request.full_url)
+        return FakeResponse(record)
+
+    cache_dir = tmp_path / "cache"
+    provider = OSVDebianProvider(opener=opener, cache_dir=cache_dir)
+    assert provider.fetch_records([package()], "Debian:12").error is None
+    cache_path = provider._cache.path_for(record["id"])
+    cached = json.loads(cache_path.read_text())
+    cached["cached_at"] = 1
+    cache_path.write_text(json.dumps(cached), encoding="utf-8")
+    messages = []
+    provider = OSVDebianProvider(
+        opener=opener, cache_dir=cache_dir, diagnostic=messages.append
+    )
+
+    refetched = provider.fetch_records([package()], "Debian:12")
+
+    assert refetched.error is None
+    assert len(requested_gets) == 2
+    assert any("expired_or_invalid=1" in line and "misses=1" in line for line in messages)
+
+
+@pytest.mark.parametrize("cached_content", [
+    "{malformed-json",
+    json.dumps({
+        "schema_version": 1,
+        "advisory_id": "DEBIAN-CVE-2024-6387",
+        "cached_at": time.time(),
+        "record": {"id": "DEBIAN-CVE-2024-6387", "affected": [{}]},
+    }),
+])
+def test_debian_malformed_or_invalid_cache_record_is_refetched(tmp_path, cached_content):
+    record = advisory()
+    provider = OSVDebianProvider(cache_dir=tmp_path / "cache")
+    cache_path = provider._cache.path_for(record["id"])
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text(cached_content, encoding="utf-8")
+    requested_gets = []
+    messages = []
+
+    def opener(request, timeout):
+        if request.full_url == OSV_QUERY_BATCH_URL:
+            return FakeResponse({"results": [{"vulns": [{"id": record["id"]}]}]})
+        requested_gets.append(request.full_url)
+        return FakeResponse(record)
+
+    provider = OSVDebianProvider(
+        opener=opener, cache_dir=cache_path.parent, diagnostic=messages.append
+    )
+    result = provider.fetch_records([package()], "Debian:12")
+
+    assert result.error is None
+    assert requested_gets == [OSV_VULN_URL + record["id"]]
+    assert any("expired_or_invalid=1" in line for line in messages)
+    assert json.loads(cache_path.read_text(encoding="utf-8"))["record"] == record
+
+
+def test_debian_cache_read_write_failures_fall_back_and_clean_temp_files(tmp_path, monkeypatch):
+    record = advisory()
+    cache_dir = tmp_path / "cache"
+    provider = OSVDebianProvider(cache_dir=cache_dir)
+    cache_path = provider._cache.path_for(record["id"])
+    cache_path.parent.mkdir(parents=True)
+    cache_path.mkdir()
+    messages = []
+    requested_gets = []
+
+    def fail_replace(source, target):
+        raise OSError("mock atomic replace failure")
+
+    monkeypatch.setattr(vulnerability_assessment.os, "replace", fail_replace)
+
+    def opener(request, timeout):
+        if request.full_url == OSV_QUERY_BATCH_URL:
+            return FakeResponse({"results": [{"vulns": [{"id": record["id"]}]}]})
+        requested_gets.append(request.full_url)
+        return FakeResponse(record)
+
+    provider = OSVDebianProvider(
+        opener=opener, cache_dir=cache_dir, diagnostic=messages.append
+    )
+    result = provider.fetch_records([package()], "Debian:12")
+
+    assert result.error is None
+    assert requested_gets == [OSV_VULN_URL + record["id"]]
+    assert any("read_failures=1" in line for line in messages)
+    assert any("write_failures=1" in line for line in messages)
+    assert not list(cache_dir.glob("*.tmp"))
+    assert not list(cache_dir.glob(".*.tmp"))
+
+
+def test_debian_network_failure_is_not_cached(tmp_path):
+    record_id = "DEBIAN-CVE-2024-6387"
+
+    def opener(request, timeout):
+        if request.full_url == OSV_QUERY_BATCH_URL:
+            return FakeResponse({"results": [{"vulns": [{"id": record_id}]}]})
+        raise OSError("mock network unavailable")
+
+    provider = OSVDebianProvider(opener=opener, cache_dir=tmp_path / "cache")
+    result = provider.fetch_records([package()], "Debian:12")
+
+    assert result.error.startswith("Debian OSV data retrieval failed:")
+    assert not provider._cache.path_for(record_id).exists()
+
+
+def test_cached_and_uncached_assessment_results_are_identical(tmp_path):
+    record = advisory()
+    requested_gets = []
+
+    def opener(request, timeout):
+        if request.full_url == OSV_QUERY_BATCH_URL:
+            return FakeResponse({"results": [{"vulns": [{"id": record["id"]}]}]})
+        requested_gets.append(request.full_url)
+        return FakeResponse(record)
+
+    cache_dir = tmp_path / "cache"
+    first = assess_packages(
+        [package()], "Debian GNU/Linux 12", "12",
+        OSVDebianProvider(opener=opener, cache_dir=cache_dir),
+    ).to_dict()
+    second = assess_packages(
+        [package()], "Debian GNU/Linux 12", "12",
+        OSVDebianProvider(opener=opener, cache_dir=cache_dir),
+    ).to_dict()
+
+    assert first["assessment_status"] == second["assessment_status"] == "vulnerable"
+    assert first["packages"] == second["packages"]
+    assert first["packages"][0]["findings"][0]["severity"] is None
+    assert first["packages"][0]["findings"][0]["urgency"] == "not yet assigned"
+    assert len(requested_gets) == 1
 
 
 def test_debian_provider_hydrates_repeated_advisory_once_and_keeps_associations():

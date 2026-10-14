@@ -33,6 +33,8 @@ Package inventory requires Debian, Ubuntu, or Kali Linux and the `dpkg-query` co
 
 Ubuntu matching uses Ubuntu OSV records served through the OSV API and is limited to releases with suitable metadata. Debian matching uses Debian ecosystem records from OSV, requires an exact Debian release and source package identity, compares the source version against supported OSV affected ranges, and preserves the matching Debian Security Tracker reference. OSV query results can be abbreviated records, so full records are retrieved before matching. Debian severity remains unset when the source does not provide a severity.
 
+The Debian provider caches validated full OSV advisory records for 24 hours. Querybatch still runs on every scan; only full records fetched or returned inline are cached. Linux uses `$XDG_CACHE_HOME/linuxsecmonitor/osv`, falling back to `~/.cache/linuxsecmonitor/osv`; Windows uses `%LOCALAPPDATA%\LinuxSecMonitor\osv` when available. The cache is keyed by a SHA-256 digest of the advisory ID and can be configured in code through `OSVDebianProvider(cache_dir=..., cache_ttl_seconds=...)`. Unavailable, expired, or invalid cache entries are fetched again; cache read/write failures do not change scan results.
+
 **Distribution support:** package inventory supports Kali, Ubuntu, and Debian. Automated vulnerability assessment supports Ubuntu with suitable release metadata and Debian with a numeric release plus provable source package/version metadata. Kali remains explicitly unsupported; Debian and Ubuntu advisories are not applied to Kali. Other distributions require review. Packages with legacy inventory rows, malformed source metadata, unsupported range events, withdrawn advisories, or conflicting version evidence require review. Debian OSV records may omit severity. Ubuntu Pro/ESM status is not detected. `no_known_match` means no matching record was found in the queried data; it does not mean a package is safe. The scanner is read-only, requires no root privileges, and never modifies packages.
 
 The JSON vulnerability assessment and terminal report include a package-entry total and counts grouped by the existing assessment status. Each assessed package entry is counted once. The summary preserves the detected distribution, release, data source, and any assessment error or limitation. A `no_known_match` result is explicitly not proof that a package is safe.
@@ -66,7 +68,7 @@ The live check requires network access to `api.osv.dev`; it is intentionally sep
 
 ### Scan diagnostics
 
-Pass `--diagnostics` to print stage progress and elapsed times to stderr while keeping report JSON unchanged and JSON stdout clean. Diagnostics include system information and package inventory, Debian OSV batch requests, advisory hydration counts (requested, cached, and newly fetched), vulnerability matching progress, and report serialization/writing. Package and advisory names are not included in progress messages.
+Pass `--diagnostics` to print stage progress and elapsed times to stderr while keeping report JSON unchanged and JSON stdout clean. Diagnostics include system information and package inventory, Debian OSV batch requests, advisory hydration counts (requested, cached, and newly fetched), persistent advisory-cache hit/miss/expiry/write/failure counts, vulnerability matching progress, and report serialization/writing. Package and advisory names are not included in progress messages.
 
 ```bash
 python3 main.py --diagnostics --json --output debian-scan.json
