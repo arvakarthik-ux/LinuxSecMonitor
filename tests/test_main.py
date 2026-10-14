@@ -134,6 +134,76 @@ def test_text_reports_assessment_summary_and_context():
     assert "not proof that a package is safe" in text
 
 
+def test_text_renders_advisory_context_and_truncates_long_details():
+    long_details = "Security advisory details. " * 30
+    report = {
+        "system_info": {},
+        "package_scan": {"success": True, "error": None, "packages": []},
+        "vulnerability_assessment": {
+            "assessment_status": "vulnerable", "error": None,
+            "advisory_context": {"DEBIAN-CVE-2024-6387": {
+                "summary": "OpenSSH issue summary",
+                "details": long_details,
+                "references": [{"type": "REPORT", "url": "https://example.test/advisory"}],
+            }},
+            "packages": [{"assessment_status": "vulnerable", "findings": [{
+                "advisory_id": "DEBIAN-CVE-2024-6387", "package_name": "openssh-server",
+                "installed_version": "1", "severity": None,
+                "assessment_status": "vulnerable", "urgency": "high",
+            }]}],
+        },
+    }
+
+    text = main._render_text(report)
+
+    assert "Summary: OpenSSH issue summary" in text
+    assert "Debian urgency: high" in text
+    assert "Advisory reference: https://example.test/advisory" in text
+    detail_line = next(line for line in text.splitlines() if "    Details:" in line)
+    rendered_details = detail_line.removeprefix("    Details: ")
+    assert len(rendered_details) <= main.DETAILS_PREVIEW_LIMIT
+    assert rendered_details.endswith("…")
+
+
+def test_text_omits_missing_advisory_context_fields_without_error():
+    report = {
+        "system_info": {},
+        "package_scan": {"success": True, "error": None, "packages": []},
+        "vulnerability_assessment": {
+            "assessment_status": "vulnerable", "error": None,
+            "advisory_context": {"CVE-2024-0001": {"references": [None, {}]}},
+            "packages": [{"findings": [{
+                "advisory_id": "CVE-2024-0001", "assessment_status": "vulnerable",
+            }]}],
+        },
+    }
+
+    text = main._render_text(report)
+
+    assert "CVE-2024-0001" in text
+    assert "Summary:" not in text
+    assert "    Details:" not in text
+    assert "Advisory reference:" not in text
+
+
+def test_text_renders_legacy_findings_without_advisory_context():
+    report = {
+        "system_info": {},
+        "package_scan": {"success": True, "error": None, "packages": []},
+        "vulnerability_assessment": {
+            "assessment_status": "vulnerable", "error": None,
+            "packages": [{"findings": [{
+                "advisory_id": "CVE-2024-0001", "package_name": "bash",
+                "installed_version": "5.0", "assessment_status": "vulnerable",
+            }]}],
+        },
+    }
+
+    text = main._render_text(report)
+
+    assert "vulnerable: CVE-2024-0001 — bash 5.0" in text
+
+
 def test_serialized_assessment_summary_matches_terminal_counts():
     assessment = VulnerabilityAssessmentReport(
         assessment_status="vulnerable",

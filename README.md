@@ -37,6 +37,8 @@ Ubuntu matching uses Ubuntu OSV records served through the OSV API and is limite
 
 The JSON vulnerability assessment and terminal report include a package-entry total and counts grouped by the existing assessment status. Each assessed package entry is counted once. The summary preserves the detected distribution, release, data source, and any assessment error or limitation. A `no_known_match` result is explicitly not proof that a package is safe.
 
+Assessment JSON also includes an additive `advisory_context` map keyed by OSV advisory ID. When OSV provides them, entries include the advisory `summary`, `details`, and validated HTTP(S) `references`; repeated advisory IDs share one context entry. Debian findings may include `urgency` only when it is present on the matching OSV affected entry for the detected Debian release and source package. Urgency is separate from severity and does not affect matching or assessment status. These fields come from the OSV record. Debian Security Tracker notes are not fetched during normal scans; the report retains the Tracker reference for traceability, but does not retrieve the Tracker page content.
+
 ## Tests
 
 ```bash

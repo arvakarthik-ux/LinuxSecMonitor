@@ -14,6 +14,7 @@ from scanner.vulnerability_assessment import assess_packages
 
 T = TypeVar("T")
 DiagnosticCallback = Callable[[str], None]
+DETAILS_PREVIEW_LIMIT = 240
 
 
 def _diagnose(callback: DiagnosticCallback | None, message: str) -> None:
@@ -84,6 +85,7 @@ def build_result(diagnostic: DiagnosticCallback | None = None) -> dict[str, obje
             "source": None,
             "error": "Vulnerability assessment was not run because package inventory failed.",
             "packages": [],
+            "advisory_context": {},
             "summary": {
                 "total_assessed_packages": 0,
                 "status_counts": {},
@@ -165,12 +167,40 @@ def _render_text(result: dict[str, object]) -> str:
             if not assessment.get("error"):
                 findings = [finding for item in assessed if isinstance(item, dict)
                             for finding in item.get("findings", []) if isinstance(finding, dict)]
+                advisory_context = assessment.get("advisory_context", {})
+                if not isinstance(advisory_context, dict):
+                    advisory_context = {}
+                rendered_context_ids: set[str] = set()
                 for finding in findings[:10]:
                     lines.append(
                         f"  {finding.get('assessment_status', 'unknown')}: "
                         f"{finding.get('advisory_id', 'advisory')} — "
                         f"{finding.get('package_name', 'package')} {finding.get('installed_version', '')}"
                     )
+                    urgency = finding.get("urgency")
+                    if isinstance(urgency, str) and urgency.strip():
+                        lines.append(f"    Debian urgency: {urgency.strip()}")
+                    advisory_id = finding.get("advisory_id")
+                    context = advisory_context.get(advisory_id) if isinstance(advisory_id, str) else None
+                    if isinstance(context, dict) and advisory_id not in rendered_context_ids:
+                        rendered_context_ids.add(advisory_id)
+                        summary = context.get("summary")
+                        if isinstance(summary, str) and summary.strip():
+                            lines.append(f"    Summary: {summary.strip()}")
+                        details = context.get("details")
+                        if isinstance(details, str) and details.strip():
+                            concise_details = " ".join(details.split())
+                            if len(concise_details) > DETAILS_PREVIEW_LIMIT:
+                                concise_details = concise_details[:DETAILS_PREVIEW_LIMIT - 1].rstrip() + "…"
+                            lines.append(f"    Details: {concise_details}")
+                        references = context.get("references")
+                        if isinstance(references, list):
+                            first_reference = next((ref for ref in references
+                                                    if isinstance(ref, dict)
+                                                    and isinstance(ref.get("url"), str)
+                                                    and ref["url"].strip()), None)
+                            if first_reference:
+                                lines.append(f"    Advisory reference: {first_reference['url'].strip()}")
                 if len(findings) > 10:
                     lines.append(f"  … and {len(findings) - 10} more findings")
     return "\n".join(lines)

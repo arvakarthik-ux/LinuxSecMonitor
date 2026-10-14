@@ -51,12 +51,12 @@ def advisory(*, ecosystem="Debian:12", source="openssh", fixed="1:9.2p1-2+deb12u
         "ranges": ranges or [{"type": "ECOSYSTEM", "events": [
             {"introduced": "0"}, {"fixed": fixed},
         ]}],
+        "ecosystem_specific": {"urgency": "not yet assigned"},
     }
     return {
         "id": "DEBIAN-CVE-2024-6387",
         "affected": [affected_entry],
         "references": [{"type": "REPORT", "url": f"{DEBIAN_TRACKER_URL}CVE-2024-6387"}],
-        "ecosystem_specific": {"urgency": "not yet assigned"},
     }
 
 
@@ -79,7 +79,67 @@ def test_debian_confirmed_affected_source_version_has_traceable_reference():
     assert finding.advisory_id == "DEBIAN-CVE-2024-6387"
     assert finding.source_reference == f"{DEBIAN_TRACKER_URL}CVE-2024-6387"
     assert finding.severity is None
+    assert finding.urgency == "not yet assigned"
     assert "source version" in finding.explanation
+
+
+def test_debian_urgency_uses_matching_release_and_source_without_changing_status_or_severity():
+    record = advisory()
+    record["affected"].insert(0, {
+        "package": {"name": "openssh", "ecosystem": "Debian:11"},
+        "ecosystem_specific": {"urgency": "critical"},
+        "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}]}],
+    })
+    record["affected"].append({
+        "package": {"name": "other-source", "ecosystem": "Debian:12"},
+        "ecosystem_specific": {"urgency": "high"},
+    })
+
+    report = assess(record)
+    finding = report.packages[0].findings[0]
+
+    assert finding.urgency == "not yet assigned"
+    assert finding.severity is None
+    assert finding.assessment_status == "vulnerable"
+    assert report.packages[0].assessment_status == "vulnerable"
+
+
+def test_debian_advisory_context_omits_missing_metadata_and_invalid_references():
+    record = advisory()
+    record.pop("summary", None)
+    record.pop("details", None)
+    record["references"] = [
+        {"type": "REPORT", "url": "javascript:alert(1)"},
+        {"type": "WEB", "url": "https://[malformed"},
+        {"url": 42},
+    ]
+    record["affected"][0].pop("ecosystem_specific")
+
+    serialized = assess(record).to_dict()
+    finding = serialized["packages"][0]["findings"][0]
+
+    assert record["id"] not in serialized["advisory_context"]
+    assert "urgency" not in finding
+
+
+def test_repeated_advisory_id_has_one_advisory_context_entry():
+    record = advisory()
+    record["summary"] = "OpenSSH advisory summary"
+    record["details"] = "Advisory details from OSV."
+    first = package()
+    second = Package("openssh-client", first.version, first.source_name, first.source_version)
+    report = assess_packages(
+        [first, second], "Debian GNU/Linux 12", "12",
+        FakeProvider({first.name: [SourceRecord("openssh", record)],
+                      second.name: [SourceRecord("openssh", record)]}),
+    ).to_dict()
+
+    assert list(report["advisory_context"]) == [record["id"]]
+    assert report["advisory_context"][record["id"]]["summary"] == "OpenSSH advisory summary"
+    assert report["advisory_context"][record["id"]]["details"] == "Advisory details from OSV."
+    assert report["advisory_context"][record["id"]]["references"] == [
+        {"url": f"{DEBIAN_TRACKER_URL}CVE-2024-6387", "type": "REPORT"}
+    ]
 
 
 def test_debian_tracker_reference_must_match_the_advisory_identity():
