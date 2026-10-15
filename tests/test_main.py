@@ -200,6 +200,54 @@ def test_text_reports_scan_failure(monkeypatch):
     assert main.main([], stdout=output) == 1
     assert "Operating system: Unavailable" in output.getvalue()
     assert "Scan failed: unsupported" in output.getvalue()
+    assert "Partial inventory:" not in output.getvalue()
+
+
+def test_text_reports_retained_packages_as_partial_inventory():
+    packages = [
+        {"name": f"package-{index:02d}", "version": f"{index}.0"}
+        for index in range(1, 13)
+    ]
+    report = {
+        "system_info": {},
+        "package_scan": {
+            "success": False,
+            "error": "dpkg-query returned 1 malformed package identity row; the inventory may be incomplete.",
+            "packages": packages,
+        },
+    }
+
+    text = main._render_text(report)
+
+    assert "Scan failed: dpkg-query returned 1 malformed package identity row" in text
+    assert "Partial inventory: 12 package(s) retained; this is not a complete inventory." in text
+    for package in packages[:10]:
+        assert f"  {package['name']} {package['version']}" in text
+    assert "  package-11 11.0" not in text
+    assert "  package-12 12.0" not in text
+    assert "… and 2 more" in text
+
+
+def test_successful_inventory_text_format_is_unchanged():
+    report = {
+        "system_info": {},
+        "package_scan": {
+            "success": True,
+            "error": None,
+            "packages": [
+                {"name": "bash", "version": "5.2-2"},
+                {"name": "libc6", "version": "2.36-9"},
+            ],
+        },
+    }
+
+    text = main._render_text(report)
+
+    assert "Total packages found: 2" in text
+    assert "  bash 5.2-2" in text
+    assert "  libc6 2.36-9" in text
+    assert "Partial inventory:" not in text
+    assert "Scan failed:" not in text
 
 
 def test_text_includes_vulnerability_assessment_when_available():

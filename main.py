@@ -127,6 +127,14 @@ def _render_text(result: dict[str, object]) -> str:
             lines.append(f"  … and {len(packages) - 10} more")
     else:
         lines.append(f"  Scan failed: {package_scan['error']}")
+        if packages:
+            lines.append(
+                f"  Partial inventory: {len(packages)} package(s) retained; "
+                "this is not a complete inventory."
+            )
+            lines.extend(f"  {p['name']} {p['version']}" for p in packages[:10])
+            if len(packages) > 10:
+                lines.append(f"  … and {len(packages) - 10} more")
     assessment = result.get("vulnerability_assessment")
     if isinstance(assessment, dict):
         lines.append("Vulnerability assessment:")
