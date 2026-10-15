@@ -58,21 +58,24 @@ def _os_release_ids(path: Path = Path("/etc/os-release")) -> set[str]:
     return {distro_id} if distro_id else set()
 
 
-def parse_dpkg_output(output: str) -> list[Package]:
-    """Parse dpkg-query output, including optional source-package metadata.
+def _parse_dpkg_output(output: str) -> tuple[list[Package], int]:
+    """Parse packages and count nonblank rows with invalid identity fields.
 
     Debian Policy permits the ``Source`` field to be omitted when source and
     binary package names and versions are identical. A present source name
     without a parenthesized version likewise means the versions are identical.
     Legacy two-column rows do not prove that relationship, so leave their
-    source fields unset.
+    source fields unset. Malformed source metadata does not invalidate an
+    otherwise usable binary package identity.
     """
     packages: list[Package] = []
+    malformed_identity_rows = 0
     for line in output.splitlines():
         if not line.strip():
             continue
         fields = line.split("\t")
         if len(fields) < 2 or not fields[0].strip() or not fields[1].strip():
+            malformed_identity_rows += 1
             continue
         name, version = fields[0].strip(), fields[1].strip()
         source_name = source_version = None
@@ -91,6 +94,12 @@ def parse_dpkg_output(output: str) -> list[Package]:
                     # differs; otherwise Debian Policy guarantees equality.
                     source_version = source_match.group(2) or version
         packages.append(Package(name, version, source_name, source_version))
+    return packages, malformed_identity_rows
+
+
+def parse_dpkg_output(output: str) -> list[Package]:
+    """Parse dpkg-query output into packages, preserving the public API."""
+    packages, _ = _parse_dpkg_output(output)
     return packages
 
 
@@ -121,4 +130,12 @@ def scan_installed_packages() -> PackageScanResult:
         return PackageScanResult([], f"dpkg-query failed{': ' + detail if detail else '.'}")
     except OSError as exc:
         return PackageScanResult([], f"Could not run dpkg-query: {exc}")
-    return PackageScanResult(parse_dpkg_output(completed.stdout))
+    packages, malformed_identity_rows = _parse_dpkg_output(completed.stdout)
+    if malformed_identity_rows:
+        return PackageScanResult(
+            packages,
+            f"dpkg-query returned {malformed_identity_rows} malformed package "
+            f"identity {'row' if malformed_identity_rows == 1 else 'rows'}; "
+            "the inventory may be incomplete.",
+        )
+    return PackageScanResult(packages)

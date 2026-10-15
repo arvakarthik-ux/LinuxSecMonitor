@@ -3,6 +3,8 @@
 import subprocess
 from types import SimpleNamespace
 
+import pytest
+
 from scanner import package_scanner as scanner
 
 
@@ -10,6 +12,21 @@ def test_parse_dpkg_output():
     assert scanner.parse_dpkg_output("bash\t5.2-2\nlibc6:amd64\t2.36-9\n\n") == [
         scanner.Package("bash", "5.2-2"), scanner.Package("libc6:amd64", "2.36-9")
     ]
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "\t1.0",  # Missing package name.
+        "package\t",  # Missing package version.
+        "package-only",  # Too few fields to contain both identity values.
+    ],
+)
+def test_parse_dpkg_output_counts_malformed_identity_rows(row):
+    packages, malformed_rows = scanner._parse_dpkg_output(row)
+
+    assert packages == []
+    assert malformed_rows == 1
 
 
 def test_parse_dpkg_source_metadata_and_policy_defined_fallback():
@@ -45,6 +62,43 @@ def test_empty_output_is_successful_empty_inventory(monkeypatch):
     result = scanner.scan_installed_packages()
     assert result.success
     assert result.packages == []
+
+
+def test_malformed_identity_rows_fail_scan_but_keep_valid_packages(monkeypatch):
+    monkeypatch.setattr(scanner.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(scanner, "_os_release_ids", lambda: {"debian"})
+    output = "valid-package\t1.0\n\t2.0\nmissing-version\t\npackage-only\n"
+    monkeypatch.setattr(
+        scanner.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout=output),
+    )
+
+    result = scanner.scan_installed_packages()
+
+    assert not result.success
+    assert result.packages == [scanner.Package("valid-package", "1.0")]
+    assert "3 malformed package identity rows" in result.error
+    assert "inventory may be incomplete" in result.error
+
+
+def test_malformed_source_metadata_does_not_fail_package_scan(monkeypatch):
+    monkeypatch.setattr(scanner.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(scanner, "_os_release_ids", lambda: {"debian"})
+    monkeypatch.setattr(
+        scanner.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            stdout="binary-package\t1.0\tinvalid source field!\n"
+        ),
+    )
+
+    result = scanner.scan_installed_packages()
+
+    assert result.success
+    assert result.packages == [
+        scanner.Package("binary-package", "1.0", None, None)
+    ]
 
 
 def test_unsupported_system_does_not_run_command(monkeypatch):
