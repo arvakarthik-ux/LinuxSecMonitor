@@ -19,6 +19,7 @@ from scanner.vulnerability_assessment import (
     OSVDebianProvider,
     ProviderResult,
     SourceRecord,
+    _debian_range_status,
     _debian_version_compare,
     assess_packages,
 )
@@ -188,6 +189,28 @@ def test_debian_fixed_boundary_compares_revision_suffixes(source_version, expect
     assert report.packages[0].findings[0].assessment_status == expected_status
 
 
+@pytest.mark.parametrize("invalid_version", ["banana", "1.0-", "1:", "abc:1.0"])
+def test_debian_version_comparator_rejects_malformed_syntax(invalid_version):
+    with pytest.raises(ValueError):
+        _debian_version_compare(invalid_version, "1.0-1")
+
+
+@pytest.mark.parametrize("invalid_version", ["banana", "1.0-", "1:"])
+def test_debian_invalid_installed_source_version_requires_review(invalid_version):
+    report = assess(advisory(), package(invalid_version))
+
+    assert report.packages[0].assessment_status == "requires_review"
+    assert report.packages[0].findings == []
+
+
+@pytest.mark.parametrize("invalid_boundary", ["banana", "1.0-", "1:"])
+def test_debian_malformed_range_boundary_requires_review(invalid_boundary):
+    report = assess(advisory(fixed=invalid_boundary))
+
+    assert report.packages[0].assessment_status == "requires_review"
+    assert report.packages[0].findings == []
+
+
 def test_explicit_debian_affected_version_is_vulnerable_without_ranges():
     record = advisory()
     record["affected"][0].pop("ranges")
@@ -302,6 +325,48 @@ def test_malformed_debian_range_structure_requires_review(malformed_ranges):
 
     assert item.assessment_status == "requires_review"
     assert item.findings == []
+
+
+def test_debian_range_validates_unsupported_event_after_earlier_affected_match():
+    record = advisory(ranges=[{"type": "ECOSYSTEM", "events": [
+        {"introduced": "0"}, {"fixed": "2.0"}, {"last_affected": "3.0"},
+    ]}])
+
+    item = assess(record, package("1.0")).packages[0]
+
+    assert item.assessment_status == "requires_review"
+    assert item.findings == []
+
+
+@pytest.mark.parametrize("malformed_event", [
+    {"introduced": "banana"},
+    {"fixed": ""},
+    "not-an-event",
+])
+def test_debian_range_validates_malformed_trailing_event_after_fixed(malformed_event):
+    record = advisory(ranges=[{"type": "ECOSYSTEM", "events": [
+        {"introduced": "0"}, {"fixed": "2.0"}, malformed_event,
+    ]}])
+
+    item = assess(record, package("1.0")).packages[0]
+
+    assert item.assessment_status == "requires_review"
+    assert item.findings == []
+
+
+@pytest.mark.parametrize(
+    ("installed", "expected"),
+    [("1.0", "vulnerable"), ("2.0", "fixed")],
+)
+def test_debian_complete_introduced_fixed_range_keeps_existing_results(installed, expected):
+    result, _ = _debian_range_status(
+        {"type": "ECOSYSTEM", "events": [
+            {"introduced": "0"}, {"fixed": "2.0"},
+        ]},
+        installed,
+    )
+
+    assert result == expected
 
 
 def test_debian_empty_success_is_no_known_match_and_kali_stays_unsupported():
