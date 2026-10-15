@@ -490,6 +490,49 @@ def test_debian_expired_cache_entry_is_refetched(tmp_path):
     assert any("expired_or_invalid=1" in line and "misses=1" in line for line in messages)
 
 
+def test_debian_expired_cache_entry_with_failed_refresh_reports_error(tmp_path, monkeypatch):
+    record = advisory()
+    fixed_now = 200_000
+    requested_urls = []
+    messages = []
+
+    def opener(request, timeout):
+        requested_urls.append(request.full_url)
+        if request.full_url == OSV_QUERY_BATCH_URL:
+            return FakeResponse({"results": [{"vulns": [{"id": record["id"]}]}]})
+        raise OSError("mock network unavailable")
+
+    cache_dir = tmp_path / "cache"
+    provider = OSVDebianProvider(
+        opener=opener, cache_dir=cache_dir, diagnostic=messages.append
+    )
+    monkeypatch.setattr(provider._cache, "_clock", lambda: fixed_now)
+    provider._cache.store(record["id"], record)
+    cache_path = provider._cache.path_for(record["id"])
+    cached_entry = json.loads(cache_path.read_text(encoding="utf-8"))
+    cached_entry["cached_at"] = 1
+    cache_path.write_text(json.dumps(cached_entry), encoding="utf-8")
+
+    report = assess_packages(
+        [package()], "Debian GNU/Linux 12", "12", provider
+    )
+
+    assert requested_urls == [OSV_QUERY_BATCH_URL, OSV_VULN_URL + record["id"]]
+    assert report.assessment_status == "error"
+    assert report.error.startswith("Debian OSV data retrieval failed:")
+    assert report.packages[0].assessment_status == "error"
+    assert report.packages[0].findings == []
+    assert any(
+        "hits=0, misses=1, expired_or_invalid=1" in message
+        for message in messages
+    )
+    assert cache_path.is_file()
+    remaining_entry = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert remaining_entry["cached_at"] == 1
+    assert remaining_entry["record"] == record
+    assert provider._cache.load(record["id"]) == (None, "expired")
+
+
 @pytest.mark.parametrize("cached_content", [
     "{malformed-json",
     json.dumps({
