@@ -161,6 +161,46 @@ The unit tests mock operating-system commands and OSV responses, so they do not 
 .\.venv\Scripts\python.exe -m pytest -v
 ```
 
+## Manual Debian and Ubuntu Validation
+
+Use separate disposable Debian and Ubuntu VMs for real-host validation. Take a VM snapshot first and run the scanner as a normal, non-root user. The scanner is read-only, but the JSON command writes `scan.json` in the project directory. These instructions are a checklist; they do not imply that a real-host scan has already passed.
+
+### Debian VM checklist
+
+- [ ] Confirm the VM is running Debian and note its release.
+- [ ] From the project directory, create and activate a virtual environment, install dependencies, and run both report formats:
+
+  ```bash
+  python3 -m venv .venv
+  source .venv/bin/activate
+  python -m pip install -r requirements.txt
+  python main.py --diagnostics --json --output scan.json
+  scan_exit_code=$?
+  python -m json.tool scan.json
+  python main.py
+  ```
+
+- [ ] Record the detected distribution and release, whether package inventory succeeded, the package count, the assessment status and source, and the scanner's exit code (`scan_exit_code`).
+
+### Ubuntu VM checklist
+
+- [ ] Confirm the VM is running Ubuntu and note its release.
+- [ ] From the project directory, create and activate a virtual environment, install dependencies, and run both report formats:
+
+  ```bash
+  python3 -m venv .venv
+  source .venv/bin/activate
+  python -m pip install -r requirements.txt
+  python main.py --diagnostics --json --output scan.json
+  scan_exit_code=$?
+  python -m json.tool scan.json
+  python main.py
+  ```
+
+- [ ] Record the detected distribution and release, whether package inventory succeeded, the package count, the assessment status and source, and the scanner's exit code (`scan_exit_code`).
+
+The CLI exit code reflects package inventory and report writing. OSV retrieval can fail after a successful inventory; in that case the report should still show the inventory result and identify the assessment error. `no_known_match` only means no matching record was found in the queried data; it does not mean the system or package is safe. Kali package inventory is supported, but Kali vulnerability assessment remains explicitly unsupported; Debian or Ubuntu records are not authoritative for Kali.
+
 ### Optional live OSV integration tests
 
 Live tests are skipped unless explicitly enabled. They require network access to `api.osv.dev` and verify documented Ubuntu or Debian OSV cases; they are separate from the normal offline suite.
