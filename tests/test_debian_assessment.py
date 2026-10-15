@@ -290,6 +290,20 @@ def test_unsupported_range_event_requires_review():
     assert report.packages[0].assessment_status == "requires_review"
 
 
+@pytest.mark.parametrize("malformed_ranges", [
+    "not-a-range-list",
+    [{"type": "ECOSYSTEM", "events": "not-an-event-list"}],
+])
+def test_malformed_debian_range_structure_requires_review(malformed_ranges):
+    record = advisory()
+    record["affected"][0]["ranges"] = malformed_ranges
+
+    item = assess(record).packages[0]
+
+    assert item.assessment_status == "requires_review"
+    assert item.findings == []
+
+
 def test_debian_empty_success_is_no_known_match_and_kali_stays_unsupported():
     pkg = package()
     empty = assess_packages([pkg], "Debian GNU/Linux 12", "12", FakeProvider())
@@ -346,6 +360,41 @@ def test_debian_provider_queries_source_ecosystem_and_hydrates_record():
     assert result.error is None
     assert requested == [OSV_QUERY_BATCH_URL, OSV_VULN_URL + record["id"]]
     assert result.records_by_package["openssh-server"][0].record == record
+
+
+@pytest.mark.parametrize("query_payload", [[], {"unexpected": []}])
+def test_debian_unexpected_query_response_structure_is_an_error(query_payload):
+    def opener(request, timeout):
+        return FakeResponse(query_payload)
+
+    report = assess_packages(
+        [package()], "Debian GNU/Linux 12", "12",
+        OSVDebianProvider(opener=opener),
+    )
+
+    assert report.assessment_status == "error"
+    assert report.packages[0].assessment_status == "error"
+    assert report.packages[0].findings == []
+    assert "no results list" in report.error
+
+
+@pytest.mark.parametrize("advisory_id", ["", " \t\n"])
+def test_debian_blank_advisory_id_is_rejected_without_producing_findings(advisory_id):
+    requested_urls = []
+
+    def opener(request, timeout):
+        requested_urls.append(request.full_url)
+        return FakeResponse({"results": [{"vulns": [{"id": advisory_id}]}]})
+
+    report = assess_packages(
+        [package()], "Debian GNU/Linux 12", "12",
+        OSVDebianProvider(opener=opener),
+    )
+
+    assert report.assessment_status == "error"
+    assert report.packages[0].assessment_status == "error"
+    assert report.packages[0].findings == []
+    assert requested_urls == [OSV_QUERY_BATCH_URL]
 
 
 def test_debian_cache_miss_fetches_and_stores_valid_full_record(tmp_path):
