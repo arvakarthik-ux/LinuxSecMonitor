@@ -163,12 +163,12 @@ The unit tests mock operating-system commands and OSV responses, so they do not 
 
 ## Manual Debian and Ubuntu Validation
 
-Use separate disposable Debian and Ubuntu VMs for real-host validation. Take a VM snapshot first and run the scanner as a normal, non-root user. The scanner is read-only, but the JSON command writes `scan.json` in the project directory. These instructions are a checklist; they do not imply that a real-host scan has already passed.
+Use separate disposable Debian and Ubuntu VMs for real-host validation. Take a VM snapshot first and run the scanner as a normal, non-root user. The scanner is read-only, but the JSON command writes `scan.json` in the project directory. Debian 12 validation is complete as recorded below; Ubuntu validation is still pending.
 
-### Debian VM checklist
+### Debian VM checklist (completed)
 
-- [ ] Confirm the VM is running Debian and note its release.
-- [ ] From the project directory, create and activate a virtual environment, install dependencies, and run both report formats:
+- [x] Confirm the VM is running Debian and note its release.
+- [x] From the project directory, create and activate a virtual environment, install dependencies, and run both report formats:
 
   ```bash
   python3 -m venv .venv
@@ -180,7 +180,13 @@ Use separate disposable Debian and Ubuntu VMs for real-host validation. Take a V
   python main.py
   ```
 
-- [ ] Record the detected distribution and release, whether package inventory succeeded, the package count, the assessment status and source, and the scanner's exit code (`scan_exit_code`).
+- [x] Record the detected distribution and release, whether package inventory succeeded, the package count, the assessment status and source, and the scanner's exit code (`scan_exit_code`).
+
+#### Completed Debian 12 validation
+
+The real CLI was validated on Debian GNU/Linux 12 (bookworm), running kernel `6.1.0-53-amd64`, on `x86_64` with Python `3.11.2`. Package inventory succeeded with 1,614 package entries, and the JSON scan exited with code `0`. The text report displayed system information, package inventory, and vulnerability assessment. The Debian OSV provider was selected for release 12; the JSON report had no assessment error and included 501 package entries with matching advisory evidence and 1,113 `no_known_match` entries. A subsequent scan successfully used the persistent advisory cache.
+
+These results are observations from that Debian VM, not guarantees for other hosts or future scans. A `vulnerable` result means matching advisory evidence was found; it does not confirm exploitability. `no_known_match` does not prove that a package or system is safe.
 
 ### Ubuntu VM checklist
 
@@ -198,6 +204,8 @@ Use separate disposable Debian and Ubuntu VMs for real-host validation. Take a V
   ```
 
 - [ ] Record the detected distribution and release, whether package inventory succeeded, the package count, the assessment status and source, and the scanner's exit code (`scan_exit_code`).
+
+**Ubuntu validation status: pending.** No real-host Ubuntu scan is recorded here.
 
 The CLI exit code reflects package inventory and report writing. OSV retrieval can fail after a successful inventory; in that case the report should still show the inventory result and identify the assessment error. `no_known_match` only means no matching record was found in the queried data; it does not mean the system or package is safe. Kali package inventory is supported, but Kali vulnerability assessment remains explicitly unsupported; Debian or Ubuntu records are not authoritative for Kali.
 
