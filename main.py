@@ -186,6 +186,11 @@ def _render_text(result: dict[str, object]) -> str:
                     urgency = finding.get("urgency")
                     if isinstance(urgency, str) and urgency.strip():
                         lines.append(f"    Debian urgency: {urgency.strip()}")
+                    source_name = finding.get("source_package_name")
+                    source_version = finding.get("source_version")
+                    if (isinstance(source_name, str) and source_name.strip()
+                            and isinstance(source_version, str) and source_version.strip()):
+                        lines.append(f"    Source package: {source_name} {source_version}")
                     advisory_id = finding.get("advisory_id")
                     context = advisory_context.get(advisory_id) if isinstance(advisory_id, str) else None
                     if isinstance(context, dict) and advisory_id not in rendered_context_ids:

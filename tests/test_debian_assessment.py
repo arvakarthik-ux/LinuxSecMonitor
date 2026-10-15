@@ -82,6 +82,16 @@ def assess(record, pkg=None, distribution="Debian GNU/Linux 12", release="12"):
     return assess_packages([pkg], distribution, release, FakeProvider(records))
 
 
+def assess_records(records, pkg=None):
+    """Assess one Debian package against several independent advisories."""
+    pkg = pkg or package()
+    source_records = [SourceRecord(pkg.source_name or "", record) for record in records]
+    return assess_packages(
+        [pkg], "Debian GNU/Linux 12", "12",
+        FakeProvider({pkg.name: source_records}),
+    )
+
+
 def test_debian_confirmed_affected_source_version_has_traceable_reference():
     report = assess(advisory())
     item = report.packages[0]
@@ -92,7 +102,16 @@ def test_debian_confirmed_affected_source_version_has_traceable_reference():
     assert finding.source_reference == f"{DEBIAN_TRACKER_URL}CVE-2024-6387"
     assert finding.severity is None
     assert finding.urgency == "not yet assigned"
+    assert finding.source_package_name == "openssh"
+    assert finding.source_version == "1:9.2p1-2+deb12u2"
     assert "source version" in finding.explanation
+    serialized_finding = report.to_dict()["packages"][0]["findings"][0]
+    assert serialized_finding["package_name"] == "openssh-server"
+    assert serialized_finding["installed_version"] == "1:9.2p1-2+deb12u2"
+    assert serialized_finding["source_reference"] == f"{DEBIAN_TRACKER_URL}CVE-2024-6387"
+    assert serialized_finding["assessment_status"] == "vulnerable"
+    assert serialized_finding["source_package_name"] == "openssh"
+    assert serialized_finding["source_version"] == "1:9.2p1-2+deb12u2"
 
 
 def test_debian_urgency_uses_matching_release_and_source_without_changing_status_or_severity():
@@ -175,6 +194,74 @@ def test_debian_source_version_at_or_after_fixed_boundary_is_fixed():
     assert report.packages[0].findings[0].assessment_status == "fixed"
 
 
+def test_debian_vulnerable_and_fixed_advisories_keep_both_findings_and_vulnerable_status():
+    vulnerable = advisory()
+    fixed = advisory(fixed="1:9.2p1-2+deb12u1")
+    fixed["id"] = "DEBIAN-CVE-2024-9998"
+
+    report = assess_records([vulnerable, fixed])
+    item = report.packages[0]
+
+    assert item.assessment_status == "vulnerable"
+    assert [(finding.advisory_id, finding.assessment_status) for finding in item.findings] == [
+        (vulnerable["id"], "vulnerable"),
+        (fixed["id"], "fixed"),
+    ]
+    assert report.to_dict()["summary"]["status_counts"] == {"vulnerable": 1}
+
+
+def test_debian_vulnerable_and_review_advisories_preserve_both_evidence_records():
+    vulnerable = advisory()
+    review = advisory(ranges="malformed")
+    review["id"] = "DEBIAN-CVE-2024-9998"
+
+    report = assess_records([vulnerable, review])
+    item = report.packages[0]
+
+    assert item.assessment_status == "vulnerable"
+    assert [(finding.advisory_id, finding.assessment_status) for finding in item.findings] == [
+        (vulnerable["id"], "vulnerable"),
+        (review["id"], "requires_review"),
+    ]
+    assert item.findings[1].source_reference == f"{DEBIAN_TRACKER_URL}CVE-2024-9998"
+    assert "no usable ranges" in item.findings[1].explanation
+    serialized_findings = report.to_dict()["packages"][0]["findings"]
+    assert serialized_findings[1]["advisory_id"] == review["id"]
+    assert "no usable ranges" in serialized_findings[1]["explanation"]
+    assert report.to_dict()["summary"]["status_counts"] == {"vulnerable": 1}
+
+
+def test_debian_fixed_and_review_advisories_report_review_and_keep_fixed_finding():
+    fixed = advisory(fixed="1:9.2p1-2+deb12u1")
+    review = advisory(ranges="malformed")
+    review["id"] = "DEBIAN-CVE-2024-9998"
+
+    report = assess_records([fixed, review])
+    item = report.packages[0]
+
+    assert item.assessment_status == "requires_review"
+    assert [(finding.advisory_id, finding.assessment_status) for finding in item.findings] == [
+        (fixed["id"], "fixed"),
+    ]
+    assert "no usable ranges" in item.explanation
+    assert report.to_dict()["summary"]["status_counts"] == {"requires_review": 1}
+
+
+def test_debian_multiple_vulnerable_advisories_have_distinct_findings_but_one_package_count():
+    first = advisory()
+    second = advisory()
+    second["id"] = "DEBIAN-CVE-2024-9998"
+
+    report = assess_records([first, second])
+    item = report.packages[0]
+
+    assert item.assessment_status == "vulnerable"
+    assert [finding.advisory_id for finding in item.findings] == [first["id"], second["id"]]
+    assert all(finding.assessment_status == "vulnerable" for finding in item.findings)
+    assert report.to_dict()["summary"]["total_assessed_packages"] == 1
+    assert report.to_dict()["summary"]["status_counts"] == {"vulnerable": 1}
+
+
 @pytest.mark.parametrize(
     ("source_version", "expected_status"),
     [
@@ -237,6 +324,8 @@ def test_missing_source_version_requires_review_without_binary_fallback():
     report = assess(advisory(), pkg)
     assert report.packages[0].assessment_status == "requires_review"
     assert "no binary-version substitution" in report.packages[0].explanation
+    assert report.packages[0].findings == []
+    assert report.to_dict()["packages"][0]["findings"] == []
 
 
 def test_missing_source_name_requires_review():
