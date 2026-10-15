@@ -574,6 +574,49 @@ def test_debian_network_failure_is_not_cached(tmp_path):
     assert not provider._cache.path_for(record_id).exists()
 
 
+def test_debian_cache_read_failure_and_network_failure_report_assessment_error(
+    tmp_path, monkeypatch
+):
+    record = advisory()
+    cache_reads = []
+    requested_urls = []
+    messages = []
+
+    def fail_cache_read(advisory_id):
+        cache_reads.append(advisory_id)
+        return None, "read_failure"
+
+    def opener(request, timeout):
+        requested_urls.append(request.full_url)
+        if request.full_url == OSV_QUERY_BATCH_URL:
+            return FakeResponse({"results": [{"vulns": [{"id": record["id"]}]}]})
+        raise OSError("mock network unavailable")
+
+    provider = OSVDebianProvider(
+        opener=opener,
+        cache_dir=tmp_path / "cache",
+        diagnostic=messages.append,
+    )
+    monkeypatch.setattr(provider._cache, "load", fail_cache_read)
+
+    report = assess_packages(
+        [package()], "Debian GNU/Linux 12", "12", provider
+    )
+
+    assert cache_reads == [record["id"]]
+    assert requested_urls == [OSV_QUERY_BATCH_URL, OSV_VULN_URL + record["id"]]
+    assert report.assessment_status == "error"
+    assert report.error.startswith("Debian OSV data retrieval failed:")
+    assert report.packages[0].assessment_status == "error"
+    assert report.packages[0].findings == []
+    assert report.assessment_status != "no_known_match"
+    assert any(
+        "hits=0, misses=1" in message and "read_failures=1" in message
+        for message in messages
+    )
+    assert not provider._cache.path_for(record["id"]).exists()
+
+
 def test_cached_and_uncached_assessment_results_are_identical(tmp_path):
     record = advisory()
     requested_gets = []
