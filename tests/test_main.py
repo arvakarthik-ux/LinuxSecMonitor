@@ -169,6 +169,63 @@ def test_cli_json_diagnostics_runs_real_build_result_end_to_end(monkeypatch, cap
     assert "[diagnostic]" not in stdout.getvalue()
 
 
+def test_build_result_reports_osv_error_when_inventory_succeeds(monkeypatch):
+    system_info = SystemInfo(
+        operating_system="Linux",
+        distribution="Ubuntu 24.04 LTS",
+        distribution_version="24.04",
+        kernel_version="6.8.0-test",
+        architecture="x86_64",
+        python_version="3.12.0",
+        hostname="test-host",
+    )
+    package = Package("bash", "5.2-2ubuntu1", "bash", "5.2-2ubuntu1")
+    provider_error = "OSV query failed: offline"
+    monkeypatch.setattr(main, "collect_system_info", lambda: system_info)
+    monkeypatch.setattr(main, "scan_installed_packages", lambda: PackageScanResult([package]))
+
+    def failed_assessment(packages, distribution, release):
+        assert packages == [package]
+        return VulnerabilityAssessmentReport(
+            assessment_status="error",
+            distribution=distribution,
+            release=release,
+            source="Ubuntu OSV via osv.dev",
+            error=provider_error,
+            packages=[PackageAssessment(
+                package_name=package.name,
+                installed_version=package.version,
+                assessment_status="error",
+                explanation=provider_error,
+                findings=[],
+            )],
+        )
+
+    monkeypatch.setattr(main, "assess_packages", failed_assessment)
+
+    result = main.build_result()
+    report = json.loads(json.dumps(result))
+    assessment = report["vulnerability_assessment"]
+    text = main._render_text(report)
+
+    assert report["package_scan"]["success"] is True
+    assert assessment["assessment_status"] == "error"
+    assert assessment["source"] == "Ubuntu OSV via osv.dev"
+    assert assessment["error"] == provider_error
+    assert assessment["summary"]["total_assessed_packages"] == 1
+    assert assessment["summary"]["status_counts"] == {"error": 1}
+    assert assessment["packages"] == [{
+        "package_name": "bash",
+        "installed_version": "5.2-2ubuntu1",
+        "assessment_status": "error",
+        "explanation": provider_error,
+        "findings": [],
+    }]
+    assert "Status: error" in text
+    assert "Source: Ubuntu OSV via osv.dev" in text
+    assert f"Details: {provider_error}" in text
+
+
 def test_inventory_exception_is_diagnosed_and_propagated(monkeypatch):
     monkeypatch.setattr(
         main, "collect_system_info", lambda: type("Info", (), {"to_dict": lambda self: {
