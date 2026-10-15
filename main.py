@@ -168,7 +168,7 @@ def _render_text(result: dict[str, object]) -> str:
                 else:
                     lines.append("    None")
             note = summary.get("no_known_match_note") if isinstance(summary, dict) else None
-            if note:
+            if note and counts.get("no_known_match", 0) > 0:
                 lines.append(f"  Note: {note}")
             if not assessment.get("error"):
                 findings = [finding for item in assessed if isinstance(item, dict)

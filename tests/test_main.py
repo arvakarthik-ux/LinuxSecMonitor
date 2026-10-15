@@ -224,6 +224,7 @@ def test_build_result_reports_osv_error_when_inventory_succeeds(monkeypatch):
     assert "Status: error" in text
     assert "Source: Ubuntu OSV via osv.dev" in text
     assert f"Details: {provider_error}" in text
+    assert "Note: no_known_match means" not in text
 
 
 def test_inventory_exception_is_diagnosed_and_propagated(monkeypatch):
@@ -348,6 +349,28 @@ def test_text_reports_assessment_summary_and_context():
     assert "fixed: 1" in text
     assert "no_known_match: 1" in text
     assert "not proof that a package is safe" in text
+
+
+def test_text_omits_no_match_warning_for_empty_assessment():
+    assessment = VulnerabilityAssessmentReport(
+        assessment_status="no_known_match",
+        distribution="Debian GNU/Linux 12",
+        release="12",
+        source="Debian OSV via osv.dev",
+        error=None,
+        packages=[],
+    ).to_dict()
+    report = {
+        "system_info": {},
+        "package_scan": {"success": True, "error": None, "packages": []},
+        "vulnerability_assessment": assessment,
+    }
+
+    text = main._render_text(report)
+
+    assert "Status: no_known_match" in text
+    assert "Total assessed package entries: 0" in text
+    assert "Note: " not in text
 
 
 def test_text_renders_advisory_context_and_truncates_long_details():
@@ -589,6 +612,7 @@ def test_build_result_preserves_package_inventory_failure_in_json(monkeypatch):
     assert any("Package inventory result: success=False" in message for message in messages)
     assert any("Package inventory started" in message for message in messages)
     assert any("Package inventory completed in" in message for message in messages)
+    assert "Note: no_known_match means" not in main._render_text(serialized)
 
 
 def test_cli_json_package_inventory_failure_exits_one_and_reports_error(monkeypatch):
