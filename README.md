@@ -1,100 +1,223 @@
 # LinuxSecMonitor
 
-LinuxSecMonitor is a defensive Linux security monitoring project. It collects basic host information and installed package inventory, with conservative advisory matching for Ubuntu and Debian. It does not claim complete security coverage.
+LinuxSecMonitor is a read-only command-line tool for collecting Linux host details, inventorying Debian-family packages, and comparing installed package versions with supported OSV vulnerability data. It produces text or JSON reports and does not claim complete vulnerability coverage.
 
-## Sprint 1 features
+## Key features
 
-- Read-only system information from Python's `platform` module and Linux `/etc/os-release`.
-- Debian/Ubuntu/Kali package inventory from `dpkg-query`; Debian source metadata is retained internally for advisory matching.
-- Human-readable output or structured JSON on standard output / in a file.
-- Graceful scan errors with a distinct successful empty inventory.
-- A separate, conservative vulnerability assessment foundation with structured results.
+- Collects operating system, distribution and version when available, kernel version, CPU architecture, Python version, and hostname.
+- Inventories installed Debian, Ubuntu, and Kali packages with `dpkg-query` where supported. Source package metadata is retained internally for Debian assessment.
+- Performs conservative, distribution-aware vulnerability assessment using Ubuntu and Debian OSV records. Kali vulnerability matching is explicitly unsupported.
+- Adds available OSV summaries, details, references, and Debian urgency as advisory context. Urgency is kept separate from severity.
+- Writes human-readable text or structured JSON reports.
+- Provides optional progress and timing diagnostics on standard error.
+- Caches validated full Debian OSV advisory records on disk for 24 hours by default.
 
-The package scanner supports Debian, Ubuntu, and Kali Linux. It invokes `dpkg-query` with an argument list (no shell) and performs no package modifications or privileged actions.
+## How a scan works
 
-## Setup and usage
+```text
+main.py
+  |-- collect_system_info()          scanner/system_info.py
+  |-- scan_installed_packages()      scanner/package_scanner.py
+  |-- assess_packages()              scanner/vulnerability_assessment.py
+  |   |-- Select the distribution-specific assessment path
+  |   |-- Query OSV and retrieve full advisory records when needed
+  |   |-- Match supported release/package/version evidence
+  |   `-- Build assessment and advisory-context results
+  `-- Render text or JSON
+```
 
-Python 3.10 or newer is recommended. From the project directory:
+The assessment runs only after package inventory succeeds. Eligible Debian assessments query OSV on each run; package-to-advisory query results are not cached. Full advisory records are read from the persistent cache when valid and unexpired; otherwise, they are retrieved from OSV. Package inventory and assessment are read-only.
+
+## Requirements and installation
+
+Python 3.10 or newer is recommended. Full package inventory is intended for Debian, Ubuntu, and Kali Linux systems with `dpkg-query` available. On Windows, system information and the mocked automated tests can run, but package inventory reports that the operating system is unsupported.
+
+The WSL instructions apply when WSL is running a supported Debian, Ubuntu, or Kali Linux distribution; WSL itself is not a separate package-inventory target.
+
+### Debian, Ubuntu, Kali Linux, and WSL
+
+From the project directory:
 
 ```bash
-python -m venv .venv
-# Linux/macOS: source .venv/bin/activate
-# Windows PowerShell: .venv\Scripts\Activate.ps1
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install -r requirements.txt
+```
+
+The dependency file lists `pytest` for development and testing. The scanner itself uses Python's standard library.
+
+### Windows PowerShell
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+py -m pip install -r requirements.txt
+```
+
+Windows is useful for development and running the mocked tests; it is not a supported package-inventory target.
+
+## Run the scanner
+
+Run these commands from the project directory:
+
+```bash
+# Human-readable report
 python main.py
+
+# JSON to standard output
 python main.py --json
+
+# JSON written to a file
 python main.py --json --output scan.json
+
+# Progress and timing details to standard error, JSON report to a file
 python main.py --diagnostics --json --output scan.json
 ```
 
-Package inventory requires Debian, Ubuntu, or Kali Linux and the `dpkg-query` command. System information remains available on other operating systems, but the package scan reports that it is unsupported.
+The same CLI forms work in PowerShell when `python` resolves to the intended interpreter, or with the Windows launcher, for example `py main.py --json`. The implemented options are `--json`, `-o`/`--output`, and `--diagnostics`. `--output` requires `--json`. Diagnostics go to standard error so JSON written to standard output remains parseable. A completed package scan returns exit code `0`; a package-inventory failure returns `1`; a JSON output-file write failure returns `2`.
 
-## Vulnerability assessment
+### Example report shape
 
-Ubuntu matching uses Ubuntu OSV records served through the OSV API and is limited to releases with suitable metadata. Debian matching uses Debian ecosystem records from OSV, requires an exact Debian release and source package identity, compares the source version against supported OSV affected ranges, and preserves the matching Debian Security Tracker reference. OSV query results can be abbreviated records, so full records are retrieved before matching. Debian severity remains unset when the source does not provide a severity.
+This is a format template, not a recorded scan result. Values in angle brackets are filled from the current host and data sources.
 
-The Debian provider caches validated full OSV advisory records for 24 hours. Querybatch still runs on every scan; only full records fetched or returned inline are cached. Linux uses `$XDG_CACHE_HOME/linuxsecmonitor/osv`, falling back to `~/.cache/linuxsecmonitor/osv`; Windows uses `%LOCALAPPDATA%\LinuxSecMonitor\osv` when available. The cache is keyed by a SHA-256 digest of the advisory ID and can be configured in code through `OSVDebianProvider(cache_dir=..., cache_ttl_seconds=...)`. Unavailable, expired, or invalid cache entries are fetched again; cache read/write failures do not change scan results.
+```text
+LinuxSecMonitor — Sprint 1
+System information:
+  Operating system: <detected operating system>
+  Distribution: <distribution or Unavailable>
+Package inventory:
+  Total packages found: <count>
+Vulnerability assessment:
+  Status: <assessment status>
+  Distribution: <detected distribution>
+  Release: <detected release>
+  Source: <assessment provider, when available>
+  Total assessed package entries: <count>
+```
 
-**Distribution support:** package inventory supports Kali, Ubuntu, and Debian. Automated vulnerability assessment supports Ubuntu with suitable release metadata and Debian with a numeric release plus provable source package/version metadata. Kali remains explicitly unsupported; Debian and Ubuntu advisories are not applied to Kali. Other distributions require review. Packages with legacy inventory rows, malformed source metadata, unsupported range events, withdrawn advisories, or conflicting version evidence require review. Debian OSV records may omit severity. Ubuntu Pro/ESM status is not detected. `no_known_match` means no matching record was found in the queried data; it does not mean a package is safe. The scanner is read-only, requires no root privileges, and never modifies packages.
+The text report previews up to ten package entries and ten findings. JSON includes the full package inventory and assessment entries, plus an `advisory_context` map keyed by advisory ID. The map is empty when no usable OSV context is available.
 
-The JSON vulnerability assessment and terminal report include a package-entry total and counts grouped by the existing assessment status. Each assessed package entry is counted once. The summary preserves the detected distribution, release, data source, and any assessment error or limitation. A `no_known_match` result is explicitly not proof that a package is safe.
+## Assessment states and interpretation
 
-Assessment JSON also includes an additive `advisory_context` map keyed by OSV advisory ID. When OSV provides them, entries include the advisory `summary`, `details`, and validated HTTP(S) `references`; repeated advisory IDs share one context entry. Debian findings may include `urgency` only when it is present on the matching OSV affected entry for the detected Debian release and source package. Urgency is separate from severity and does not affect matching or assessment status. These fields come from the OSV record. Debian Security Tracker notes are not fetched during normal scans; the report retains the Tracker reference for traceability, but does not retrieve the Tracker page content.
+Assessment status is shown for the overall assessment and for individual package entries. It describes the evidence available from the configured source; it is not a guarantee of system security.
+
+| Status | Meaning |
+| --- | --- |
+| `vulnerable` | A matching source record marks the installed version as affected. |
+| `no_known_match` | No matching record was found in the queried data. This is **not** evidence that the package is safe. |
+| `requires_review` | Distribution, package metadata, or advisory/version evidence is missing, incomplete, or ambiguous. No safe conclusion was made. |
+| `unsupported` | Automated vulnerability assessment is explicitly unsupported for the detected distribution, including Kali. |
+| `fixed` | Matching source data provides fixed-version evidence for the assessed package. |
+| `not_affected` | Matching range data places the version outside the affected interval; this is not a fixed-version claim. |
+| `error` | The assessment could not complete, for example because required OSV data retrieval failed. |
+| `mixed` | Overall result used when fixed evidence coexists with other package entries, such as `no_known_match` or `not_affected`. |
+
+Successful empty inventory results are distinct from scan failures. A successful query with no matching advisory still produces `no_known_match`, not a statement that the package is secure.
+
+## Distribution support and limitations
+
+| Distribution | Package inventory | Vulnerability assessment |
+| --- | --- | --- |
+| Debian | Supported with `dpkg-query` | Debian OSV records, with numeric release and provable source package/version evidence; matching findings require traceable Debian Security Tracker references. |
+| Ubuntu | Supported with `dpkg-query` | Ubuntu OSV data for releases with suitable metadata and package/version evidence. |
+| Kali | Supported with `dpkg-query` | Explicitly unsupported. Debian or Ubuntu records are not treated as authoritative for Kali. |
+| Other distributions | Unsupported | Requires review; no distribution-specific provider is configured. |
+| Windows | Unsupported | System information and tests can run, but package inventory and Linux vulnerability assessment are not supported. |
+
+Distribution detection reads `/etc/os-release` on Linux. The package scanner checks the primary distribution ID and invokes `dpkg-query` without a shell. The scanner does not detect Ubuntu Pro/ESM entitlement. Some advisories lack severity or complete version evidence, and Debian OSV coverage can be incomplete. Debian Security Tracker references are retained, but Tracker page notes are not fetched during normal scans. `no_known_match` only describes queried data and never proves safety.
+
+## Persistent Debian OSV cache
+
+The Debian provider caches validated full OSV advisory records, keyed by a SHA-256 digest of the advisory ID. Its default TTL is 24 hours. Package-to-advisory querybatch results are not cached, so eligible Debian scans query OSV each time. The cache reduces repeated full-record downloads, but it does not eliminate inventory collection, querybatch requests, or local matching.
+
+Default locations:
+
+- Linux: `$XDG_CACHE_HOME/linuxsecmonitor/osv`, or `~/.cache/linuxsecmonitor/osv` when `XDG_CACHE_HOME` is unset or not absolute.
+- Windows: `%LOCALAPPDATA%\LinuxSecMonitor\osv` when `%LOCALAPPDATA%` is absolute; otherwise a per-user `AppData\Local\LinuxSecMonitor\osv` directory.
+
+Code that constructs `OSVDebianProvider` can configure `cache_dir` and `cache_ttl_seconds`. Expired, malformed, unreadable, or invalid cache records are fetched again. Cache read/write failures are reported in diagnostics and do not replace network retrieval or turn missing data into a safe result.
+
+In one observed Debian scan, the first scan took approximately **127.6 seconds** and a subsequent cached scan took approximately **5.6 seconds**. These are measured examples, not performance guarantees; actual timings depend on network conditions, OSV responses, package inventory size, and cache state.
+
+## Diagnostics
+
+Add `--diagnostics` to report stage progress and elapsed time to standard error. Diagnostics include OSV batch and hydration progress, persistent cache hit/miss/expiry/write/failure counts, matching progress, and report-writing times. They avoid printing advisory descriptions.
+
+```bash
+python main.py --diagnostics --json --output scan.json
+```
 
 ## Tests
 
+Install the project requirements, then run the deterministic offline suite:
+
 ```bash
-python -m pytest
+python -m pytest -v
 ```
 
-Tests mock operating-system metadata and package-manager calls, so they can run on Windows without `dpkg-query`.
+The unit tests mock operating-system commands and OSV responses, so they do not require `dpkg-query` or a live network. On Windows, the project's virtual environment can be used with:
 
-### Optional live Ubuntu OSV check
+```powershell
+.\.venv\Scripts\python.exe -m pytest -v
+```
 
-The normal suite remains offline; the live integration test is skipped unless explicitly enabled. It checks a documented Ubuntu OSV record for `bash` on Ubuntu 22.04 LTS and verifies its advisory ID, affected status, release, and Canonical source reference. OSV's query-batch API can return advisory stubs, so the provider retrieves full advisory records before matching.
+### Optional live OSV integration tests
+
+Live tests are skipped unless explicitly enabled. They require network access to `api.osv.dev` and verify documented Ubuntu or Debian OSV cases; they are separate from the normal offline suite.
+
+PowerShell:
 
 ```powershell
 $env:LINUXSECMONITOR_LIVE_OSV = "1"
 python -m pytest -m live_osv tests/integration -v
-```
 
-On Linux or macOS:
-
-```bash
-LINUXSECMONITOR_LIVE_OSV=1 python -m pytest -m live_osv tests/integration -v
-```
-
-The live check requires network access to `api.osv.dev`; it is intentionally separate from the deterministic unit suite.
-
-### Scan diagnostics
-
-Pass `--diagnostics` to print stage progress and elapsed times to stderr while keeping report JSON unchanged and JSON stdout clean. Diagnostics include system information and package inventory, Debian OSV batch requests, advisory hydration counts (requested, cached, and newly fetched), persistent advisory-cache hit/miss/expiry/write/failure counts, vulnerability matching progress, and report serialization/writing. Package and advisory names are not included in progress messages.
-
-```bash
-python3 main.py --diagnostics --json --output debian-scan.json
-```
-
-Progress for longer loops is emitted every 100 package/advisory entries. Diagnostics are disabled unless requested.
-
-### Optional live Debian OSV check
-
-The Debian integration test is also skipped unless explicitly enabled. It validates the Debian 12 `openssh` source package against the OSV record for CVE-2024-6387, including the fixed source version and Debian Security Tracker reference.
-
-```powershell
 $env:LINUXSECMONITOR_LIVE_DEBIAN_OSV = "1"
 python -m pytest -m live_debian_osv tests/integration -v
 ```
 
-On Linux or macOS:
+Linux or macOS:
 
 ```bash
+LINUXSECMONITOR_LIVE_OSV=1 python -m pytest -m live_osv tests/integration -v
 LINUXSECMONITOR_LIVE_DEBIAN_OSV=1 python -m pytest -m live_debian_osv tests/integration -v
 ```
 
-## Project layout
+## Security and safety
+
+- Collection and assessment are read-only. The tool does not install, remove, upgrade, or modify packages.
+- It does not require root privileges and does not run a privileged background service.
+- It does not automatically remediate findings.
+- A `vulnerable` result is limited to the evidence matched from the configured advisory source. The scanner does not detect every vulnerability or configuration weakness.
+- `no_known_match` means only that no matching record was found in the queried data; it does **not** mean safe.
+- Network failures, unsupported distributions, and uncertain package/version evidence are represented as errors, unsupported states, or items requiring review rather than silently treated as safe.
+
+## Project structure
 
 ```text
-scanner/       system information and package inventory modules
-tests/         pytest coverage for collectors and CLI
-main.py        command-line interface
+LinuxSecMonitor/
++-- main.py
+|-- requirements.txt
+|-- pytest.ini
+|-- README.md
+|-- scanner/
+|   |-- __init__.py
+|   |-- system_info.py
+|   |-- package_scanner.py
+|   `-- vulnerability_assessment.py
+`-- tests/
+    |-- test_system_info.py
+    |-- test_package_scanner.py
+    |-- test_vulnerability_assessment.py
+    |-- test_debian_assessment.py
+    |-- test_main.py
+    `-- integration/
+        |-- test_ubuntu_osv_live.py
+        `-- test_debian_osv_live.py
 ```
+
+## Potential future improvements (planned, not implemented)
+
+- Add more distribution-specific vulnerability sources after their data and matching quality are validated.
+- Add security-configuration auditing and change monitoring.
+- Add a web dashboard and background monitoring in a later project sprint.
+- Improve historical reporting and alert workflows without automatic remediation.
