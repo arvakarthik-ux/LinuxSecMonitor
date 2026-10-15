@@ -121,7 +121,10 @@ def test_text_reports_assessment_summary_and_context():
                 "status_counts": {"fixed": 1, "no_known_match": 1},
                 "no_known_match_note": "no_known_match is not proof that a package is safe.",
             },
-            "packages": [],
+            "packages": [
+                {"assessment_status": "fixed", "findings": []},
+                {"assessment_status": "no_known_match", "findings": []},
+            ],
         },
     }
     text = main._render_text(report)
@@ -274,6 +277,78 @@ def test_text_derives_counts_for_legacy_report_without_summary():
     assert "Total assessed package entries: 3" in text
     assert "no_known_match: 2" in text
     assert "requires_review: 1" in text
+
+
+def test_text_uses_package_entries_when_supplied_summary_counts_are_incorrect():
+    report = {
+        "system_info": {},
+        "package_scan": {"success": True, "error": None, "packages": []},
+        "vulnerability_assessment": {
+            "assessment_status": "mixed", "error": None,
+            "summary": {
+                "total_assessed_packages": 99,
+                "status_counts": {"fixed": 99},
+                "no_known_match_note": "No known match is not proof of safety.",
+            },
+            "packages": [
+                {"assessment_status": "vulnerable"},
+                {"assessment_status": "no_known_match"},
+            ],
+        },
+    }
+
+    text = main._render_text(report)
+
+    assert "Total assessed package entries: 2" in text
+    assert "vulnerable: 1" in text
+    assert "no_known_match: 1" in text
+    assert "fixed: 99" not in text
+    assert "No known match is not proof of safety." in text
+
+
+def test_text_ignores_nonzero_supplied_summary_for_empty_package_list():
+    report = {
+        "system_info": {},
+        "package_scan": {"success": True, "error": None, "packages": []},
+        "vulnerability_assessment": {
+            "assessment_status": "no_known_match", "error": None,
+            "summary": {
+                "total_assessed_packages": 4,
+                "status_counts": {"no_known_match": 4},
+            },
+            "packages": [],
+        },
+    }
+
+    text = main._render_text(report)
+
+    assert "Total assessed package entries: 0" in text
+    assert "Package assessment counts:\n    None" in text
+    assert "no_known_match: 4" not in text
+
+
+def test_text_counts_package_with_missing_status_as_unknown():
+    report = {
+        "system_info": {},
+        "package_scan": {"success": True, "error": None, "packages": []},
+        "vulnerability_assessment": {
+            "assessment_status": "requires_review", "error": None,
+            "summary": {
+                "total_assessed_packages": 0,
+                "status_counts": {},
+            },
+            "packages": [
+                {"package_name": "legacy-package"},
+                {"package_name": "known-package", "assessment_status": "fixed"},
+            ],
+        },
+    }
+
+    text = main._render_text(report)
+
+    assert "Total assessed package entries: 2" in text
+    assert "fixed: 1" in text
+    assert "unknown: 1" in text
 
 
 def test_build_result_preserves_package_inventory_failure_in_json(monkeypatch):
