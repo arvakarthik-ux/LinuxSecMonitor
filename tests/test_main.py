@@ -7,6 +7,7 @@ import pytest
 
 import main
 from scanner.package_scanner import Package, PackageScanResult
+from scanner.system_info import SystemInfo
 from scanner.vulnerability_assessment import (
     PackageAssessment,
     VulnerabilityAssessmentReport,
@@ -37,6 +38,48 @@ def test_json_output_file(tmp_path, monkeypatch, capsys):
     assert "[diagnostic] Report writing completed in" in stderr
 
 
+def test_cli_json_output_file_write_failure_returns_two(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        main,
+        "collect_system_info",
+        lambda: SystemInfo(
+            operating_system="Linux",
+            distribution="Debian GNU/Linux 12",
+            distribution_version="12",
+            kernel_version="6.1.0-test",
+            architecture="x86_64",
+            python_version="3.12.0",
+            hostname="test-host",
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "scan_installed_packages",
+        lambda: PackageScanResult([], "mock inventory failure"),
+    )
+    output_file = tmp_path / "scan.json"
+    attempted_paths = []
+
+    def fail_write_text(path, data, *args, **kwargs):
+        attempted_paths.append(path)
+        raise OSError("mocked disk full")
+
+    monkeypatch.setattr(main.Path, "write_text", fail_write_text)
+    stdout = StringIO()
+
+    exit_code = main.main(
+        ["--json", "--output", str(output_file)], stdout=stdout
+    )
+
+    stderr = capsys.readouterr().err
+    assert exit_code == 2
+    assert attempted_paths == [output_file]
+    assert "Could not write JSON output:" in stderr
+    assert "mocked disk full" in stderr
+    assert "Traceback" not in stderr
+    assert stdout.getvalue() == ""
+
+
 def test_diagnostics_stay_on_stderr_and_preserve_json_stdout(monkeypatch, capsys):
     report = {
         "system_info": {},
@@ -58,6 +101,71 @@ def test_diagnostics_stay_on_stderr_and_preserve_json_stdout(monkeypatch, capsys
     assert "[diagnostic] mock assessment stage" in stderr
     assert "[diagnostic] Report serialization completed in" in stderr
     assert "[diagnostic] Report writing to stdout completed in" in stderr
+    assert "[diagnostic]" not in stdout.getvalue()
+
+
+def test_cli_json_diagnostics_runs_real_build_result_end_to_end(monkeypatch, capsys):
+    system_info = SystemInfo(
+        operating_system="Linux",
+        distribution="Ubuntu 24.04 LTS",
+        distribution_version="24.04",
+        kernel_version="6.8.0-test",
+        architecture="x86_64",
+        python_version="3.12.0",
+        hostname="test-host",
+    )
+    package = Package("bash", "5.2.21-2ubuntu4", "bash", "5.2.21-2ubuntu4")
+    monkeypatch.setattr(main, "collect_system_info", lambda: system_info)
+    monkeypatch.setattr(main, "scan_installed_packages", lambda: PackageScanResult([package]))
+    assessment_calls = {}
+
+    def fake_assess_packages(packages, distribution, release, *, diagnostic=None):
+        assessment_calls["packages"] = packages
+        assessment_calls["distribution"] = distribution
+        assessment_calls["release"] = release
+        assessment_calls["diagnostic"] = diagnostic
+        return VulnerabilityAssessmentReport(
+            assessment_status="requires_review",
+            distribution=distribution,
+            release=release,
+            source="mocked assessment source",
+            error=None,
+            packages=[PackageAssessment(
+                package_name="bash",
+                installed_version="5.2.21-2ubuntu4",
+                assessment_status="requires_review",
+                explanation="Mocked package assessment for CLI workflow coverage.",
+                findings=[],
+            )],
+        )
+
+    monkeypatch.setattr(main, "assess_packages", fake_assess_packages)
+    stdout = StringIO()
+
+    exit_code = main.main(["--json", "--diagnostics"], stdout=stdout)
+
+    captured = capsys.readouterr()
+    report = json.loads(stdout.getvalue())
+    assert exit_code == 0
+    assert report["system_info"] == system_info.to_dict()
+    assert report["package_scan"] == {
+        "success": True,
+        "error": None,
+        "packages": [{"name": "bash", "version": "5.2.21-2ubuntu4"}],
+    }
+    assessment = report["vulnerability_assessment"]
+    assert assessment["summary"]["total_assessed_packages"] == 1
+    assert assessment["summary"]["status_counts"] == {"requires_review": 1}
+    assert assessment["packages"][0]["package_name"] == "bash"
+    assert assessment["packages"][0]["assessment_status"] == "requires_review"
+    assert assessment_calls["packages"] == [package]
+    assert assessment_calls["distribution"] == "Ubuntu 24.04 LTS"
+    assert assessment_calls["release"] == "24.04"
+    assert assessment_calls["diagnostic"] is not None
+    assert "[diagnostic] System information collection started." in captured.err
+    assert "[diagnostic] Package inventory started." in captured.err
+    assert "[diagnostic] Report serialization completed in" in captured.err
+    assert "[diagnostic] Report writing to stdout completed in" in captured.err
     assert "[diagnostic]" not in stdout.getvalue()
 
 
@@ -376,6 +484,44 @@ def test_build_result_preserves_package_inventory_failure_in_json(monkeypatch):
     assert any("Package inventory result: success=False" in message for message in messages)
     assert any("Package inventory started" in message for message in messages)
     assert any("Package inventory completed in" in message for message in messages)
+
+
+def test_cli_json_package_inventory_failure_exits_one_and_reports_error(monkeypatch):
+    inventory_error = "dpkg-query failed: database unavailable"
+    monkeypatch.setattr(
+        main,
+        "collect_system_info",
+        lambda: SystemInfo(
+            operating_system="Linux",
+            distribution="Debian GNU/Linux 12",
+            distribution_version="12",
+            kernel_version="6.1.0-test",
+            architecture="x86_64",
+            python_version="3.12.0",
+            hostname="test-host",
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "scan_installed_packages",
+        lambda: PackageScanResult([], inventory_error),
+    )
+    stdout = StringIO()
+
+    exit_code = main.main(["--json"], stdout=stdout)
+
+    report = json.loads(stdout.getvalue())
+    assessment = report["vulnerability_assessment"]
+    assert exit_code == 1
+    assert report["package_scan"] == {
+        "success": False,
+        "error": inventory_error,
+        "packages": [],
+    }
+    assert assessment["assessment_status"] == "error"
+    assert assessment["error"] == "Vulnerability assessment was not run because package inventory failed."
+    assert assessment["summary"]["total_assessed_packages"] == 0
+    assert assessment["summary"]["status_counts"] == {}
 
 
 def test_build_result_uses_internal_source_metadata_without_changing_inventory_json(monkeypatch):
