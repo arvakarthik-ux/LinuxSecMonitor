@@ -157,9 +157,11 @@ def _render_text(result: dict[str, object]) -> str:
             total = len(assessed)
             counts = {}
             for item in assessed:
-                if isinstance(item, dict):
-                    status = item.get("assessment_status", "unknown")
-                    counts[status] = counts.get(status, 0) + 1
+                status = (
+                    item.get("assessment_status", "unknown")
+                    if isinstance(item, dict) else "unknown"
+                )
+                counts[status] = counts.get(status, 0) + 1
             lines.append(f"  Total assessed package entries: {total}")
             if isinstance(counts, dict):
                 lines.append("  Package assessment counts:")

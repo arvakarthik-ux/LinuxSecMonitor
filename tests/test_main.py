@@ -674,6 +674,32 @@ def test_text_counts_package_with_missing_status_as_unknown():
     assert "unknown: 1" in text
 
 
+def test_text_counts_malformed_package_entries_as_unknown():
+    report = {
+        "system_info": {},
+        "package_scan": {"success": True, "error": None, "packages": []},
+        "vulnerability_assessment": {
+            "assessment_status": "requires_review", "error": None,
+            "packages": [
+                {"package_name": "bash", "assessment_status": "vulnerable"},
+                "malformed entry",
+                None,
+                {"package_name": "curl", "assessment_status": "fixed"},
+            ],
+        },
+    }
+
+    text = main._render_text(report)
+
+    assert "Total assessed package entries: 4" in text
+    assert "vulnerable: 1" in text
+    assert "fixed: 1" in text
+    assert "unknown: 2" in text
+    counts_section = text.split("Package assessment counts:\n", 1)[1].split("\n", 4)
+    displayed_counts = [int(line.rsplit(": ", 1)[1]) for line in counts_section if ": " in line]
+    assert sum(displayed_counts) == 4
+
+
 def test_build_result_preserves_package_inventory_failure_in_json(monkeypatch):
     monkeypatch.setattr(
         main, "collect_system_info", lambda: type("Info", (), {"to_dict": lambda self: {
