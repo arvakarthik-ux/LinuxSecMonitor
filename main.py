@@ -171,8 +171,16 @@ def _render_text(result: dict[str, object]) -> str:
             if note and counts.get("no_known_match", 0) > 0:
                 lines.append(f"  Note: {note}")
             if not assessment.get("error"):
-                findings = [finding for item in assessed if isinstance(item, dict)
-                            for finding in item.get("findings", []) if isinstance(finding, dict)]
+                findings = []
+                for item in assessed:
+                    if not isinstance(item, dict):
+                        continue
+                    package_findings = item.get("findings", [])
+                    if isinstance(package_findings, list):
+                        findings.extend(
+                            finding for finding in package_findings
+                            if isinstance(finding, dict)
+                        )
                 advisory_context = assessment.get("advisory_context", {})
                 if not isinstance(advisory_context, dict):
                     advisory_context = {}

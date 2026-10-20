@@ -10,6 +10,7 @@ from scanner.package_scanner import Package, PackageScanResult
 from scanner.system_info import SystemInfo
 from scanner.vulnerability_assessment import (
     PackageAssessment,
+    VulnerabilityFinding,
     VulnerabilityAssessmentReport,
 )
 
@@ -167,6 +168,67 @@ def test_cli_json_diagnostics_runs_real_build_result_end_to_end(monkeypatch, cap
     assert "[diagnostic] Report serialization completed in" in captured.err
     assert "[diagnostic] Report writing to stdout completed in" in captured.err
     assert "[diagnostic]" not in stdout.getvalue()
+
+
+def test_cli_json_serializes_debian_review_finding_with_source_evidence(monkeypatch):
+    system_info = SystemInfo(
+        operating_system="Linux",
+        distribution="Debian GNU/Linux 12",
+        distribution_version="12",
+        kernel_version="6.1.0-test",
+        architecture="x86_64",
+        python_version="3.12.0",
+        hostname="test-host",
+    )
+    package = Package("openssh-server", "1:9.2p1-2+deb12u2", "openssh", "1:9.2p1-2+deb12u2")
+    explanation = "The matching advisory has incomplete version-range data and requires review."
+    finding = VulnerabilityFinding(
+        advisory_id="DEBIAN-CVE-2024-9998",
+        package_name=package.name,
+        installed_version=package.version,
+        source_reference="https://security-tracker.debian.org/tracker/CVE-2024-9998",
+        severity=None,
+        assessment_status="requires_review",
+        explanation=explanation,
+        source_package_name="openssh",
+        source_version="1:9.2p1-2+deb12u2",
+    )
+    assessment = VulnerabilityAssessmentReport(
+        assessment_status="requires_review",
+        distribution="Debian GNU/Linux 12",
+        release="12",
+        source="Debian OSV via osv.dev",
+        error=None,
+        packages=[PackageAssessment(
+            package_name=package.name,
+            installed_version=package.version,
+            assessment_status="requires_review",
+            explanation=explanation,
+            findings=[finding],
+        )],
+    )
+    monkeypatch.setattr(main, "collect_system_info", lambda: system_info)
+    monkeypatch.setattr(main, "scan_installed_packages", lambda: PackageScanResult([package]))
+    monkeypatch.setattr(main, "assess_packages", lambda packages, distribution, release: assessment)
+    stdout = StringIO()
+
+    exit_code = main.main(["--json"], stdout=stdout)
+
+    report = json.loads(stdout.getvalue())
+    assessment_json = report["vulnerability_assessment"]
+    assert exit_code == 0
+    assert report["package_scan"]["success"] is True
+    assert report["package_scan"]["packages"] == [
+        {"name": "openssh-server", "version": "1:9.2p1-2+deb12u2"}
+    ]
+    assert assessment_json["summary"]["total_assessed_packages"] == 1
+    assert assessment_json["summary"]["status_counts"] == {"requires_review": 1}
+    serialized_finding = assessment_json["packages"][0]["findings"][0]
+    assert serialized_finding["assessment_status"] == "requires_review"
+    assert serialized_finding["advisory_id"] == "DEBIAN-CVE-2024-9998"
+    assert serialized_finding["explanation"] == explanation
+    assert serialized_finding["source_package_name"] == "openssh"
+    assert serialized_finding["source_version"] == "1:9.2p1-2+deb12u2"
 
 
 def test_build_result_reports_osv_error_when_inventory_succeeds(monkeypatch):
@@ -426,6 +488,27 @@ def test_text_omits_missing_advisory_context_fields_without_error():
     assert "Summary:" not in text
     assert "    Details:" not in text
     assert "Advisory reference:" not in text
+
+
+def test_text_skips_malformed_null_findings_without_changing_package_counts():
+    report = {
+        "system_info": {},
+        "package_scan": {"success": True, "error": None, "packages": []},
+        "vulnerability_assessment": {
+            "assessment_status": "requires_review",
+            "error": None,
+            "packages": [{
+                "assessment_status": "requires_review",
+                "findings": None,
+            }],
+        },
+    }
+
+    text = main._render_text(report)
+
+    assert "Total assessed package entries: 1" in text
+    assert "requires_review: 1" in text
+    assert "CVE-" not in text
 
 
 def test_text_renders_legacy_findings_without_advisory_context():
