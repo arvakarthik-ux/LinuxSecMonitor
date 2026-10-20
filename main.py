@@ -193,6 +193,17 @@ def _render_text(result: dict[str, object]) -> str:
                         f"{finding.get('advisory_id', 'advisory')} — "
                         f"{finding.get('package_name', 'package')} {finding.get('installed_version', '')}"
                     )
+                    severity = finding.get("severity")
+                    if isinstance(severity, str) and severity.strip():
+                        lines.append(f"    Severity: {severity.strip()}")
+                    explanation = finding.get("explanation")
+                    if isinstance(explanation, str) and explanation.strip():
+                        concise_explanation = " ".join(explanation.split())
+                        if len(concise_explanation) > DETAILS_PREVIEW_LIMIT:
+                            concise_explanation = (
+                                concise_explanation[:DETAILS_PREVIEW_LIMIT - 1].rstrip() + "…"
+                            )
+                        lines.append(f"    Explanation: {concise_explanation}")
                     urgency = finding.get("urgency")
                     if isinstance(urgency, str) and urgency.strip():
                         lines.append(f"    Debian urgency: {urgency.strip()}")

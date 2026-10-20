@@ -457,8 +457,14 @@ def test_text_renders_advisory_context_and_truncates_long_details():
         },
     }
 
+    finding = report["vulnerability_assessment"]["packages"][0]["findings"][0]
+    finding["severity"] = "High"
+    finding["explanation"] = "The installed source version is below the advisory's fixed version."
+
     text = main._render_text(report)
 
+    assert "Severity: High" in text
+    assert "Explanation: The installed source version is below the advisory's fixed version." in text
     assert "Summary: OpenSSH issue summary" in text
     assert "Debian urgency: high" in text
     assert "Source package: openssh 1:9.2p1-2+deb12u2" in text
@@ -528,6 +534,33 @@ def test_text_renders_legacy_findings_without_advisory_context():
 
     assert "vulnerable: CVE-2024-0001 — bash 5.0" in text
     assert "Source package:" not in text
+    assert "Severity:" not in text
+    assert "Explanation:" not in text
+
+
+@pytest.mark.parametrize("severity, explanation", [(None, None), ("", "  ")])
+def test_text_omits_unavailable_or_empty_finding_fields(severity, explanation):
+    report = {
+        "system_info": {},
+        "package_scan": {"success": True, "error": None, "packages": []},
+        "vulnerability_assessment": {
+            "assessment_status": "requires_review", "error": None,
+            "packages": [{"assessment_status": "requires_review", "findings": [{
+                "advisory_id": "DEBIAN-CVE-2024-0001",
+                "package_name": "openssl",
+                "installed_version": "3.0.0",
+                "assessment_status": "requires_review",
+                "severity": severity,
+                "explanation": explanation,
+            }]}],
+        },
+    }
+
+    text = main._render_text(report)
+
+    assert "DEBIAN-CVE-2024-0001" in text
+    assert "Severity:" not in text
+    assert "Explanation:" not in text
 
 
 def test_serialized_assessment_summary_matches_terminal_counts():
