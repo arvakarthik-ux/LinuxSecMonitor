@@ -10,6 +10,7 @@ from time import perf_counter
 from typing import Callable, TextIO, TypeVar
 
 from scanner import collect_system_info, scan_installed_packages
+from scanner.malware_scanner import scan_deb
 from scanner.vulnerability_assessment import assess_packages
 
 T = TypeVar("T")
@@ -238,6 +239,55 @@ def _render_text(result: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _render_malware_text(assessment: dict[str, object]) -> str:
+    """Render the opt-in downloaded-package malware assessment."""
+    def terminal_text(value: object, fallback: str = "Unavailable") -> str:
+        """Escape nonprinting characters before displaying untrusted text."""
+        if not isinstance(value, str):
+            return fallback
+        return "".join(
+            character if character.isprintable()
+            else character.encode("unicode_escape").decode("ascii")
+            for character in value
+        )
+
+    package = assessment.get("package")
+    if not isinstance(package, dict):
+        package = {}
+    identity = " ".join(
+        terminal_text(value, "") for value in (package.get("name"), package.get("version"))
+        if isinstance(value, str) and value.strip()
+    ) or "Unavailable"
+    lines = [
+        "LinuxSecMonitor — Debian package malware assessment",
+        f"Package: {identity}",
+        f"Status: {terminal_text(assessment.get('status'), 'error')}",
+        f"Scanner: {terminal_text(assessment.get('scanner'))}",
+    ]
+    architecture = package.get("architecture")
+    if isinstance(architecture, str) and architecture.strip():
+        lines.append(f"Architecture: {terminal_text(architecture)}")
+    detections = assessment.get("detections")
+    if isinstance(detections, list):
+        for detection in detections:
+            if isinstance(detection, dict):
+                lines.append(
+                    f"Detection: {terminal_text(detection.get('name'), 'Unknown')} — "
+                    f"{terminal_text(detection.get('path'), 'path unavailable')}"
+                )
+    error = assessment.get("error")
+    if isinstance(error, str) and error.strip():
+        lines.append(f"Error: {terminal_text(error)}")
+    limitations = assessment.get("limitations")
+    if isinstance(limitations, list):
+        lines.extend(
+            f"Coverage limitation: {terminal_text(item)}"
+            for item in limitations if isinstance(item, str) and item.strip()
+        )
+    lines.append("Note: No detection does not guarantee that this package is safe.")
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
     """Run the CLI and return a process exit status."""
     parser = argparse.ArgumentParser(description="Collect basic Linux system and package inventory data.")
@@ -247,9 +297,29 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
         "--diagnostics", action="store_true",
         help="Write stage progress and elapsed times to stderr.",
     )
+    parser.add_argument(
+        "--scan-deb", type=Path, metavar="PACKAGE.deb",
+        help="Inspect and scan a downloaded Debian package without installing it.",
+    )
     args = parser.parse_args(argv)
     if args.output and not args.json:
         parser.error("--output requires --json")
+
+    if args.scan_deb:
+        assessment = scan_deb(args.scan_deb).to_dict()
+        if args.json:
+            rendered = json.dumps(assessment, indent=2) + "\n"
+        else:
+            rendered = _render_malware_text(assessment) + "\n"
+        if args.output:
+            try:
+                args.output.write_text(rendered, encoding="utf-8")
+            except OSError as exc:
+                print(f"Could not write JSON output: {exc}", file=sys.stderr)
+                return 2
+        else:
+            stdout.write(rendered)
+        return 0 if assessment["status"] == "no_detection" else 1
 
     diagnostic = None
     if args.diagnostics:

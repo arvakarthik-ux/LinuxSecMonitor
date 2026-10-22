@@ -7,6 +7,7 @@ import pytest
 
 import main
 from scanner.package_scanner import Package, PackageScanResult
+from scanner.malware_scanner import MalwareAssessment, MalwareDetection
 from scanner.system_info import SystemInfo
 from scanner.vulnerability_assessment import (
     PackageAssessment,
@@ -23,6 +24,79 @@ def test_json_output_format(monkeypatch):
     output = StringIO()
     assert main.main(["--json"], stdout=output) == 0
     assert json.loads(output.getvalue())["package_scan"]["packages"][0]["name"] == "bash"
+
+
+def test_scan_deb_cli_keeps_malware_report_separate_and_serializes_json(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "scan_deb",
+        lambda path: MalwareAssessment(
+            status="detected",
+            scanner="ClamAV clamscan",
+            package={"name": "demo", "version": "1.2-3"},
+            detections=[MalwareDetection("Test.Signature", "payload/usr/bin/demo")],
+            coverage_complete=True,
+        ),
+    )
+    output = StringIO()
+
+    exit_code = main.main(["--scan-deb", "demo.deb", "--json"], stdout=output)
+
+    report = json.loads(output.getvalue())
+    assert exit_code == 1
+    assert report["status"] == "detected"
+    assert report["package"]["name"] == "demo"
+    assert report["detections"][0] == {
+        "name": "Test.Signature", "path": "payload/usr/bin/demo",
+    }
+    assert "vulnerability_assessment" not in report
+
+
+def test_scan_deb_text_report_explains_status_and_safety_limit(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "scan_deb",
+        lambda path: MalwareAssessment(
+            status="incomplete",
+            scanner="ClamAV clamscan",
+            package={"name": "demo", "version": "1.2-3", "architecture": "all"},
+            error=None,
+            limitations=["A symbolic link was skipped."],
+        ),
+    )
+    output = StringIO()
+
+    exit_code = main.main(["--scan-deb", "demo.deb"], stdout=output)
+
+    text = output.getvalue()
+    assert exit_code == 1
+    assert "Package: demo 1.2-3" in text
+    assert "Status: incomplete" in text
+    assert "Scanner: ClamAV clamscan" in text
+    assert "Coverage limitation: A symbolic link was skipped." in text
+    assert "No detection does not guarantee" in text
+
+
+def test_malware_text_escapes_package_and_detection_terminal_controls():
+    report = {
+        "status": "detected",
+        "scanner": "ClamAV",
+        "package": {"name": "demo\x1b[31m\nforged", "version": "1.0\rhidden"},
+        "detections": [{
+            "name": "Test.Signature",
+            "path": "payload/evil\x1b[2J\r\nforged",
+        }],
+        "error": None,
+        "limitations": [],
+    }
+
+    text = main._render_malware_text(report)
+
+    assert "demo\\x1b[31m\\nforged" in text
+    assert "1.0\\rhidden" in text
+    assert "payload/evil\\x1b[2J\\r\\nforged" in text
+    assert "\x1b" not in text
+    assert "\r" not in text
 
 
 def test_json_output_file(tmp_path, monkeypatch, capsys):
