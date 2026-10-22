@@ -11,6 +11,7 @@ LinuxSecMonitor is a read-only command-line tool for collecting Linux host detai
 - Writes human-readable text or structured JSON reports.
 - Provides optional progress and timing diagnostics on standard error.
 - Caches validated full Debian OSV advisory records on disk for 24 hours by default.
+- Inventories local repository files and can separately scan a bounded snapshot with ClamAV; repository code is never executed.
 
 ## How a scan works
 
@@ -26,11 +27,24 @@ main.py
   `-- Render text or JSON
 ```
 
+The opt-in `--scan-repo` mode runs repository inventory and ClamAV malware
+assessment as separate stages. It copies eligible regular files into private
+temporary storage and gives ClamAV that staged snapshot, not the original
+repository directory. It does not run scripts, hooks, builds, package
+managers, or repository commands.
+
 The assessment runs only after package inventory succeeds. Eligible Debian assessments query OSV on each run; package-to-advisory query results are not cached. Full advisory records are read from the persistent cache when valid and unexpired; otherwise, they are retrieved from OSV. Package inventory and assessment are read-only.
 
 ## Requirements and installation
 
 Python 3.10 or newer is recommended. Full package inventory is intended for Debian, Ubuntu, and Kali Linux systems with `dpkg-query` available. On Windows, system information and the mocked automated tests can run, but package inventory reports that the operating system is unsupported.
+
+Repository malware assessment additionally requires the `clamscan` executable
+and an available ClamAV signature database. Safe repository scanning requires
+POSIX no-follow directory-descriptor support; Windows can run the mocked tests,
+but this repository malware mode reports `unavailable` there. Linux is the
+validated target. LinuxSecMonitor does not install ClamAV or download/update
+signatures.
 
 The WSL instructions apply when WSL is running a supported Debian, Ubuntu, or Kali Linux distribution; WSL itself is not a separate package-inventory target.
 
@@ -76,6 +90,23 @@ python main.py --diagnostics --json --output scan.json
 
 The same CLI forms work in PowerShell when `python` resolves to the intended interpreter, or with the Windows launcher, for example `py main.py --json`. The implemented options are `--json`, `-o`/`--output`, and `--diagnostics`. `--output` requires `--json`. Diagnostics go to standard error so JSON written to standard output remains parseable. A completed package scan returns exit code `0`; a package-inventory failure returns `1`; a JSON output-file write failure returns `2`.
 
+For an opt-in repository inventory and ClamAV scan:
+
+```bash
+python main.py --scan-repo /path/to/repository
+python main.py --scan-repo /path/to/repository --json
+python main.py --scan-repo /path/to/repository --json --output repository-report.json
+```
+
+Repository JSON keeps the inventory fields at the top level and adds a separate
+`malware_assessment` object. Text output labels the inventory and malware
+assessment separately. Exit code `0` requires both a complete inventory and a
+complete ClamAV scan with `no_detection`; a detection, unavailable scanner,
+error, or incomplete coverage returns `1`. A report-file write failure returns
+`2`. For read-only operation, choose an `--output` path outside the repository
+being scanned; the CLI rejects an output path inside that tree. `--scan-repo`
+does not run the host package inventory or OSV assessment.
+
 ### Example report shape
 
 This is a format template, not a recorded scan result. Values in angle brackets are filled from the current host and data sources.
@@ -113,6 +144,21 @@ Assessment status is shown for the overall assessment and for individual package
 | `mixed` | Overall result used when fixed evidence coexists with other package entries, such as `no_known_match` or `not_affected`. |
 
 Successful empty inventory results are distinct from scan failures. A successful query with no matching advisory still produces `no_known_match`, not a statement that the package is secure.
+
+Repository malware status is reported separately under `malware_assessment`:
+
+| Status | Meaning |
+| --- | --- |
+| `detected` | ClamAV reported one or more signature findings. This is scanner evidence, not an assessment of exploitability. |
+| `no_detection` | ClamAV completed the staged scan without a known detection. This does **not** prove the repository is safe. |
+| `unavailable` | ClamAV or the safe filesystem capabilities/signature database were unavailable. |
+| `incomplete` | Some files or nested content could not be scanned, or a configured limit was reached. |
+| `error` | The scan could not be completed, for example because ClamAV timed out or failed unexpectedly. |
+
+Inventory `status` and `coverage_complete` describe the inventory stage. The
+separate `malware_assessment.status` and `malware_assessment.coverage_complete`
+describe ClamAV scanning; success in one stage does not imply success in the
+other.
 
 ## Distribution support and limitations
 
@@ -238,6 +284,27 @@ LINUXSECMONITOR_LIVE_DEBIAN_OSV=1 python -m pytest -m live_debian_osv tests/inte
 - A `vulnerable` result is limited to the evidence matched from the configured advisory source. The scanner does not detect every vulnerability or configuration weakness.
 - `no_known_match` means only that no matching record was found in the queried data; it does **not** mean safe.
 - Network failures, unsupported distributions, and uncertain package/version evidence are represented as errors, unsupported states, or items requiring review rather than silently treated as safe.
+- Repository malware assessment stages regular files using no-follow directory descriptors, skips `.git`, links, junctions and non-regular entries, and applies limits of 100,000 files, 20,000 directories, 50 MiB per file, 512 MiB total staged data, 30 seconds for staging, and 120 seconds for ClamAV scanning. Limit alerts and skipped content make coverage incomplete. Time checks are cooperative for filesystem operations; they are not a hard bound on a blocked filesystem call.
+- ClamAV scans only the temporary staged snapshot and may inspect supported nested archives. Unsupported or encrypted content, ClamAV errors, missing signatures, and timeouts do not produce a clean result. A `no_detection` result means only that this ClamAV run reported no known detection in the fully staged input; it does not guarantee that the repository is safe.
+- Malware findings are separate from OSV vulnerability findings. A ClamAV signature match is evidence reported by the scanner, not a complete assessment of repository security or a claim about exploitability.
+
+### Optional Debian EICAR check
+
+The EICAR test string is a harmless antivirus test signature, not actual
+malware. On a disposable Debian VM with `clamscan` and its signature database
+already available, this creates a temporary test directory and scans it. It
+does not download malware, install a package, or execute the test file:
+
+```bash
+eicar_dir="$(mktemp -d)"
+trap 'rm -rf "$eicar_dir"' EXIT
+printf '%s' 'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > "$eicar_dir/eicar.txt"
+python main.py --scan-repo "$eicar_dir"
+```
+
+ClamAV signature names can vary. The expected behavior is a `detected` malware
+assessment with a path relative to that temporary repository. Do not interpret
+an unavailable, error, or incomplete result as a clean scan.
 
 ## Project structure
 
@@ -251,10 +318,14 @@ LinuxSecMonitor/
 |   |-- __init__.py
 |   |-- system_info.py
 |   |-- package_scanner.py
+|   |-- repository_scanner.py
+|   |-- repository_malware_scanner.py
 |   `-- vulnerability_assessment.py
 `-- tests/
     |-- test_system_info.py
     |-- test_package_scanner.py
+    |-- test_repository_scanner.py
+    |-- test_repository_malware_scanner.py
     |-- test_vulnerability_assessment.py
     |-- test_debian_assessment.py
     |-- test_main.py

@@ -7,6 +7,7 @@ executes repository-provided code, and it excludes Git internals by default.
 from __future__ import annotations
 
 import os
+import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,7 +89,17 @@ def _is_symlink_or_junction(path: str | Path, entry=None) -> bool:
     if entry is None and Path(path).is_symlink():
         return True
     is_junction = getattr(os.path, "isjunction", None)
-    return bool(is_junction(path)) if is_junction is not None else False
+    if is_junction is not None and is_junction(path):
+        return True
+    try:
+        file_stat = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    # Python exposes isjunction only from 3.12. Windows marks junctions and
+    # other reparse points in st_file_attributes, so older supported runtimes
+    # can still skip them rather than treating them as ordinary directories.
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+    return bool(getattr(file_stat, "st_file_attributes", 0) & reparse_flag)
 
 
 def scan_repository(repository_path: str | Path) -> RepositoryScanResult:

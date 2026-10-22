@@ -3,10 +3,29 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
 from scanner import repository_scanner as scanner
+
+
+def test_reparse_point_attribute_is_treated_as_a_junction(monkeypatch):
+    class Entry:
+        path = "mock-junction"
+
+        @staticmethod
+        def is_symlink():
+            return False
+
+    monkeypatch.setattr(scanner.os.path, "isjunction", lambda path: False, raising=False)
+    monkeypatch.setattr(
+        scanner.os,
+        "stat",
+        lambda path, follow_symlinks=False: SimpleNamespace(st_file_attributes=0x0400),
+    )
+
+    assert scanner._is_symlink_or_junction("mock-junction", Entry()) is True
 
 
 def test_scan_repository_inventories_files_and_manifests_without_running_them(tmp_path):

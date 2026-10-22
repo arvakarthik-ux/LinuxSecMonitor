@@ -12,6 +12,7 @@ from typing import Callable, TextIO, TypeVar
 from scanner import collect_system_info, scan_installed_packages
 from scanner.malware_scanner import scan_deb
 from scanner.repository_scanner import scan_repository
+from scanner.repository_malware_scanner import scan_repository_malware
 from scanner.vulnerability_assessment import assess_packages
 
 T = TypeVar("T")
@@ -344,8 +345,74 @@ def _render_repository_text(result: dict[str, object]) -> str:
                 f"{label}: {terminal_text(value)}"
                 for value in values if isinstance(value, str) and value.strip()
             )
-    lines.append(terminal_text(result.get("note"), "Inventory only; no security analysis was performed."))
+    lines.append(
+        "Inventory scope: "
+        + terminal_text(result.get("note"), "Inventory only; no content analysis was performed.")
+    )
     return "\n".join(lines)
+
+
+def _render_repository_malware_text(assessment: dict[str, object]) -> str:
+    """Render a repository malware result while escaping untrusted output."""
+    def terminal_text(value: object, fallback: str = "Unavailable") -> str:
+        if not isinstance(value, str):
+            return fallback
+        return "".join(
+            character if character.isprintable()
+            else character.encode("unicode_escape").decode("ascii")
+            for character in value
+        )
+
+    lines = [
+        "Repository malware assessment:",
+        f"  Status: {terminal_text(assessment.get('status'), 'error')}",
+        f"  Scanner: {terminal_text(assessment.get('scanner'))}",
+        f"  Coverage complete: {'yes' if assessment.get('coverage_complete') is True else 'no'}",
+        f"  Staged files scanned: {assessment.get('files_scanned', 0)}",
+        f"  Staged bytes scanned: {assessment.get('bytes_scanned', 0)}",
+    ]
+    detections = assessment.get("detections")
+    if isinstance(detections, list) and detections:
+        lines.append("  Detections:")
+        for detection in detections[:20]:
+            if isinstance(detection, dict):
+                lines.append(
+                    f"    {terminal_text(detection.get('name'), 'Unknown')}: "
+                    f"{terminal_text(detection.get('path'), 'path unavailable')}"
+                )
+        if len(detections) > 20:
+            lines.append(f"    … and {len(detections) - 20} more detections")
+    else:
+        lines.append("  Detections: None reported")
+
+    for label, key in (("Error", "errors"), ("Coverage limitation", "limitations")):
+        values = assessment.get(key)
+        if isinstance(values, list):
+            lines.extend(
+                f"  {label}: {terminal_text(value)}"
+                for value in values if isinstance(value, str) and value.strip()
+            )
+    lines.append(terminal_text(
+        assessment.get("note"),
+        "No detection does not guarantee that a repository is safe.",
+    ))
+    return "\n".join(lines)
+
+
+def _output_is_inside_repository(output_path: Path, repository_path: Path) -> bool:
+    """Reject output paths that would write into the repository being scanned."""
+    try:
+        output_absolute = output_path.expanduser().absolute()
+        repository_absolute = repository_path.expanduser().absolute()
+        output_resolved = output_absolute.resolve()
+        repository_resolved = repository_absolute.resolve()
+        return (
+            output_absolute.is_relative_to(repository_absolute)
+            or output_resolved.is_relative_to(repository_resolved)
+        )
+    except (OSError, RuntimeError, ValueError):
+        # If containment cannot be established, avoid a potentially mutating write.
+        return True
 
 
 def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
@@ -363,19 +430,27 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
     )
     parser.add_argument(
         "--scan-repo", type=Path, metavar="REPOSITORY",
-        help="Inventory a local repository without executing or analyzing its contents.",
+        help="Inventory a repository and scan staged file contents with ClamAV when available.",
     )
     args = parser.parse_args(argv)
     if args.output and not args.json:
         parser.error("--output requires --json")
     if args.scan_deb and args.scan_repo:
         parser.error("--scan-deb and --scan-repo cannot be used together")
+    if args.scan_repo and args.output and _output_is_inside_repository(args.output, args.scan_repo):
+        print("Could not write JSON output inside the repository being scanned.", file=sys.stderr)
+        return 2
 
     if args.scan_repo:
         result = scan_repository(args.scan_repo).to_dict()
+        assessment = scan_repository_malware(args.scan_repo).to_dict()
+        result["malware_assessment"] = assessment
         rendered = (
             json.dumps(result, indent=2) + "\n"
-            if args.json else _render_repository_text(result) + "\n"
+            if args.json else (
+                _render_repository_text(result) + "\n"
+                + _render_repository_malware_text(assessment) + "\n"
+            )
         )
         if args.output:
             try:
@@ -385,7 +460,11 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
                 return 2
         else:
             stdout.write(rendered)
-        return 0 if result["coverage_complete"] is True else 1
+        return 0 if (
+            result["coverage_complete"] is True
+            and assessment.get("status") == "no_detection"
+            and assessment.get("coverage_complete") is True
+        ) else 1
 
     if args.scan_deb:
         assessment = scan_deb(args.scan_deb).to_dict()

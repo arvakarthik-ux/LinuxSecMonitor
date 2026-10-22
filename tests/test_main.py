@@ -9,6 +9,10 @@ import main
 from scanner.package_scanner import Package, PackageScanResult
 from scanner.malware_scanner import MalwareAssessment, MalwareDetection
 from scanner import repository_scanner
+from scanner.repository_malware_scanner import (
+    RepositoryMalwareAssessment,
+    RepositoryMalwareDetection,
+)
 from scanner.system_info import SystemInfo
 from scanner.vulnerability_assessment import (
     PackageAssessment,
@@ -100,11 +104,22 @@ def test_malware_text_escapes_package_and_detection_terminal_controls():
     assert "\r" not in text
 
 
-def test_scan_repo_cli_text_displays_inventory_only_report(tmp_path):
+def test_scan_repo_cli_text_displays_separate_inventory_and_malware_results(
+    tmp_path, monkeypatch
+):
     root = tmp_path / "repo"
     root.mkdir()
     (root / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
     (root / "app.py").write_text("print('not executed')\n", encoding="utf-8")
+    monkeypatch.setattr(
+        main,
+        "scan_repository_malware",
+        lambda path: RepositoryMalwareAssessment(
+            status="no_detection", scanner="ClamAV clamscan",
+            repository_path=str(path), files_scanned=2, bytes_scanned=30,
+            coverage_complete=True,
+        ),
+    )
     output = StringIO()
 
     exit_code = main.main(["--scan-repo", str(root)], stdout=output)
@@ -116,16 +131,27 @@ def test_scan_repo_cli_text_displays_inventory_only_report(tmp_path):
     assert "Regular files inventoried: 2" in report
     assert "pyproject.toml: pyproject.toml" in report
     assert "Inventory only" in report
+    assert "Repository malware assessment:" in report
+    assert "Status: no_detection" in report
+    assert "No detection does not guarantee" in report
     assert "malware" in report
     assert "not executed" not in report
 
 
-def test_scan_repo_cli_json_writes_parseable_report_file(tmp_path):
+def test_scan_repo_cli_json_writes_parseable_report_file(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
     (root / "go.mod").write_text("module example\n", encoding="utf-8")
     report_path = tmp_path / "repository.json"
 
+    monkeypatch.setattr(
+        main,
+        "scan_repository_malware",
+        lambda path: RepositoryMalwareAssessment(
+            status="no_detection", repository_path=str(path),
+            files_scanned=1, bytes_scanned=12, coverage_complete=True,
+        ),
+    )
     exit_code = main.main([
         "--scan-repo", str(root), "--json", "--output", str(report_path),
     ], stdout=StringIO())
@@ -136,6 +162,8 @@ def test_scan_repo_cli_json_writes_parseable_report_file(tmp_path):
     assert report["coverage_complete"] is True
     assert report["files_scanned"] == 1
     assert report["manifests"] == [{"name": "go.mod", "path": "go.mod"}]
+    assert report["malware_assessment"]["status"] == "no_detection"
+    assert report["malware_assessment"]["coverage_complete"] is True
     assert "vulnerability_assessment" not in report
     assert "malware" in report["note"]
 
@@ -158,11 +186,38 @@ def test_scan_repo_cli_output_write_failure_returns_two(tmp_path, monkeypatch, c
     assert "Could not write JSON output:" in capsys.readouterr().err
 
 
+def test_scan_repo_refuses_report_path_inside_repository(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "source.txt").write_text("source", encoding="utf-8")
+    report_path = root / "report.json"
+    monkeypatch.setattr(
+        main,
+        "scan_repository_malware",
+        lambda path: pytest.fail("must reject repository output before scanning"),
+    )
+
+    exit_code = main.main([
+        "--scan-repo", str(root), "--json", "--output", str(report_path),
+    ], stdout=StringIO())
+
+    assert exit_code == 2
+    assert not report_path.exists()
+    assert "inside the repository" in capsys.readouterr().err
+
+
 def test_scan_repo_cli_returns_one_for_incomplete_inventory(monkeypatch, tmp_path):
     root = tmp_path / "repo"
     root.mkdir()
     (root / "one.txt").write_text("1", encoding="utf-8")
     monkeypatch.setattr(repository_scanner, "MAX_FILES", 0)
+    monkeypatch.setattr(
+        main,
+        "scan_repository_malware",
+        lambda path: RepositoryMalwareAssessment(
+            status="no_detection", repository_path=str(path), coverage_complete=True,
+        ),
+    )
     output = StringIO()
 
     exit_code = main.main(["--scan-repo", str(root), "--json"], stdout=output)
@@ -173,6 +228,75 @@ def test_scan_repo_cli_returns_one_for_incomplete_inventory(monkeypatch, tmp_pat
     assert report["coverage_complete"] is False
     assert report["files_scanned"] == 0
     assert report["limitations"]
+
+
+@pytest.mark.parametrize("status", ["detected", "incomplete", "error", "unavailable"])
+def test_scan_repo_cli_nonclean_malware_status_returns_one(monkeypatch, tmp_path, status):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "file.txt").write_text("sample", encoding="utf-8")
+    monkeypatch.setattr(
+        main,
+        "scan_repository_malware",
+        lambda path: RepositoryMalwareAssessment(
+            status=status, repository_path=str(path), coverage_complete=False,
+            detections=([RepositoryMalwareDetection("Test.Signature", "file.txt")]
+                        if status == "detected" else []),
+            errors=(["mocked scanner issue"] if status in {"error", "unavailable"} else []),
+            limitations=(["mocked incomplete coverage"] if status == "incomplete" else []),
+        ),
+    )
+    output = StringIO()
+
+    exit_code = main.main(["--scan-repo", str(root), "--json"], stdout=output)
+
+    report = json.loads(output.getvalue())
+    assert exit_code == 1
+    assert report["malware_assessment"]["status"] == status
+
+
+def test_scan_repo_text_escapes_control_characters_in_malware_paths_and_errors():
+    assessment = {
+        "status": "detected",
+        "scanner": "ClamAV",
+        "coverage_complete": False,
+        "files_scanned": 1,
+        "bytes_scanned": 2,
+        "detections": [{"name": "Test.Signature", "path": "src/a\x1b[2J\r\nforge.py"}],
+        "errors": ["bad\x1b[31m\r\nmessage"],
+        "limitations": [],
+        "note": "No detection does not guarantee safety.",
+    }
+
+    rendered = main._render_repository_malware_text(assessment)
+
+    assert "src/a\\x1b[2J\\r\\nforge.py" in rendered
+    assert "bad\\x1b[31m\\r\\nmessage" in rendered
+    assert "\x1b" not in rendered
+    assert "\r" not in rendered
+
+
+def test_scan_repo_json_preserves_detection_path_as_encoded_data(monkeypatch, tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "sample.txt").write_text("sample", encoding="utf-8")
+    unusual_path = "src/résumé [draft]\nfile.txt"
+    monkeypatch.setattr(
+        main,
+        "scan_repository_malware",
+        lambda path: RepositoryMalwareAssessment(
+            status="detected", repository_path=str(path),
+            detections=[RepositoryMalwareDetection("Test.Signature", unusual_path)],
+            coverage_complete=True,
+        ),
+    )
+    output = StringIO()
+
+    exit_code = main.main(["--scan-repo", str(root), "--json"], stdout=output)
+
+    report = json.loads(output.getvalue())
+    assert exit_code == 1
+    assert report["malware_assessment"]["detections"][0]["path"] == unusual_path
 
 
 def test_scan_repo_cli_reports_missing_path_in_text(tmp_path):
