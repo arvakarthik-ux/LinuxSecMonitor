@@ -11,11 +11,13 @@ from typing import Callable, TextIO, TypeVar
 
 from scanner import collect_system_info, scan_installed_packages
 from scanner.malware_scanner import scan_deb
+from scanner.repository_scanner import scan_repository
 from scanner.vulnerability_assessment import assess_packages
 
 T = TypeVar("T")
 DiagnosticCallback = Callable[[str], None]
 DETAILS_PREVIEW_LIMIT = 240
+REPOSITORY_MANIFEST_PREVIEW_LIMIT = 20
 
 
 def _diagnose(callback: DiagnosticCallback | None, message: str) -> None:
@@ -288,6 +290,64 @@ def _render_malware_text(assessment: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _render_repository_text(result: dict[str, object]) -> str:
+    """Render the read-only repository inventory without trusting filenames."""
+    def terminal_text(value: object, fallback: str = "Unavailable") -> str:
+        if not isinstance(value, str):
+            return fallback
+        return "".join(
+            character if character.isprintable()
+            else character.encode("unicode_escape").decode("ascii")
+            for character in value
+        )
+
+    lines = [
+        "LinuxSecMonitor — repository inventory",
+        f"Repository: {terminal_text(result.get('repository_path'))}",
+        f"Status: {terminal_text(result.get('status'), 'error')}",
+        f"Coverage complete: {'yes' if result.get('coverage_complete') is True else 'no'}",
+        f"Files observed: {result.get('files_observed', 0)}",
+        f"Regular files inventoried: {result.get('files_scanned', 0)}",
+        f"Entries skipped: {result.get('files_skipped', 0)}",
+        f"Bytes inventoried (from file metadata): {result.get('bytes_scanned', 0)}",
+        "File types:",
+    ]
+    file_types = result.get("file_types")
+    if isinstance(file_types, dict) and file_types:
+        lines.extend(
+            f"  {terminal_text(extension)}: {count}"
+            for extension, count in sorted(file_types.items())
+        )
+    else:
+        lines.append("  None")
+
+    lines.append("Project manifests:")
+    manifests = result.get("manifests")
+    if isinstance(manifests, list) and manifests:
+        for manifest in manifests[:REPOSITORY_MANIFEST_PREVIEW_LIMIT]:
+            if isinstance(manifest, dict):
+                lines.append(
+                    f"  {terminal_text(manifest.get('name'))}: "
+                    f"{terminal_text(manifest.get('path'))}"
+                )
+        if len(manifests) > REPOSITORY_MANIFEST_PREVIEW_LIMIT:
+            lines.append(
+                f"  … and {len(manifests) - REPOSITORY_MANIFEST_PREVIEW_LIMIT} more"
+            )
+    else:
+        lines.append("  None found")
+
+    for label, key in (("Limitation", "limitations"), ("Error", "errors")):
+        values = result.get(key)
+        if isinstance(values, list):
+            lines.extend(
+                f"{label}: {terminal_text(value)}"
+                for value in values if isinstance(value, str) and value.strip()
+            )
+    lines.append(terminal_text(result.get("note"), "Inventory only; no security analysis was performed."))
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
     """Run the CLI and return a process exit status."""
     parser = argparse.ArgumentParser(description="Collect basic Linux system and package inventory data.")
@@ -301,9 +361,31 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
         "--scan-deb", type=Path, metavar="PACKAGE.deb",
         help="Inspect and scan a downloaded Debian package without installing it.",
     )
+    parser.add_argument(
+        "--scan-repo", type=Path, metavar="REPOSITORY",
+        help="Inventory a local repository without executing or analyzing its contents.",
+    )
     args = parser.parse_args(argv)
     if args.output and not args.json:
         parser.error("--output requires --json")
+    if args.scan_deb and args.scan_repo:
+        parser.error("--scan-deb and --scan-repo cannot be used together")
+
+    if args.scan_repo:
+        result = scan_repository(args.scan_repo).to_dict()
+        rendered = (
+            json.dumps(result, indent=2) + "\n"
+            if args.json else _render_repository_text(result) + "\n"
+        )
+        if args.output:
+            try:
+                args.output.write_text(rendered, encoding="utf-8")
+            except OSError as exc:
+                print(f"Could not write JSON output: {exc}", file=sys.stderr)
+                return 2
+        else:
+            stdout.write(rendered)
+        return 0 if result["coverage_complete"] is True else 1
 
     if args.scan_deb:
         assessment = scan_deb(args.scan_deb).to_dict()

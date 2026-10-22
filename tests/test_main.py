@@ -8,6 +8,7 @@ import pytest
 import main
 from scanner.package_scanner import Package, PackageScanResult
 from scanner.malware_scanner import MalwareAssessment, MalwareDetection
+from scanner import repository_scanner
 from scanner.system_info import SystemInfo
 from scanner.vulnerability_assessment import (
     PackageAssessment,
@@ -95,6 +96,116 @@ def test_malware_text_escapes_package_and_detection_terminal_controls():
     assert "demo\\x1b[31m\\nforged" in text
     assert "1.0\\rhidden" in text
     assert "payload/evil\\x1b[2J\\r\\nforged" in text
+    assert "\x1b" not in text
+    assert "\r" not in text
+
+
+def test_scan_repo_cli_text_displays_inventory_only_report(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    (root / "app.py").write_text("print('not executed')\n", encoding="utf-8")
+    output = StringIO()
+
+    exit_code = main.main(["--scan-repo", str(root)], stdout=output)
+
+    report = output.getvalue()
+    assert exit_code == 0
+    assert "repository inventory" in report
+    assert "Status: completed" in report
+    assert "Regular files inventoried: 2" in report
+    assert "pyproject.toml: pyproject.toml" in report
+    assert "Inventory only" in report
+    assert "malware" in report
+    assert "not executed" not in report
+
+
+def test_scan_repo_cli_json_writes_parseable_report_file(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "go.mod").write_text("module example\n", encoding="utf-8")
+    report_path = tmp_path / "repository.json"
+
+    exit_code = main.main([
+        "--scan-repo", str(root), "--json", "--output", str(report_path),
+    ], stdout=StringIO())
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert report["status"] == "completed"
+    assert report["coverage_complete"] is True
+    assert report["files_scanned"] == 1
+    assert report["manifests"] == [{"name": "go.mod", "path": "go.mod"}]
+    assert "vulnerability_assessment" not in report
+    assert "malware" in report["note"]
+
+
+def test_scan_repo_cli_output_write_failure_returns_two(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "README.md").write_text("example", encoding="utf-8")
+    monkeypatch.setattr(
+        main.Path,
+        "write_text",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("mocked disk full")),
+    )
+
+    exit_code = main.main([
+        "--scan-repo", str(root), "--json", "--output", str(tmp_path / "report.json"),
+    ], stdout=StringIO())
+
+    assert exit_code == 2
+    assert "Could not write JSON output:" in capsys.readouterr().err
+
+
+def test_scan_repo_cli_returns_one_for_incomplete_inventory(monkeypatch, tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "one.txt").write_text("1", encoding="utf-8")
+    monkeypatch.setattr(repository_scanner, "MAX_FILES", 0)
+    output = StringIO()
+
+    exit_code = main.main(["--scan-repo", str(root), "--json"], stdout=output)
+
+    report = json.loads(output.getvalue())
+    assert exit_code == 1
+    assert report["status"] == "incomplete"
+    assert report["coverage_complete"] is False
+    assert report["files_scanned"] == 0
+    assert report["limitations"]
+
+
+def test_scan_repo_cli_reports_missing_path_in_text(tmp_path):
+    output = StringIO()
+
+    exit_code = main.main(["--scan-repo", str(tmp_path / "missing")], stdout=output)
+
+    assert exit_code == 1
+    assert "Status: error" in output.getvalue()
+    assert "not a readable directory" in output.getvalue()
+
+
+def test_repository_text_escapes_untrusted_manifest_path_controls():
+    result = {
+        "status": "completed",
+        "repository_path": "repo\x1b[2J\r\nforged",
+        "files_observed": 1,
+        "files_scanned": 1,
+        "files_skipped": 0,
+        "bytes_scanned": 10,
+        "file_types": {".json\x1b[31m": 1},
+        "manifests": [{"name": "package.json", "path": "dir\nname/package.json"}],
+        "limitations": [],
+        "errors": [],
+        "coverage_complete": True,
+        "note": "Inventory only.",
+    }
+
+    text = main._render_repository_text(result)
+
+    assert "repo\\x1b[2J\\r\\nforged" in text
+    assert "dir\\nname/package.json" in text
+    assert "\\x1b[31m" in text
     assert "\x1b" not in text
     assert "\r" not in text
 
