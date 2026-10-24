@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import stat
 import subprocess
 import sys
@@ -24,6 +23,23 @@ T = TypeVar("T")
 DiagnosticCallback = Callable[[str], None]
 DETAILS_PREVIEW_LIMIT = 240
 REPOSITORY_MANIFEST_PREVIEW_LIMIT = 20
+_SYSTEM_COMMAND_PATHS = {
+    "apt-get": "/usr/bin/apt-get",
+    "sudo": "/usr/bin/sudo",
+    "chgrp": "/usr/bin/chgrp",
+    "chmod": "/usr/bin/chmod",
+}
+
+
+def _find_system_command(name: str) -> str | None:
+    """Find an expected system command without trusting the caller's PATH."""
+    path = _SYSTEM_COMMAND_PATHS.get(name)
+    if path is None:
+        return None
+    try:
+        return path if Path(path).is_file() and os.access(path, os.X_OK) else None
+    except OSError:
+        return None
 
 
 def _diagnose(callback: DiagnosticCallback | None, message: str) -> None:
@@ -508,6 +524,11 @@ def _create_package_snapshot(source: Path, destination: Path) -> None:
                 pass
 
 
+def _preinstall_temp_parent() -> str | None:
+    """Use a traversable parent so APT's sandbox can reach the private snapshot."""
+    return "/tmp" if os.name == "posix" else None
+
+
 def _render_preinstall_report(assessment: dict[str, object]) -> str:
     """Render the scan result shown before the installation confirmation."""
     rendered = _render_malware_text(assessment)
@@ -516,6 +537,77 @@ def _render_preinstall_report(assessment: dict[str, object]) -> str:
             "\nNo known malware detection was found. This does not guarantee safety."
         )
     return rendered
+
+
+def _is_effective_root() -> bool:
+    """Return whether this process already has root privileges."""
+    return os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def _apt_sandbox_gid() -> int:
+    """Return APT's sandbox user's primary group ID on Linux."""
+    if os.name != "posix":
+        raise OSError("APT sandbox permissions are available only on Linux")
+    try:
+        import pwd
+
+        return pwd.getpwnam("_apt").pw_gid
+    except (ImportError, KeyError, OSError) as exc:
+        raise OSError("could not determine the APT sandbox user's group") from exc
+
+
+def _run_permission_command(command: list[str]) -> subprocess.CompletedProcess:
+    """Run a fixed permission-management command without a shell."""
+    return subprocess.run(
+        command, check=False, shell=False, stdin=None,
+        stdout=sys.stderr, stderr=sys.stderr,
+    )
+
+
+def _prepare_snapshot_for_apt(
+    package_path: Path,
+    private_root: Path,
+    *,
+    sudo_path: str | None,
+) -> str | None:
+    """Allow only APT's sandbox group to traverse/read the scanned snapshot.
+
+    The package and its directory remain private from other local users. This
+    permits APT's `_apt` acquisition sandbox to read a local package without
+    making the temporary directory or package world-accessible.
+    """
+    try:
+        sandbox_gid = _apt_sandbox_gid()
+        if _is_effective_root():
+            os.chown(private_root, -1, sandbox_gid)
+            os.chmod(private_root, 0o710)
+            os.chown(package_path, -1, sandbox_gid)
+            os.chmod(package_path, 0o640)
+            return None
+
+        if sudo_path is None:
+            return "sudo is unavailable; could not safely prepare the private package for APT."
+        chgrp_path = _find_system_command("chgrp")
+        chmod_path = _find_system_command("chmod")
+        if chgrp_path is None or chmod_path is None:
+            return "chgrp or chmod is unavailable; the private package was not exposed to APT."
+
+        commands = [
+            [sudo_path, chgrp_path, "--", str(sandbox_gid), str(private_root), str(package_path)],
+            [sudo_path, chmod_path, "0710", "--", str(private_root)],
+            [sudo_path, chmod_path, "0640", "--", str(package_path)],
+        ]
+        for command in commands:
+            completed = _run_permission_command(command)
+            if completed.returncode != 0:
+                return (
+                    "Could not safely prepare the private package for APT "
+                    f"(permission command exited with status {completed.returncode}); "
+                    "installation was not attempted."
+                )
+        return None
+    except (OSError, PermissionError) as exc:
+        return f"Could not safely prepare the private package for APT: {exc}"
 
 
 def _run_preinstall_deb(
@@ -547,7 +639,9 @@ def _run_preinstall_deb(
 
     outcome: tuple[dict[str, object], dict[str, object], int] | None = None
     try:
-        with tempfile.TemporaryDirectory(prefix="linuxsecmonitor-preinstall-") as temporary:
+        with tempfile.TemporaryDirectory(
+            prefix="linuxsecmonitor-preinstall-", dir=_preinstall_temp_parent(),
+        ) as temporary:
             private_root = Path(temporary)
             if os.name == "posix":
                 os.chmod(private_root, 0o700)
@@ -632,7 +726,7 @@ def _run_preinstall_snapshot(
         installation = {"status": "blocked", "message": message, "returncode": None}
         return assessment, installation, 1
 
-    apt_get = shutil.which("apt-get")
+    apt_get = _find_system_command("apt-get")
     if apt_get is None:
         installation = {
             "status": "unavailable",
@@ -649,10 +743,67 @@ def _run_preinstall_snapshot(
         answer = sys.stdin.readline()
     except (OSError, KeyboardInterrupt):
         answer = ""
-    if answer.strip().casefold() != "install":
+    # Accept only the exact token plus the terminal line ending. Do not trim
+    # spaces or normalize case; either would broaden approval unexpectedly.
+    if answer.removesuffix("\n").removesuffix("\r") != "INSTALL":
         installation = {
             "status": "cancelled",
             "message": "Installation was not approved and was cancelled.",
+            "returncode": None,
+        }
+        return assessment, installation, 1
+
+    is_root = _is_effective_root()
+    sudo_path = None if is_root else _find_system_command("sudo")
+    if not is_root and sudo_path is None:
+        installation = {
+            "status": "unavailable",
+            "message": "sudo is unavailable; administrator privileges were not requested and installation was not attempted.",
+            "returncode": None,
+        }
+        return assessment, installation, 1
+
+    if sudo_path is not None:
+        print("Requesting administrator authorization for installation only.", file=sys.stderr)
+        try:
+            authorization = _run_permission_command([sudo_path, "-v"])
+        except KeyboardInterrupt:
+            installation = {
+                "status": "cancelled",
+                "message": "Administrator authorization was interrupted; installation was not attempted.",
+                "returncode": None,
+            }
+            return assessment, installation, 1
+        except (FileNotFoundError, PermissionError, OSError) as exc:
+            installation = {
+                "status": "failed",
+                "message": f"Could not obtain administrator authorization; installation was not attempted: {exc}",
+                "returncode": None,
+            }
+            return assessment, installation, 1
+        if authorization.returncode != 0:
+            installation = {
+                "status": "failed",
+                "message": "Administrator authorization was not granted; installation was not attempted.",
+                "returncode": authorization.returncode,
+            }
+            return assessment, installation, 1
+
+    try:
+        permission_error = _prepare_snapshot_for_apt(
+            package_path, package_path.parent, sudo_path=sudo_path,
+        )
+    except KeyboardInterrupt:
+        installation = {
+            "status": "cancelled",
+            "message": "Preparing the private package for APT was interrupted; installation was not attempted.",
+            "returncode": None,
+        }
+        return assessment, installation, 1
+    if permission_error is not None:
+        installation = {
+            "status": "failed",
+            "message": permission_error,
             "returncode": None,
         }
         return assessment, installation, 1
@@ -663,6 +814,8 @@ def _run_preinstall_snapshot(
         file=sys.stderr,
     )
     command = [apt_get, "install", "--no-remove", "--", str(package_path)]
+    if sudo_path is not None:
+        command.insert(0, sudo_path)
     try:
         completed = subprocess.run(
             command,

@@ -121,9 +121,11 @@ python main.py --preinstall-deb /path/to/downloaded-package.deb --json --output 
 
 This mode requires Linux, `dpkg-deb`, `clamscan`, and a usable ClamAV signature
 database for a completed scan. Installation additionally requires `apt-get`
-and the privileges needed by APT. LinuxSecMonitor does not elevate privileges
-itself. It creates a private, size-limited snapshot and scans that snapshot;
-after approval, it passes the same snapshot to APT using the equivalent of:
+and the privileges needed by APT. Run LinuxSecMonitor as a normal user so the
+package inspection remains unprivileged. After a complete scan and exact user
+approval, it requests administrator authorization for installation only. It
+creates a private, size-limited snapshot and scans that snapshot; after
+approval, it passes the same snapshot to APT using the equivalent of:
 
 ```text
 apt-get install --no-remove -- /absolute/path/to/scanned-package.deb
@@ -138,7 +140,12 @@ package maintainer scripts after the user approves. Scanning does not execute
 package scripts.
 
 Only a complete `no_detection` assessment reaches the confirmation prompt. The
-user must type `INSTALL`; empty input, EOF, or any other response cancels. A
+user must type exactly `INSTALL`; lowercase input, extra spaces, empty input,
+EOF, or any other response cancels. For a normal-user run, `sudo` is used only
+after that confirmation. The snapshot remains private: only APT's sandbox
+group receives directory traverse and file read access, and the workflow does
+not make it world-readable or world-writable. If those permissions cannot be
+set safely, installation is not attempted. A
 `detected` result blocks installation without offering a bypass. `incomplete`,
 `error`, and `unavailable` results also block installation. A no-detection
 result means only that ClamAV reported no known detection in the inspected
@@ -333,9 +340,10 @@ LINUXSECMONITOR_LIVE_DEBIAN_OSV=1 python -m pytest -m live_debian_osv tests/inte
   inventory/scanning are read-only. The explicitly selected
   `--preinstall-deb` workflow can install the specified local package after
   confirmation; it never installs automatically.
-- Scanning does not require root privileges. The later APT installation step
-  requires the privileges APT needs. LinuxSecMonitor does not elevate privileges
-  itself and does not run a privileged background service.
+- Scanning does not require root privileges. The pre-install workflow requests
+  administrator authorization only after a complete `no_detection` result and
+  the exact `INSTALL` confirmation. It does not run a privileged background
+  service.
 - It does not automatically remediate findings.
 - A `vulnerable` result is limited to the evidence matched from the configured advisory source. The scanner does not detect every vulnerability or configuration weakness.
 - `no_known_match` means only that no matching record was found in the queried data; it does **not** mean safe.

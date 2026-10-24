@@ -87,6 +87,7 @@ def _prepare_preinstall(monkeypatch, tmp_path, *, status="no_detection", coverag
     package_path = tmp_path / "downloaded package.deb"
     package_path.write_bytes(b"fixture package bytes")
     monkeypatch.setattr(main.tempfile, "tempdir", str(tmp_path), raising=False)
+    monkeypatch.setattr(main, "_preinstall_temp_parent", lambda: str(tmp_path))
     assessment = MalwareAssessment(
         status=status,
         scanner="ClamAV clamscan",
@@ -100,7 +101,15 @@ def _prepare_preinstall(monkeypatch, tmp_path, *, status="no_detection", coverag
         coverage_complete=coverage,
     )
     monkeypatch.setattr(main, "scan_deb", lambda path: assessment)
-    monkeypatch.setattr(main.shutil, "which", lambda name: "/usr/bin/apt-get")
+    tools = {
+        "apt-get": "/usr/bin/apt-get",
+        "sudo": "/usr/bin/sudo",
+        "chgrp": "/usr/bin/chgrp",
+        "chmod": "/usr/bin/chmod",
+    }
+    monkeypatch.setattr(main, "_find_system_command", lambda name: tools.get(name))
+    monkeypatch.setattr(main, "_is_effective_root", lambda: False)
+    monkeypatch.setattr(main, "_apt_sandbox_gid", lambda: 123)
     return package_path, assessment
 
 
@@ -121,9 +130,11 @@ def test_preinstall_deb_requires_explicit_confirmation_and_keeps_json_stdout_cle
 
     def install(command, **kwargs):
         commands.append((command, kwargs))
-        assert scanned_paths
-        assert main.Path(command[-1]) == scanned_paths[0]
-        assert main.Path(command[-1]).read_bytes() == b"fixture package bytes"
+        assert kwargs["shell"] is False
+        if any(main.Path(part).name == "apt-get" for part in command):
+            assert scanned_paths
+            assert main.Path(command[-1]) == scanned_paths[0]
+            assert main.Path(command[-1]).read_bytes() == b"fixture package bytes"
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(main.subprocess, "run", install)
@@ -138,10 +149,23 @@ def test_preinstall_deb_requires_explicit_confirmation_and_keeps_json_stdout_cle
     assert report["malware_assessment"]["status"] == "no_detection"
     assert report["installation"]["status"] == "installed"
     assert "does not guarantee safety" in capsys.readouterr().err
-    assert len(commands) == 1
-    command, options = commands[0]
+    assert len(commands) == 5
+    assert commands[0][0] == ["/usr/bin/sudo", "-v"]
+    assert commands[1][0] == [
+        "/usr/bin/sudo", "/usr/bin/chgrp", "--", "123",
+        str(scanned_paths[0].parent), str(scanned_paths[0]),
+    ]
+    assert commands[2][0] == [
+        "/usr/bin/sudo", "/usr/bin/chmod", "0710", "--",
+        str(scanned_paths[0].parent),
+    ]
+    assert commands[3][0] == [
+        "/usr/bin/sudo", "/usr/bin/chmod", "0640", "--", str(scanned_paths[0]),
+    ]
+    command, options = commands[4]
     assert command == [
-        "/usr/bin/apt-get", "install", "--no-remove", "--", str(scanned_paths[0]),
+        "/usr/bin/sudo", "/usr/bin/apt-get", "install", "--no-remove", "--",
+        str(scanned_paths[0]),
     ]
     assert scanned_paths[0] != package_path.resolve()
     assert not scanned_paths[0].exists()
@@ -151,9 +175,12 @@ def test_preinstall_deb_requires_explicit_confirmation_and_keeps_json_stdout_cle
     assert options["stderr"] is main.sys.stderr
 
 
-def test_preinstall_deb_cancellation_does_not_start_apt(monkeypatch, tmp_path, capsys):
+@pytest.mark.parametrize("confirmation", ["no\n", "install\n", "INSTALL \n"])
+def test_preinstall_deb_requires_exact_confirmation_and_does_not_start_apt(
+    monkeypatch, tmp_path, capsys, confirmation,
+):
     package_path, _ = _prepare_preinstall(monkeypatch, tmp_path)
-    monkeypatch.setattr(main.sys, "stdin", StringIO("no\n"))
+    monkeypatch.setattr(main.sys, "stdin", StringIO(confirmation))
     monkeypatch.setattr(
         main.subprocess, "run", lambda *args, **kwargs: pytest.fail("APT must not run"),
     )
@@ -165,6 +192,83 @@ def test_preinstall_deb_cancellation_does_not_start_apt(monkeypatch, tmp_path, c
     assert "No known malware detection was found" in stdout.getvalue()
     assert "Installation: cancelled" in stdout.getvalue()
     assert "Type INSTALL" in capsys.readouterr().err
+
+
+def test_preinstall_deb_missing_sudo_is_reported_after_approval_without_apt(
+    monkeypatch, tmp_path,
+):
+    package_path, _ = _prepare_preinstall(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "_find_system_command", lambda name: (
+        "/usr/bin/apt-get" if name == "apt-get" else None
+    ))
+    monkeypatch.setattr(main.sys, "stdin", StringIO("INSTALL\n"))
+    monkeypatch.setattr(
+        main.subprocess, "run", lambda *args, **kwargs: pytest.fail("APT must not run"),
+    )
+    stdout = StringIO()
+
+    exit_code = main.main(
+        ["--preinstall-deb", str(package_path), "--json"], stdout=stdout,
+    )
+
+    report = json.loads(stdout.getvalue())
+    assert exit_code == 1
+    assert report["installation"]["status"] == "unavailable"
+    assert "sudo is unavailable" in report["installation"]["message"]
+
+
+def test_preinstall_deb_denied_sudo_authorization_does_not_start_apt(
+    monkeypatch, tmp_path,
+):
+    package_path, _ = _prepare_preinstall(monkeypatch, tmp_path)
+    monkeypatch.setattr(main.sys, "stdin", StringIO("INSTALL\n"))
+    commands = []
+
+    def deny_authorization(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(main.subprocess, "run", deny_authorization)
+    stdout = StringIO()
+
+    exit_code = main.main(
+        ["--preinstall-deb", str(package_path), "--json"], stdout=stdout,
+    )
+
+    report = json.loads(stdout.getvalue())
+    assert exit_code == 1
+    assert commands == [["/usr/bin/sudo", "-v"]]
+    assert report["installation"]["status"] == "failed"
+    assert report["installation"]["returncode"] == 1
+    assert "authorization was not granted" in report["installation"]["message"]
+
+
+def test_preinstall_deb_blocks_when_apt_sandbox_permissions_cannot_be_set(
+    monkeypatch, tmp_path,
+):
+    package_path, _ = _prepare_preinstall(monkeypatch, tmp_path)
+    monkeypatch.setattr(main.sys, "stdin", StringIO("INSTALL\n"))
+    commands = []
+
+    def fail_permission_setup(command, **kwargs):
+        commands.append(command)
+        if command == ["/usr/bin/sudo", "-v"]:
+            return SimpleNamespace(returncode=0)
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(main.subprocess, "run", fail_permission_setup)
+    stdout = StringIO()
+
+    exit_code = main.main(
+        ["--preinstall-deb", str(package_path), "--json"], stdout=stdout,
+    )
+
+    report = json.loads(stdout.getvalue())
+    assert exit_code == 1
+    assert len(commands) == 2
+    assert "apt-get" not in " ".join(commands[-1])
+    assert report["installation"]["status"] == "failed"
+    assert "not attempted" in report["installation"]["message"]
 
 
 def test_preinstall_deb_json_report_file_stays_parseable_on_cancellation(
@@ -222,7 +326,7 @@ def test_preinstall_deb_missing_apt_tool_is_reported_without_prompt(
     monkeypatch, tmp_path, capsys,
 ):
     package_path, _ = _prepare_preinstall(monkeypatch, tmp_path)
-    monkeypatch.setattr(main.shutil, "which", lambda name: None)
+    monkeypatch.setattr(main, "_find_system_command", lambda name: None)
     monkeypatch.setattr(main.sys, "stdin", StringIO("INSTALL\n"))
     stdout = StringIO()
 
@@ -257,9 +361,12 @@ def test_preinstall_deb_invalid_paths_are_reported_without_scanning(
 def test_preinstall_deb_apt_failure_is_reported(monkeypatch, tmp_path):
     package_path, _ = _prepare_preinstall(monkeypatch, tmp_path)
     monkeypatch.setattr(main.sys, "stdin", StringIO("INSTALL\n"))
-    monkeypatch.setattr(
-        main.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=100),
-    )
+
+    def fail_apt(command, **kwargs):
+        is_apt = any(main.Path(part).name == "apt-get" for part in command)
+        return SimpleNamespace(returncode=100 if is_apt else 0)
+
+    monkeypatch.setattr(main.subprocess, "run", fail_apt)
     stdout = StringIO()
 
     exit_code = main.main(
@@ -290,7 +397,7 @@ def test_preinstall_deb_permission_error_is_reported(monkeypatch, tmp_path):
     report = json.loads(stdout.getvalue())
     assert exit_code == 1
     assert report["installation"]["status"] == "failed"
-    assert "Permission denied" in report["installation"]["message"]
+    assert "administrator authorization" in report["installation"]["message"]
 
 
 def test_preinstall_deb_report_cannot_overwrite_package(monkeypatch, tmp_path, capsys):
