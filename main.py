@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
+import stat
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from time import perf_counter
 from typing import Callable, TextIO, TypeVar
 
 from scanner import collect_system_info, scan_installed_packages
-from scanner.malware_scanner import scan_deb
+from scanner.malware_scanner import MAX_PACKAGE_BYTES, MalwareAssessment, scan_deb
 from scanner.repository_scanner import scan_repository
 from scanner.repository_malware_scanner import scan_repository_malware
 from scanner.vulnerability_assessment import assess_packages
@@ -415,6 +420,329 @@ def _output_is_inside_repository(output_path: Path, repository_path: Path) -> bo
         return True
 
 
+def _validated_deb_path(package_path: Path) -> tuple[Path | None, str | None]:
+    """Resolve a readable regular .deb file without accepting a symlink."""
+    try:
+        candidate = package_path.expanduser().absolute()
+        if candidate.suffix.lower() != ".deb":
+            return None, "The package path must name a .deb file."
+        if candidate.is_symlink():
+            return None, "The package path must not be a symbolic link."
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_file() or not os.access(resolved, os.R_OK):
+            return None, "The package path is not a readable regular file."
+        return resolved, None
+    except (OSError, RuntimeError, ValueError) as exc:
+        return None, f"Could not validate the package path: {exc}"
+
+
+def _output_overwrites_package(output_path: Path, package_path: Path) -> bool:
+    """Return true when a report path aliases the package file being scanned."""
+    try:
+        output_absolute = output_path.expanduser().absolute()
+        package_resolved = package_path.expanduser().resolve(strict=False)
+        if output_absolute.resolve(strict=False) == package_resolved:
+            return True
+        return output_absolute.exists() and os.path.samefile(output_absolute, package_resolved)
+    except (OSError, RuntimeError, ValueError):
+        # Ambiguous path identity must not risk overwriting the input package.
+        return True
+
+
+def _create_package_snapshot(source: Path, destination: Path) -> None:
+    """Copy a bounded, stable package snapshot for both scanning and APT."""
+    source_flags = (
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    )
+    if hasattr(os, "O_CLOEXEC"):
+        source_flags |= os.O_CLOEXEC
+    source_fd = os.open(source, source_flags)
+    target_fd: int | None = None
+    copied = 0
+    completed = False
+    try:
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError("the package changed to a non-regular file")
+        if before.st_size < 0 or before.st_size > MAX_PACKAGE_BYTES:
+            raise OSError("the package exceeds the compressed-size limit")
+        target_fd = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        while True:
+            chunk = os.read(source_fd, 64 * 1024)
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > MAX_PACKAGE_BYTES:
+                raise OSError("the package grew beyond the compressed-size limit")
+            remaining = memoryview(chunk)
+            while remaining:
+                written = os.write(target_fd, remaining)
+                if written <= 0:
+                    raise OSError("could not finish writing the private package snapshot")
+                remaining = remaining[written:]
+        after = os.fstat(source_fd)
+        if (
+            copied != before.st_size
+            or before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or getattr(before, "st_mtime_ns", None) != getattr(after, "st_mtime_ns", None)
+            or getattr(before, "st_ctime_ns", None) != getattr(after, "st_ctime_ns", None)
+        ):
+            raise OSError("the package changed while the private snapshot was being created")
+        os.fsync(target_fd)
+        completed = True
+    finally:
+        os.close(source_fd)
+        if target_fd is not None:
+            os.close(target_fd)
+        if not completed and target_fd is not None:
+            try:
+                destination.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _render_preinstall_report(assessment: dict[str, object]) -> str:
+    """Render the scan result shown before the installation confirmation."""
+    rendered = _render_malware_text(assessment)
+    if assessment.get("status") == "no_detection":
+        rendered += (
+            "\nNo known malware detection was found. This does not guarantee safety."
+        )
+    return rendered
+
+
+def _run_preinstall_deb(
+    package_argument: Path,
+    *,
+    json_output: bool,
+    output_path: Path | None,
+    stdout: TextIO,
+) -> int:
+    """Scan a local .deb, then install it only after an explicit confirmation."""
+    if output_path is not None and _output_overwrites_package(output_path, package_argument):
+        print("Could not write JSON output over the package being scanned.", file=sys.stderr)
+        return 2
+
+    package_path, validation_error = _validated_deb_path(package_argument)
+    if validation_error or package_path is None:
+        assessment = MalwareAssessment(
+            status="error", scanner="dpkg-deb + ClamAV clamscan", error=validation_error,
+        ).to_dict()
+        installation: dict[str, object] = {
+            "status": "blocked",
+            "message": "Installation was not attempted because the package path is invalid.",
+            "returncode": None,
+        }
+        return _finish_preinstall_report(
+            assessment, installation, json_output=json_output,
+            output_path=output_path, stdout=stdout, exit_code=1,
+        )
+
+    outcome: tuple[dict[str, object], dict[str, object], int] | None = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="linuxsecmonitor-preinstall-") as temporary:
+            private_root = Path(temporary)
+            if os.name == "posix":
+                os.chmod(private_root, 0o700)
+            snapshot = private_root / "scanned-package.deb"
+            try:
+                _create_package_snapshot(package_path, snapshot)
+            except OSError as exc:
+                assessment = MalwareAssessment(
+                    status="error",
+                    scanner="dpkg-deb + ClamAV clamscan",
+                    error=f"Could not create a private package snapshot: {exc}",
+                ).to_dict()
+                report_stream = sys.stderr if json_output else stdout
+                report_stream.write(_render_preinstall_report(assessment) + "\n")
+                installation: dict[str, object] = {
+                    "status": "blocked",
+                    "message": "Installation was not attempted because a stable package snapshot was unavailable.",
+                    "returncode": None,
+                }
+                outcome = (assessment, installation, 1)
+            else:
+                outcome = _run_preinstall_snapshot(
+                    snapshot, json_output=json_output, stdout=stdout,
+                )
+    except OSError as exc:
+        if outcome is None:
+            assessment = MalwareAssessment(
+                status="error",
+                scanner="dpkg-deb + ClamAV clamscan",
+                error=f"Could not create a private package snapshot: {exc}",
+            ).to_dict()
+            report_stream = sys.stderr if json_output else stdout
+            report_stream.write(_render_preinstall_report(assessment) + "\n")
+            installation = {
+                "status": "blocked",
+                "message": "Installation was not attempted because a stable package snapshot was unavailable.",
+                "returncode": None,
+            }
+            outcome = (assessment, installation, 1)
+        else:
+            assessment, installation, _ = outcome
+            installation["message"] = (
+                f"{installation['message']} Private snapshot cleanup failed: {exc}"
+            )
+            outcome = (assessment, installation, 1)
+
+    assert outcome is not None
+    assessment, installation, exit_code = outcome
+    return _finish_preinstall_report(
+        assessment, installation, json_output=json_output,
+        output_path=output_path, stdout=stdout, exit_code=exit_code,
+    )
+
+
+def _run_preinstall_snapshot(
+    package_path: Path,
+    *,
+    json_output: bool,
+    stdout: TextIO,
+) -> tuple[dict[str, object], dict[str, object], int]:
+    """Assess and, after approval, install the same private package snapshot."""
+    assessment = scan_deb(package_path).to_dict()
+    preview = _render_preinstall_report(assessment) + "\n"
+    # In JSON mode, keep stdout reserved for the final machine-readable result.
+    report_stream = sys.stderr if json_output else stdout
+    report_stream.write(preview)
+    report_stream.flush()
+
+    status = assessment.get("status")
+    if status != "no_detection" or assessment.get("coverage_complete") is not True:
+        if status == "detected":
+            message = "Installation blocked because the scan reported a malware detection."
+        elif status == "no_detection":
+            message = (
+                "Installation blocked because the assessment did not confirm complete scan coverage."
+            )
+        else:
+            message = (
+                f"Installation blocked because the scan status was {status!r}; "
+                "only no_detection can proceed to confirmation."
+            )
+        installation = {"status": "blocked", "message": message, "returncode": None}
+        return assessment, installation, 1
+
+    apt_get = shutil.which("apt-get")
+    if apt_get is None:
+        installation = {
+            "status": "unavailable",
+            "message": "apt-get is unavailable; installation was not attempted.",
+            "returncode": None,
+        }
+        return assessment, installation, 1
+
+    print(
+        "Type INSTALL to continue with this local package; anything else cancels: ",
+        end="", file=sys.stderr, flush=True,
+    )
+    try:
+        answer = sys.stdin.readline()
+    except (OSError, KeyboardInterrupt):
+        answer = ""
+    if answer.strip().casefold() != "install":
+        installation = {
+            "status": "cancelled",
+            "message": "Installation was not approved and was cancelled.",
+            "returncode": None,
+        }
+        return assessment, installation, 1
+
+    print(
+        "Starting APT for the scanned local package. APT may install dependencies "
+        "from configured sources; package scripts may run.",
+        file=sys.stderr,
+    )
+    command = [apt_get, "install", "--no-remove", "--", str(package_path)]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            shell=False,
+            stdin=None,
+            stdout=sys.stderr,
+            stderr=sys.stderr,
+        )
+    except FileNotFoundError:
+        installation = {
+            "status": "unavailable",
+            "message": "apt-get became unavailable; installation was not attempted.",
+            "returncode": None,
+        }
+    except PermissionError as exc:
+        installation = {
+            "status": "failed",
+            "message": f"Permission denied while starting apt-get: {exc}",
+            "returncode": None,
+        }
+    except OSError as exc:
+        installation = {
+            "status": "failed",
+            "message": f"Could not run apt-get: {exc}",
+            "returncode": None,
+        }
+    except KeyboardInterrupt:
+        installation = {
+            "status": "cancelled",
+            "message": "APT was interrupted by the user; package state may require review.",
+            "returncode": None,
+        }
+    else:
+        if completed.returncode == 0:
+            installation = {
+                "status": "installed",
+                "message": "APT reported successful installation.",
+                "returncode": 0,
+            }
+        else:
+            installation = {
+                "status": "failed",
+                "message": (
+                    f"apt-get exited with status {completed.returncode}; "
+                    "review its output and package state."
+                ),
+                "returncode": completed.returncode,
+            }
+    result_exit_code = 0 if installation["status"] == "installed" else 1
+    return assessment, installation, result_exit_code
+
+
+def _finish_preinstall_report(
+    assessment: dict[str, object],
+    installation: dict[str, object],
+    *,
+    json_output: bool,
+    output_path: Path | None,
+    stdout: TextIO,
+    exit_code: int,
+) -> int:
+    """Write the final pre-install result without contaminating JSON stdout."""
+    if json_output:
+        rendered = json.dumps(
+            {"malware_assessment": assessment, "installation": installation}, indent=2,
+        ) + "\n"
+        if output_path is not None:
+            try:
+                output_path.write_text(rendered, encoding="utf-8")
+            except OSError as exc:
+                print(f"Could not write JSON output: {exc}", file=sys.stderr)
+                return 2
+        else:
+            stdout.write(rendered)
+    else:
+        stdout.write(f"Installation: {installation['status']} — {installation['message']}\n")
+    return exit_code
+
+
 def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
     """Run the CLI and return a process exit status."""
     parser = argparse.ArgumentParser(description="Collect basic Linux system and package inventory data.")
@@ -429,17 +757,32 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
         help="Inspect and scan a downloaded Debian package without installing it.",
     )
     parser.add_argument(
+        "--preinstall-deb", type=Path, metavar="PACKAGE.deb",
+        help="Scan a local .deb and offer installation only after explicit confirmation.",
+    )
+    parser.add_argument(
         "--scan-repo", type=Path, metavar="REPOSITORY",
         help="Inventory a repository and scan staged file contents with ClamAV when available.",
     )
     args = parser.parse_args(argv)
     if args.output and not args.json:
         parser.error("--output requires --json")
-    if args.scan_deb and args.scan_repo:
-        parser.error("--scan-deb and --scan-repo cannot be used together")
+    selected_modes = sum(bool(mode) for mode in (
+        args.scan_deb, args.preinstall_deb, args.scan_repo,
+    ))
+    if selected_modes > 1:
+        parser.error("--scan-deb, --preinstall-deb, and --scan-repo cannot be used together")
     if args.scan_repo and args.output and _output_is_inside_repository(args.output, args.scan_repo):
         print("Could not write JSON output inside the repository being scanned.", file=sys.stderr)
         return 2
+
+    if args.preinstall_deb:
+        return _run_preinstall_deb(
+            args.preinstall_deb,
+            json_output=args.json,
+            output_path=args.output,
+            stdout=stdout,
+        )
 
     if args.scan_repo:
         result = scan_repository(args.scan_repo).to_dict()

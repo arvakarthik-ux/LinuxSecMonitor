@@ -2,6 +2,7 @@
 
 import json
 from io import StringIO
+from types import SimpleNamespace
 
 import pytest
 
@@ -80,6 +81,274 @@ def test_scan_deb_text_report_explains_status_and_safety_limit(monkeypatch):
     assert "Scanner: ClamAV clamscan" in text
     assert "Coverage limitation: A symbolic link was skipped." in text
     assert "No detection does not guarantee" in text
+
+
+def _prepare_preinstall(monkeypatch, tmp_path, *, status="no_detection", coverage=True):
+    package_path = tmp_path / "downloaded package.deb"
+    package_path.write_bytes(b"fixture package bytes")
+    monkeypatch.setattr(main.tempfile, "tempdir", str(tmp_path), raising=False)
+    assessment = MalwareAssessment(
+        status=status,
+        scanner="ClamAV clamscan",
+        package={"name": "demo", "version": "1.0"},
+        detections=(
+            [MalwareDetection("Test.Signature", "payload/usr/bin/demo")]
+            if status == "detected" else []
+        ),
+        error="Mock provider error" if status == "error" else None,
+        limitations=["Mock incomplete coverage"] if status == "incomplete" else [],
+        coverage_complete=coverage,
+    )
+    monkeypatch.setattr(main, "scan_deb", lambda path: assessment)
+    monkeypatch.setattr(main.shutil, "which", lambda name: "/usr/bin/apt-get")
+    return package_path, assessment
+
+
+def test_preinstall_deb_requires_explicit_confirmation_and_keeps_json_stdout_clean(
+    monkeypatch, tmp_path, capsys,
+):
+    package_path, assessment = _prepare_preinstall(monkeypatch, tmp_path)
+    monkeypatch.setattr(main.sys, "stdin", StringIO("INSTALL\n"))
+    commands = []
+    scanned_paths = []
+
+    def scan(path):
+        scanned_paths.append(main.Path(path))
+        assert scanned_paths[-1].read_bytes() == b"fixture package bytes"
+        return assessment
+
+    monkeypatch.setattr(main, "scan_deb", scan)
+
+    def install(command, **kwargs):
+        commands.append((command, kwargs))
+        assert scanned_paths
+        assert main.Path(command[-1]) == scanned_paths[0]
+        assert main.Path(command[-1]).read_bytes() == b"fixture package bytes"
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(main.subprocess, "run", install)
+    stdout = StringIO()
+
+    exit_code = main.main(
+        ["--preinstall-deb", str(package_path), "--json"], stdout=stdout,
+    )
+
+    report = json.loads(stdout.getvalue())
+    assert exit_code == 0
+    assert report["malware_assessment"]["status"] == "no_detection"
+    assert report["installation"]["status"] == "installed"
+    assert "does not guarantee safety" in capsys.readouterr().err
+    assert len(commands) == 1
+    command, options = commands[0]
+    assert command == [
+        "/usr/bin/apt-get", "install", "--no-remove", "--", str(scanned_paths[0]),
+    ]
+    assert scanned_paths[0] != package_path.resolve()
+    assert not scanned_paths[0].exists()
+    assert options["shell"] is False
+    assert options["stdin"] is None
+    assert options["stdout"] is main.sys.stderr
+    assert options["stderr"] is main.sys.stderr
+
+
+def test_preinstall_deb_cancellation_does_not_start_apt(monkeypatch, tmp_path, capsys):
+    package_path, _ = _prepare_preinstall(monkeypatch, tmp_path)
+    monkeypatch.setattr(main.sys, "stdin", StringIO("no\n"))
+    monkeypatch.setattr(
+        main.subprocess, "run", lambda *args, **kwargs: pytest.fail("APT must not run"),
+    )
+    stdout = StringIO()
+
+    exit_code = main.main(["--preinstall-deb", str(package_path)], stdout=stdout)
+
+    assert exit_code == 1
+    assert "No known malware detection was found" in stdout.getvalue()
+    assert "Installation: cancelled" in stdout.getvalue()
+    assert "Type INSTALL" in capsys.readouterr().err
+
+
+def test_preinstall_deb_json_report_file_stays_parseable_on_cancellation(
+    monkeypatch, tmp_path, capsys,
+):
+    package_path, _ = _prepare_preinstall(monkeypatch, tmp_path)
+    report_path = tmp_path / "preinstall-report.json"
+    monkeypatch.setattr(main.sys, "stdin", StringIO("cancel\n"))
+    monkeypatch.setattr(
+        main.subprocess, "run", lambda *args, **kwargs: pytest.fail("APT must not run"),
+    )
+    stdout = StringIO()
+
+    exit_code = main.main(
+        ["--preinstall-deb", str(package_path), "--json", "--output", str(report_path)],
+        stdout=stdout,
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert stdout.getvalue() == ""
+    assert report["installation"]["status"] == "cancelled"
+    assert "Type INSTALL" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("status", "coverage"),
+    [("detected", True), ("incomplete", False), ("error", False),
+     ("unavailable", False), ("no_detection", False)],
+)
+def test_preinstall_deb_blocks_nonclean_or_incomplete_assessments(
+    monkeypatch, tmp_path, capsys, status, coverage,
+):
+    package_path, _ = _prepare_preinstall(
+        monkeypatch, tmp_path, status=status, coverage=coverage,
+    )
+    monkeypatch.setattr(main.sys, "stdin", StringIO("INSTALL\n"))
+    monkeypatch.setattr(
+        main.subprocess, "run", lambda *args, **kwargs: pytest.fail("APT must be blocked"),
+    )
+    stdout = StringIO()
+
+    exit_code = main.main(
+        ["--preinstall-deb", str(package_path), "--json"], stdout=stdout,
+    )
+
+    report = json.loads(stdout.getvalue())
+    assert exit_code == 1
+    assert report["malware_assessment"]["status"] == status
+    assert report["installation"]["status"] == "blocked"
+    assert "Type INSTALL" not in capsys.readouterr().err
+
+
+def test_preinstall_deb_missing_apt_tool_is_reported_without_prompt(
+    monkeypatch, tmp_path, capsys,
+):
+    package_path, _ = _prepare_preinstall(monkeypatch, tmp_path)
+    monkeypatch.setattr(main.shutil, "which", lambda name: None)
+    monkeypatch.setattr(main.sys, "stdin", StringIO("INSTALL\n"))
+    stdout = StringIO()
+
+    exit_code = main.main(["--preinstall-deb", str(package_path), "--json"], stdout=stdout)
+
+    report = json.loads(stdout.getvalue())
+    assert exit_code == 1
+    assert report["installation"]["status"] == "unavailable"
+    assert "apt-get is unavailable" in report["installation"]["message"]
+    assert "Type INSTALL" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad_name", ["missing.deb", "not-a-package.txt"])
+def test_preinstall_deb_invalid_paths_are_reported_without_scanning(
+    monkeypatch, tmp_path, bad_name,
+):
+    monkeypatch.setattr(
+        main, "scan_deb", lambda path: pytest.fail("invalid path must not be scanned"),
+    )
+    stdout = StringIO()
+
+    exit_code = main.main(
+        ["--preinstall-deb", str(tmp_path / bad_name), "--json"], stdout=stdout,
+    )
+
+    report = json.loads(stdout.getvalue())
+    assert exit_code == 1
+    assert report["malware_assessment"]["status"] == "error"
+    assert report["installation"]["status"] == "blocked"
+
+
+def test_preinstall_deb_apt_failure_is_reported(monkeypatch, tmp_path):
+    package_path, _ = _prepare_preinstall(monkeypatch, tmp_path)
+    monkeypatch.setattr(main.sys, "stdin", StringIO("INSTALL\n"))
+    monkeypatch.setattr(
+        main.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=100),
+    )
+    stdout = StringIO()
+
+    exit_code = main.main(
+        ["--preinstall-deb", str(package_path), "--json"], stdout=stdout,
+    )
+
+    report = json.loads(stdout.getvalue())
+    assert exit_code == 1
+    assert report["installation"]["status"] == "failed"
+    assert report["installation"]["returncode"] == 100
+    assert "review its output" in report["installation"]["message"]
+
+
+def test_preinstall_deb_permission_error_is_reported(monkeypatch, tmp_path):
+    package_path, _ = _prepare_preinstall(monkeypatch, tmp_path)
+    monkeypatch.setattr(main.sys, "stdin", StringIO("INSTALL\n"))
+
+    def permission_error(*args, **kwargs):
+        raise PermissionError("administrator privileges are required")
+
+    monkeypatch.setattr(main.subprocess, "run", permission_error)
+    stdout = StringIO()
+
+    exit_code = main.main(
+        ["--preinstall-deb", str(package_path), "--json"], stdout=stdout,
+    )
+
+    report = json.loads(stdout.getvalue())
+    assert exit_code == 1
+    assert report["installation"]["status"] == "failed"
+    assert "Permission denied" in report["installation"]["message"]
+
+
+def test_preinstall_deb_report_cannot_overwrite_package(monkeypatch, tmp_path, capsys):
+    package_path, _ = _prepare_preinstall(monkeypatch, tmp_path)
+    original_bytes = package_path.read_bytes()
+    monkeypatch.setattr(
+        main, "scan_deb", lambda path: pytest.fail("must reject output collision first"),
+    )
+    stdout = StringIO()
+
+    exit_code = main.main(
+        ["--preinstall-deb", str(package_path), "--json", "--output", str(package_path)],
+        stdout=stdout,
+    )
+
+    assert exit_code == 2
+    assert package_path.read_bytes() == original_bytes
+    assert "over the package being scanned" in capsys.readouterr().err
+
+
+def test_preinstall_deb_private_snapshot_failure_blocks_install(
+    monkeypatch, tmp_path, capsys,
+):
+    package_path, _ = _prepare_preinstall(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main, "_create_package_snapshot",
+        lambda *args: (_ for _ in ()).throw(OSError("snapshot unavailable")),
+    )
+    monkeypatch.setattr(
+        main, "scan_deb", lambda path: pytest.fail("snapshot failure must block scanning"),
+    )
+    monkeypatch.setattr(main.sys, "stdin", StringIO("INSTALL\n"))
+    stdout = StringIO()
+
+    exit_code = main.main(["--preinstall-deb", str(package_path), "--json"], stdout=stdout)
+
+    report = json.loads(stdout.getvalue())
+    assert exit_code == 1
+    assert report["malware_assessment"]["status"] == "error"
+    assert report["installation"]["status"] == "blocked"
+    assert "snapshot unavailable" in report["malware_assessment"]["error"]
+    assert "Type INSTALL" not in capsys.readouterr().err
+
+
+def test_preinstall_deb_missing_input_cannot_become_report_output(
+    tmp_path, capsys,
+):
+    package_path = tmp_path / "missing.deb"
+    stdout = StringIO()
+
+    exit_code = main.main(
+        ["--preinstall-deb", str(package_path), "--json", "--output", str(package_path)],
+        stdout=stdout,
+    )
+
+    assert exit_code == 2
+    assert not package_path.exists()
+    assert "over the package being scanned" in capsys.readouterr().err
 
 
 def test_malware_text_escapes_package_and_detection_terminal_controls():

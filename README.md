@@ -1,6 +1,6 @@
 # LinuxSecMonitor
 
-LinuxSecMonitor is a read-only command-line tool for collecting Linux host details, inventorying Debian-family packages, and comparing installed package versions with supported OSV vulnerability data. It produces text or JSON reports and does not claim complete vulnerability coverage.
+LinuxSecMonitor is a command-line tool for collecting Linux host details, inventorying Debian-family packages, and comparing installed package versions with supported OSV vulnerability data. Host scans and assessment are read-only. Separate opt-in modes can scan a downloaded `.deb` without installing it, inventory a repository, or request an explicitly confirmed local-package installation after scanning. It does not claim complete vulnerability coverage or package safety.
 
 ## Key features
 
@@ -12,6 +12,7 @@ LinuxSecMonitor is a read-only command-line tool for collecting Linux host detai
 - Provides optional progress and timing diagnostics on standard error.
 - Caches validated full Debian OSV advisory records on disk for 24 hours by default.
 - Inventories local repository files and can separately scan a bounded snapshot with ClamAV; repository code is never executed.
+- Can scan a local `.deb` without installing it, and has a separate pre-install workflow that blocks installation unless a complete scan returns `no_detection` and the user explicitly confirms.
 
 ## How a scan works
 
@@ -106,6 +107,56 @@ error, or incomplete coverage returns `1`. A report-file write failure returns
 `2`. For read-only operation, choose an `--output` path outside the repository
 being scanned; the CLI rejects an output path inside that tree. `--scan-repo`
 does not run the host package inventory or OSV assessment.
+
+### Scan and optionally install a local Debian package
+
+The separate `--preinstall-deb` mode scans a local `.deb` and displays the scan
+report before asking for explicit approval:
+
+```bash
+python main.py --preinstall-deb /path/to/downloaded-package.deb
+python main.py --preinstall-deb /path/to/downloaded-package.deb --json
+python main.py --preinstall-deb /path/to/downloaded-package.deb --json --output preinstall-report.json
+```
+
+This mode requires Linux, `dpkg-deb`, `clamscan`, and a usable ClamAV signature
+database for a completed scan. Installation additionally requires `apt-get`
+and the privileges needed by APT. LinuxSecMonitor does not elevate privileges
+itself. It creates a private, size-limited snapshot and scans that snapshot;
+after approval, it passes the same snapshot to APT using the equivalent of:
+
+```text
+apt-get install --no-remove -- /absolute/path/to/scanned-package.deb
+```
+
+APT receives that local file as the requested package and can obtain required
+dependencies from the system's configured sources. `--no-remove` asks APT to
+abort if its proposed transaction would remove packages; APT's own transaction
+confirmation remains enabled. Review APT's plan carefully. Installation can
+upgrade or add dependencies, access configured repositories, and execute
+package maintainer scripts after the user approves. Scanning does not execute
+package scripts.
+
+Only a complete `no_detection` assessment reaches the confirmation prompt. The
+user must type `INSTALL`; empty input, EOF, or any other response cancels. A
+`detected` result blocks installation without offering a bypass. `incomplete`,
+`error`, and `unavailable` results also block installation. A no-detection
+result means only that ClamAV reported no known detection in the inspected
+contents; it does not guarantee safety.
+
+With `--json`, the final JSON report is written to stdout or to `--output`.
+The pre-install scan summary, confirmation prompt, and APT output go to stderr,
+so they do not contaminate JSON stdout. The JSON contains separate
+`malware_assessment` and `installation` objects. The output path cannot alias
+the `.deb` being scanned. The pre-install mode cannot be combined with
+`--scan-deb` or `--scan-repo`.
+
+Exit codes for this command:
+
+- `0`: the user approved and APT returned success.
+- `1`: scan blocked, installation cancelled/unavailable/failed, or APT returned
+  a nonzero status.
+- `2`: invalid CLI combination or JSON output could not be safely written.
 
 ### Example report shape
 
@@ -278,8 +329,13 @@ LINUXSECMONITOR_LIVE_DEBIAN_OSV=1 python -m pytest -m live_debian_osv tests/inte
 
 ## Security and safety
 
-- Collection and assessment are read-only. The tool does not install, remove, upgrade, or modify packages.
-- It does not require root privileges and does not run a privileged background service.
+- Host collection, package inventory, OSV assessment, `--scan-deb`, and repository
+  inventory/scanning are read-only. The explicitly selected
+  `--preinstall-deb` workflow can install the specified local package after
+  confirmation; it never installs automatically.
+- Scanning does not require root privileges. The later APT installation step
+  requires the privileges APT needs. LinuxSecMonitor does not elevate privileges
+  itself and does not run a privileged background service.
 - It does not automatically remediate findings.
 - A `vulnerable` result is limited to the evidence matched from the configured advisory source. The scanner does not detect every vulnerability or configuration weakness.
 - `no_known_match` means only that no matching record was found in the queried data; it does **not** mean safe.
