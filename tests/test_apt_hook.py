@@ -288,6 +288,20 @@ def test_prompt_fails_closed_when_no_terminal_can_be_opened(monkeypatch):
     assert apt_hook._prompt_for_detection() is False
 
 
+def test_prompt_cancels_when_user_interrupts():
+    class InterruptedTerminal:
+        def write(self, value):
+            return len(value)
+
+        def flush(self):
+            return None
+
+        def readline(self):
+            raise KeyboardInterrupt
+
+    assert apt_hook._prompt_for_detection(InterruptedTerminal()) is False
+
+
 @pytest.mark.parametrize("status", ["incomplete", "error", "unavailable"])
 def test_incomplete_error_and_unavailable_results_abort(monkeypatch, status):
     code, output, _ = _run(
@@ -448,6 +462,29 @@ def test_unexpected_info_fd_and_oversized_protocol_fail_closed(monkeypatch):
         stream=BytesIO(b"x" * (apt_hook.MAX_PROTOCOL_BYTES + 1)), output=output,
     ) == 1
     assert "Invalid or incomplete APT protocol" in output.getvalue()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"VERSION 2\nAPT::Architecture=amd64\n\n" + _install_record("/cache/a.deb").encode(),
+        _protocol("malformed action record"),
+        b"VERSION 3\nAPT::Architecture=amd64\n\n",
+    ],
+)
+def test_malformed_transactions_abort_runner_before_scanning(monkeypatch, payload):
+    monkeypatch.delenv("APT_HOOK_INFO_FD", raising=False)
+    output = StringIO()
+
+    code = apt_hook.run_apt_preinstall_hook(
+        stream=BytesIO(payload),
+        scanner=lambda path: pytest.fail("malformed transaction must not reach scanning"),
+        output=output,
+    )
+
+    assert code == 1
+    assert "Invalid or incomplete APT protocol" in output.getvalue()
+    assert "transaction blocked" in output.getvalue()
 
 
 def test_safe_archive_validation_rejects_missing_oversized_directory_and_traversal(

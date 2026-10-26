@@ -275,6 +275,12 @@ printf '%s\n' 'Harmless APT hook test fixture.' > \
   "$tmp_dir/package/usr/share/doc/linuxsecmonitor-apt-hook-smoke/README"
 dpkg-deb --build "$tmp_dir/package" "$tmp_dir/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb"
 
+if sudo test -e /opt/linuxsecmonitor || \
+   sudo test -e /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb; then
+  echo 'Stop: a smoke-test target already exists; do not overwrite it.' >&2
+  exit 1
+fi
+
 sudo install -d -o root -g root -m 0755 /opt/linuxsecmonitor/scanner
 sudo install -o root -g root -m 0644 main.py /opt/linuxsecmonitor/main.py
 sudo install -o root -g root -m 0644 scanner/*.py /opt/linuxsecmonitor/scanner/
@@ -292,6 +298,12 @@ if dpkg-query -W -f='${db:Status-Abbrev}\n' linuxsecmonitor-apt-hook-smoke 2>/de
 fi
 sudo apt-get -s install /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb
 ```
+
+The setup commands refuse to overwrite an existing hook installation or
+staged package. Investigate any collision rather than reusing or replacing it.
+This creates only a root-owned code copy and local fixture; it does not create
+or edit an APT configuration file. The hook is enabled only for the single
+`apt-get` invocation shown below through command-line `-o` options.
 
 The simulation is only a transaction-plan check; it does not prove that the
 hook runs. Proceed only if the plan contains the single new smoke-test package
@@ -338,6 +350,49 @@ Scanner error and incomplete-result behavior are covered by mocked tests, not
 this real APT procedure. The fixture can be removed later with an explicit
 APT command if desired; review that transaction as well.
 
+After testing, the safest rollback is to revert the disposable VM snapshot.
+That restores the package database and removes the temporary hook code and
+staged fixtures together. If retaining the VM, first simulate package removal
+and inspect the full plan:
+
+```bash
+sudo apt-get -s remove linuxsecmonitor-apt-hook-smoke
+```
+
+Proceed only if the simulation removes that test package and changes no other
+packages. Then remove it explicitly and confirm it is no longer installed:
+
+```bash
+sudo apt-get remove linuxsecmonitor-apt-hook-smoke
+dpkg-query -W -f='${db:Status-Abbrev}\n' linuxsecmonitor-apt-hook-smoke 2>/dev/null || true
+```
+
+Inspect the staged files before cleanup. Remove only the files created by this
+procedure, and use `rmdir` so unexpected leftover content prevents directory
+removal:
+
+```bash
+sudo find /opt/linuxsecmonitor -printf '%u:%g %m %p\n'
+sudo rm -f /opt/linuxsecmonitor/main.py
+sudo rm -f /opt/linuxsecmonitor/scanner/__init__.py \
+  /opt/linuxsecmonitor/scanner/apt_hook.py \
+  /opt/linuxsecmonitor/scanner/malware_scanner.py \
+  /opt/linuxsecmonitor/scanner/package_scanner.py \
+  /opt/linuxsecmonitor/scanner/repository_malware_scanner.py \
+  /opt/linuxsecmonitor/scanner/repository_scanner.py \
+  /opt/linuxsecmonitor/scanner/repository_security_scanner.py \
+  /opt/linuxsecmonitor/scanner/system_info.py \
+  /opt/linuxsecmonitor/scanner/vulnerability_assessment.py
+sudo rmdir /opt/linuxsecmonitor/scanner /opt/linuxsecmonitor
+sudo rm -f /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb
+rm -rf "$tmp_dir"
+```
+
+If inspection shows files that were not copied by this procedure, stop and
+keep them. If the test package is not installed because APT was cancelled,
+skip its removal. No LinuxSecMonitor APT hook entry requires removal because
+the procedure never writes one.
+
 Do not point a root-run APT hook at a checkout under a user's writable home
 directory: Python imports and executes the hook code with root privileges
 before the scanner can drop to APT's sandbox user. Keep the test VM disposable
@@ -366,13 +421,17 @@ handle for APT's later installation step, so a concurrent privileged process
 could still replace an archive after the final check and before APT opens it.
 
 APT proceeds automatically only when every archive has a complete
-`no_detection` result. This means ClamAV found no known signature; it does not
-prove that a package is safe. If complete scans report detections, the hook
-shows the findings and asks on `/dev/tty` for the exact token `INSTALL`;
-declining, any other input, or no terminal aborts the transaction. Detection
-approval does not bypass incomplete scans or errors. The hook does not run
-package maintainer scripts; APT/dpkg may run those scripts later if installation
-is approved.
+`no_detection` result and no maintainer-script review leads. `no_detection`
+means ClamAV found no known signature; it does not prove that a package is
+safe. A complete ClamAV scan can still report heuristic maintainer-script
+review leads while retaining ClamAV status `no_detection`; those leads are not
+confirmed malware. If any complete scan reports a malware detection or a
+maintainer-script review lead, the hook displays the evidence and asks on
+`/dev/tty` for the exact token `INSTALL`. Declining, any other input,
+interruption, or no terminal aborts the transaction. Approval never bypasses
+incomplete scans, errors, unavailable scanners, invalid transactions, or
+package-identity mismatches. The hook does not execute package maintainer
+scripts; APT/dpkg may run them later if installation is approved.
 
 This is an experimental hook integration, not a permanent APT policy and not
 an automatic APT configuration change. APT's v3 stream has no transaction
