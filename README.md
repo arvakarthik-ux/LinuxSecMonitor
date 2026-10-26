@@ -281,9 +281,11 @@ Pre-Install-Pkgs protocol version 3. On Debian 12, APT 2.6.1 can be asked to
 use protocol version 3 for one invocation with command-line configuration
 options. This does not write an APT configuration file:
 
-Use only a disposable Debian 12 VM or snapshot. Build a harmless package with
-no maintainer scripts, stage it in a root-owned location readable by `_apt`,
-and install a trusted copy of the hook code under `/opt`:
+Use only a disposable Debian 12 VM or snapshot. Run all commands below in the
+same interactive Bash session. Build harmless packages with no maintainer
+scripts, and install a trusted copy of the hook code in a unique, root-owned
+temporary directory under `/opt`. The commands never reuse or remove a normal
+`/opt/linuxsecmonitor` installation:
 
 ```bash
 set -euo pipefail
@@ -300,24 +302,19 @@ printf '%s\n' 'Harmless APT hook test fixture.' > \
   "$tmp_dir/package/usr/share/doc/linuxsecmonitor-apt-hook-smoke/README"
 dpkg-deb --build "$tmp_dir/package" "$tmp_dir/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb"
 
-if sudo test -e /opt/linuxsecmonitor || \
-   sudo test -e /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb || \
-   sudo test -e /var/tmp/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb; then
-  echo 'Stop: a smoke-test target already exists; do not overwrite it.' >&2
-  exit 1
-fi
-
-sudo install -d -o root -g root -m 0755 /opt/linuxsecmonitor/scanner
-sudo install -o root -g root -m 0644 main.py /opt/linuxsecmonitor/main.py
-sudo install -o root -g root -m 0644 scanner/*.py /opt/linuxsecmonitor/scanner/
+hook_root="$(sudo mktemp -d /opt/linuxsecmonitor-apt-hook.XXXXXX)"
+sudo install -d -o root -g root -m 0755 "$hook_root/scanner"
+sudo install -o root -g root -m 0644 main.py "$hook_root/main.py"
+sudo install -o root -g root -m 0644 scanner/*.py "$hook_root/scanner/"
 sudo install -o root -g root -m 0644 \
   "$tmp_dir/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb" \
-  /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb
-sudo namei -l /opt/linuxsecmonitor/main.py
-sudo find /opt/linuxsecmonitor -printf '%u:%g %m %p\n'
+  "$hook_root/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb"
+sudo chmod 0755 "$hook_root"
+sudo namei -l "$hook_root/main.py"
+sudo find "$hook_root" -printf '%u:%g %m %p\n'
 sudo stat -c '%U:%G %a %n' /usr/bin/python3 \
-  /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb
-sudo apt-config dump | grep -i 'DPkg::Pre-Install-Pkgs'
+  "$hook_root/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb"
+sudo apt-config dump | grep -i 'DPkg::Pre-Install-Pkgs' || true
 if dpkg-query -W -f='${db:Status-Abbrev}\n' linuxsecmonitor-apt-hook-smoke 2>/dev/null | grep -q '^ii'; then
   echo 'Stop: the smoke-test package is already installed.' >&2
   exit 1
@@ -326,12 +323,12 @@ if dpkg-query -s linuxsecmonitor-apt-hook-eicar 2>/dev/null | grep -q '^Status: 
   echo 'Stop: the EICAR test package is already installed.' >&2
   exit 1
 fi
-sudo apt-get -s --no-remove install /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb
+sudo apt-get -s --no-remove install "$hook_root/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb"
 ```
 
-The setup commands refuse to overwrite an existing hook installation or
-staged package. Investigate any collision rather than reusing or replacing it.
-This creates only a root-owned code copy and local fixture; it does not create
+`mktemp` creates a unique hook directory atomically; the package is staged only
+inside that directory. This avoids overwriting an existing hook installation or
+staged package. This creates only a root-owned code copy and local fixture; it does not create
 or edit an APT configuration file. The hook is enabled only for the single
 `apt-get` invocation shown below through command-line `-o` options.
 
@@ -346,8 +343,9 @@ command-line options below:
 
 ```bash
 sudo apt-config dump | grep -i 'DPkg::Pre-Install-Pkgs' || true
+hook_command="/usr/bin/python3 $hook_root/main.py --apt-preinstall-hook"
 sudo apt-config \
-  -o 'DPkg::Pre-Install-Pkgs::=/usr/bin/python3 /opt/linuxsecmonitor/main.py --apt-preinstall-hook' \
+  -o "DPkg::Pre-Install-Pkgs::=$hook_command" \
   -o 'DPkg::Tools::Options::/usr/bin/python3::Version=3' \
   dump | grep -i 'DPkg::Pre-Install-Pkgs'
 read -r -p 'If the effective list is understood and LinuxSecMonitor is last, type ORDER-VERIFIED: ' hook_order
@@ -379,9 +377,9 @@ to the hook executable's first word (`/usr/bin/python3`), as APT expects:
 
 ```bash
 sudo apt-get --no-remove \
-  -o 'DPkg::Pre-Install-Pkgs::=/usr/bin/python3 /opt/linuxsecmonitor/main.py --apt-preinstall-hook' \
+  -o "DPkg::Pre-Install-Pkgs::=$hook_command" \
   -o 'DPkg::Tools::Options::/usr/bin/python3::Version=3' \
-  install /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb 2>&1 | tee "$tmp_dir/clean-apt.log"
+  install "$hook_root/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb" 2>&1 | tee "$tmp_dir/clean-apt.log"
 grep -F 'APT Pre-Install-Pkgs protocol version 3 accepted.' "$tmp_dir/clean-apt.log"
 ```
 
@@ -407,14 +405,10 @@ EOF
 printf '%s' 'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > \
   "$tmp_dir/eicar/usr/share/linuxsecmonitor-eicar/eicar.txt"
 dpkg-deb --build "$tmp_dir/eicar" "$tmp_dir/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb"
-if sudo test -e /var/tmp/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb; then
-  echo 'Stop: the EICAR fixture target already exists; do not overwrite it.' >&2
-  exit 1
-fi
 sudo install -o root -g root -m 0644 \
   "$tmp_dir/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb" \
-  /var/tmp/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb
-dpkg-deb --control "$tmp_dir/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb" "$tmp_dir/eicar-control"
+  "$hook_root/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb"
+dpkg-deb --control "$hook_root/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb" "$tmp_dir/eicar-control"
 if find "$tmp_dir/eicar-control" -maxdepth 1 -type f ! -name control -print -quit | grep -q .; then
   echo 'Stop: unexpected control files are present; do not install this fixture.' >&2
   exit 1
@@ -427,8 +421,8 @@ errors and incomplete scans also return nonzero:
 
 ```bash
 set +e
-python3 /opt/linuxsecmonitor/main.py --scan-deb \
-  /var/tmp/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb \
+python3 "$hook_root/main.py" --scan-deb \
+  "$hook_root/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb" \
   --json --output "$tmp_dir/eicar-scan.json"
 scan_exit=$?
 set -e
@@ -450,16 +444,16 @@ is not installed. If APT lacks the detection prompt, the hook's blocked
 message, or the expected debug evidence, stop and revert the VM snapshot.
 
 ```bash
-sudo apt-get -s --no-remove install /var/tmp/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb
+sudo apt-get -s --no-remove install "$hook_root/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb"
 set +e
 set -o pipefail
-sudo apt-get --no-remove -o Debug::pkgDPkgPM=1 -o 'DPkg::Pre-Install-Pkgs::=/usr/bin/python3 /opt/linuxsecmonitor/main.py --apt-preinstall-hook' -o 'DPkg::Tools::Options::/usr/bin/python3::Version=3' install /var/tmp/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb 2>&1 | tee "$tmp_dir/eicar-apt.log"
+sudo apt-get --no-remove -o Debug::pkgDPkgPM=1 -o "DPkg::Pre-Install-Pkgs::=$hook_command" -o 'DPkg::Tools::Options::/usr/bin/python3::Version=3' install "$hook_root/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb" 2>&1 | tee "$tmp_dir/eicar-apt.log"
 apt_exit=$?
 set -e
 test "$apt_exit" -ne 0
 grep -F 'APT Pre-Install-Pkgs protocol version 3 accepted.' "$tmp_dir/eicar-apt.log"
 grep -F 'APT transaction blocked:' "$tmp_dir/eicar-apt.log"
-if grep -E '(/usr/bin/dpkg|dpkg --)' "$tmp_dir/eicar-apt.log"; then
+if grep -E '(^|[[:space:]])(/usr/bin/)?dpkg[[:space:]]' "$tmp_dir/eicar-apt.log"; then
   echo 'Failure: APT appears to have invoked dpkg for the cancelled transaction.' >&2
   exit 1
 fi
@@ -493,32 +487,34 @@ sudo apt-get remove linuxsecmonitor-apt-hook-smoke
 dpkg-query -W -f='${db:Status-Abbrev}\n' linuxsecmonitor-apt-hook-smoke 2>/dev/null || true
 ```
 
-Inspect the staged files before cleanup. Remove only the files created by this
-procedure, and use `rmdir` so unexpected leftover content prevents directory
-removal:
+Inspect the unique staged directory before cleanup. Remove only the exact files
+copied by this procedure. Use `rmdir`, never recursive deletion, so unexpected
+leftover content prevents directory removal. Never clean up `/opt/linuxsecmonitor`
+or any path other than the exact `hook_root` shown by the current shell:
 
 ```bash
-sudo find /opt/linuxsecmonitor -printf '%u:%g %m %p\n'
-sudo rm -f /opt/linuxsecmonitor/main.py
-sudo rm -f /opt/linuxsecmonitor/scanner/__init__.py \
-  /opt/linuxsecmonitor/scanner/apt_hook.py \
-  /opt/linuxsecmonitor/scanner/malware_scanner.py \
-  /opt/linuxsecmonitor/scanner/package_scanner.py \
-  /opt/linuxsecmonitor/scanner/repository_malware_scanner.py \
-  /opt/linuxsecmonitor/scanner/repository_scanner.py \
-  /opt/linuxsecmonitor/scanner/repository_security_scanner.py \
-  /opt/linuxsecmonitor/scanner/system_info.py \
-  /opt/linuxsecmonitor/scanner/vulnerability_assessment.py
-sudo rmdir /opt/linuxsecmonitor/scanner /opt/linuxsecmonitor
-sudo rm -f /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb
-sudo rm -f /var/tmp/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb
+sudo find "$hook_root" -printf '%u:%g %m %p\n'
+sudo rm -- "$hook_root/main.py" \
+  "$hook_root/scanner/__init__.py" \
+  "$hook_root/scanner/apt_hook.py" \
+  "$hook_root/scanner/malware_scanner.py" \
+  "$hook_root/scanner/package_scanner.py" \
+  "$hook_root/scanner/repository_malware_scanner.py" \
+  "$hook_root/scanner/repository_scanner.py" \
+  "$hook_root/scanner/repository_security_scanner.py" \
+  "$hook_root/scanner/system_info.py" \
+  "$hook_root/scanner/vulnerability_assessment.py" \
+  "$hook_root/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb" \
+  "$hook_root/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb"
+sudo rmdir -- "$hook_root/scanner" "$hook_root"
 rm -rf "$tmp_dir"
 ```
 
-If inspection shows files that were not copied by this procedure, stop and
-keep them. If the test package is not installed because APT was cancelled,
-skip its removal. No LinuxSecMonitor APT hook entry requires removal because
-the procedure never writes one.
+If `rmdir` fails or inspection shows any unexpected file, stop cleanup and
+restore the VM snapshot rather than deleting additional content. If the test
+package is not installed because APT was cancelled, skip its removal. No
+LinuxSecMonitor APT hook entry requires removal because the procedure never
+writes one.
 
 Do not point a root-run APT hook at a checkout under a user's writable home
 directory: Python imports and executes the hook code with root privileges
