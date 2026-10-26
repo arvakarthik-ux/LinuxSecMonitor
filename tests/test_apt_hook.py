@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from io import BytesIO, StringIO
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -28,7 +29,10 @@ def _assessment(status: str = "no_detection", *, complete: bool | None = None) -
     return MalwareAssessment(
         status=status,
         scanner="mock ClamAV",
-        package={"name": "demo", "version": "1"},
+        package={
+            "name": "demo", "version": "1", "architecture": "amd64",
+            "multi_arch": "no",
+        },
         detections=(
             [MalwareDetection("Test.Signature", "payload/bin/demo")]
             if status == "detected" else []
@@ -78,10 +82,24 @@ def _run(monkeypatch, actions, *, statuses=None, answer=None, changed=False, inf
     _install_path_validation(monkeypatch, changed=changed)
     statuses = statuses or {}
     scanned = []
+    transaction = apt_hook.parse_pre_install_v3(_protocol(*actions))
+    actions_by_filename = {
+        Path(action.archive_path).name: action
+        for action in transaction.actions
+        if action.archive_path is not None
+    }
 
     def scanner(path):
         scanned.append(path)
-        return _assessment(statuses.get(path.name, "no_detection"))
+        result = _assessment(statuses.get(path.name, "no_detection"))
+        action = actions_by_filename[path.name]
+        result.package = {
+            "name": action.package_name,
+            "version": action.target_version or "1",
+            "architecture": action.target_architecture or "amd64",
+            "multi_arch": "no" if action.target_multiarch == "none" else action.target_multiarch,
+        }
+        return result
 
     monkeypatch.delenv("APT_HOOK_INFO_FD", raising=False)
     if info_fd is not None:
@@ -104,7 +122,13 @@ def test_parse_v3_transaction_preserves_archive_path_spaces_and_multiarch_fields
     ))
 
     assert transaction.actions[0].archive_path == "/var/cache/apt/archives/demo package.deb"
+    assert transaction.actions[0].target_version == "1"
+    assert transaction.actions[0].target_architecture == "amd64"
+    assert transaction.actions[0].target_multiarch == "none"
     assert transaction.actions[1].action == "**CONFIGURE**"
+    assert transaction.actions[1].target_version == "2"
+    assert transaction.actions[1].target_architecture == "amd64"
+    assert transaction.actions[1].target_multiarch == "same"
     assert transaction.configuration == (("APT::Architecture", "amd64"),)
 
 
@@ -252,6 +276,99 @@ def test_changed_archive_after_scan_aborts_transaction(monkeypatch):
     assert code == 1
     assert "changed while it was being scanned" in output
     assert "transaction blocked" in output
+
+
+@pytest.mark.parametrize(
+    ("actual_name", "actual_version", "actual_arch", "actual_multiarch"),
+    [
+        ("different-package", "1", "amd64", "no"),
+        ("demo", "2", "amd64", "no"),
+        ("demo", "1", "arm64", "no"),
+        ("demo", "1", "amd64", "same"),
+    ],
+)
+def test_archive_identity_mismatch_with_apt_transaction_blocks_clean_result(
+    monkeypatch, actual_name, actual_version, actual_arch, actual_multiarch,
+):
+    _install_path_validation(monkeypatch)
+    monkeypatch.delenv("APT_HOOK_INFO_FD", raising=False)
+    assessment = MalwareAssessment(
+        status="no_detection",
+        scanner="mock ClamAV",
+        package={
+            "name": actual_name, "version": actual_version,
+            "architecture": actual_arch, "multi_arch": actual_multiarch,
+        },
+        coverage_complete=True,
+    )
+    output = StringIO()
+    code = apt_hook.run_apt_preinstall_hook(
+        stream=BytesIO(_protocol(_install_record("/cache/demo.deb"))),
+        scanner=lambda path: assessment,
+        output=output,
+    )
+
+    report = output.getvalue()
+    assert code == 1
+    assert "Status: error" in report
+    assert "Scanned archive identity does not match APT's transaction record" in report
+    assert "Status: no_detection" not in report
+    assert "APT transaction blocked" in report
+
+
+def test_archive_identity_mismatch_preserves_detection_and_blocks_without_prompt(monkeypatch):
+    _install_path_validation(monkeypatch)
+    monkeypatch.delenv("APT_HOOK_INFO_FD", raising=False)
+    assessment = MalwareAssessment(
+        status="detected",
+        scanner="mock ClamAV",
+        package={"name": "unexpected-package", "version": "9"},
+        detections=[MalwareDetection("Test.Signature", "payload/file")],
+        coverage_complete=True,
+    )
+    monkeypatch.setattr(
+        apt_hook, "_prompt_for_detection",
+        lambda terminal=None: pytest.fail("mismatched identity must block without an override prompt"),
+    )
+    output = StringIO()
+    code = apt_hook.run_apt_preinstall_hook(
+        stream=BytesIO(_protocol(_install_record("/cache/demo.deb"))),
+        scanner=lambda path: assessment,
+        output=output,
+    )
+
+    report = output.getvalue()
+    assert code == 1
+    assert "Status: detected" in report
+    assert "Test.Signature" in report
+    assert "Scanned archive identity does not match APT's transaction record" in report
+    assert "transaction blocked" in report
+
+
+def test_scanner_uses_trusted_system_path_and_restores_caller_environment(monkeypatch):
+    _install_path_validation(monkeypatch)
+    monkeypatch.delenv("APT_HOOK_INFO_FD", raising=False)
+    monkeypatch.setenv("PATH", "untrusted-bin")
+    observed_paths = []
+
+    def scanner(path):
+        observed_paths.append(os.environ.get("PATH"))
+        result = _assessment()
+        result.package = {
+            "name": "demo", "version": "1", "architecture": "amd64",
+            "multi_arch": "no",
+        }
+        return result
+
+    code = apt_hook.run_apt_preinstall_hook(
+        stream=BytesIO(_protocol(_install_record("/cache/demo.deb"))),
+        scanner=scanner,
+        output=StringIO(),
+    )
+
+    assert code == 0
+    assert observed_paths == [apt_hook._TRUSTED_SCANNER_PATH]
+    assert os.environ["PATH"] == "untrusted-bin"
 
 
 def test_configuration_and_removal_only_transaction_needs_no_scanner(monkeypatch):

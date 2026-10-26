@@ -21,6 +21,7 @@ _CONFIG_KEY = re.compile(r"^(?:[A-Za-z0-9_.:+/-]|%[0-9A-Fa-f]{2})+$")
 _MULTIARCH = {"same", "foreign", "allowed", "none", "no"}
 _SPECIAL_ACTIONS = {"**CONFIGURE**", "**REMOVE**"}
 _ASSESSMENT_STATUSES = {"detected", "no_detection", "unavailable", "incomplete", "error"}
+_TRUSTED_SCANNER_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 
 
 class AptProtocolError(ValueError):
@@ -34,6 +35,9 @@ class AptPackageAction:
     package_name: str
     action: str
     archive_path: str | None
+    target_version: str | None = None
+    target_architecture: str | None = None
+    target_multiarch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -124,7 +128,14 @@ def _validate_package_action(line: str) -> AptPackageAction:
             raise AptProtocolError("remove action unexpectedly contains a new package version")
         if action == "**CONFIGURE**" and new_version == "-":
             raise AptProtocolError("configure action is missing its target package version")
-        return AptPackageAction(name, action, None)
+        return AptPackageAction(
+            name,
+            action,
+            None,
+            None if new_version == "-" else new_version,
+            None if new_arch == "-" else new_arch,
+            None if new_version == "-" else new_multiarch,
+        )
     if action.startswith("**") or not action.startswith("/"):
         raise AptProtocolError("package action is neither a known operation nor an absolute archive path")
     if new_version == "-":
@@ -132,7 +143,9 @@ def _validate_package_action(line: str) -> AptPackageAction:
     archive = PurePosixPath(action)
     if ".." in archive.parts or archive.suffix != ".deb":
         raise AptProtocolError("archive path is unsafe or is not a .deb file")
-    return AptPackageAction(name, action, action)
+    return AptPackageAction(
+        name, action, action, new_version, new_arch, new_multiarch,
+    )
 
 
 def parse_pre_install_v3(data: bytes | str) -> AptTransaction:
@@ -395,6 +408,21 @@ def _drop_to_apt_sandbox_user() -> None:
         raise OSError("could not permanently drop all root group IDs for archive scanning")
 
 
+def _scan_with_trusted_path(
+    scanner: Callable[[Path], MalwareAssessment], path: Path,
+) -> MalwareAssessment:
+    """Avoid resolving dpkg-deb or clamscan from an inherited untrusted PATH."""
+    original_path = os.environ.get("PATH")
+    os.environ["PATH"] = _TRUSTED_SCANNER_PATH
+    try:
+        return scanner(path)
+    finally:
+        if original_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = original_path
+
+
 def _prompt_for_detection(terminal: TextIO | None = None) -> bool:
     """Require exact interactive approval for a complete scan with detections."""
     opened = None
@@ -448,7 +476,7 @@ def run_apt_preinstall_hook(
 
     # Validate every path while root-protection checks are still available.
     # Only after this pass does a root-run hook permanently become _apt.
-    pending: list[tuple[str, Path | None, _FileIdentity | None, str | None]] = []
+    pending: list[tuple[AptPackageAction, Path | None, _FileIdentity | None, str | None]] = []
     identities: set[str] = set()
     for action in archive_actions:
         raw_path = action.archive_path
@@ -459,12 +487,12 @@ def run_apt_preinstall_hook(
             if resolved_name in identities:
                 raise OSError("duplicate archive resolves to an already-scanned file")
             identities.add(resolved_name)
-            pending.append((raw_path, resolved, identity, None))
+            pending.append((action, resolved, identity, None))
         except (OSError, RuntimeError, KeyError, PermissionError, ValueError) as exc:
-            pending.append((raw_path, None, None, str(exc)))
+            pending.append((action, None, None, str(exc)))
         except Exception as exc:
             pending.append((
-                raw_path, None, None,
+                action, None, None,
                 f"Archive validation raised {type(exc).__name__}: {exc}",
             ))
 
@@ -474,12 +502,14 @@ def run_apt_preinstall_hook(
         except Exception as exc:
             detail = f"Could not drop privileges for package scanning: {type(exc).__name__}: {exc}"
             pending = [
-                (raw_path, None, None, error or detail)
-                for raw_path, path, identity, error in pending
+                (action, None, None, error or detail)
+                for action, path, identity, error in pending
             ]
 
     results: list[tuple[str, dict[str, object], bool]] = []
-    for raw_path, resolved, identity, validation_error in pending:
+    for action, resolved, identity, validation_error in pending:
+        raw_path = action.archive_path
+        assert raw_path is not None
         if validation_error is not None:
             results.append((raw_path, {
                 "status": "error", "scanner": "LinuxSecMonitor APT pre-install hook",
@@ -491,9 +521,48 @@ def run_apt_preinstall_hook(
         try:
             if _identity_at_path(resolved) != identity:
                 raise OSError("APT archive changed after path validation")
-            assessment = scanner(resolved)
+            assessment = _scan_with_trusted_path(scanner, resolved)
             unchanged = _identity_at_path(resolved) == identity
             result = _validated_assessment_dict(assessment)
+            if result.get("status") in {"detected", "no_detection"}:
+                package = result["package"]
+                assert isinstance(package, dict)
+                actual_multiarch = package.get("multi_arch", "no")
+                if actual_multiarch == "none":
+                    actual_multiarch = "no"
+                expected_multiarch = action.target_multiarch
+                if expected_multiarch == "none":
+                    expected_multiarch = "no"
+                if (
+                    package.get("name") != action.package_name
+                    or package.get("version") != action.target_version
+                    or package.get("architecture") != action.target_architecture
+                    or actual_multiarch != expected_multiarch
+                ):
+                    expected = (
+                        f"{action.package_name} {action.target_version} "
+                        f"{action.target_architecture} {expected_multiarch}"
+                    )
+                    actual = (
+                        f"{package.get('name')} {package.get('version')} "
+                        f"{package.get('architecture')} {actual_multiarch}"
+                    )
+                    mismatch_error = (
+                        "Scanned archive identity does not match APT's transaction "
+                        f"record (expected {expected}; found {actual})."
+                    )
+                    existing_error = result.get("error")
+                    result["error"] = (
+                        f"{existing_error} {mismatch_error}"
+                        if isinstance(existing_error, str) and existing_error.strip()
+                        else mismatch_error
+                    )
+                    result["limitations"].append(
+                        "The scanned package could not be confirmed as the package APT plans to install."
+                    )
+                    result["coverage_complete"] = False
+                    if result["status"] == "no_detection":
+                        result["status"] = "error"
             if not unchanged:
                 result["error"] = "APT archive changed while it was being scanned."
                 result["coverage_complete"] = False

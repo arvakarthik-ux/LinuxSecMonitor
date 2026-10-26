@@ -1,6 +1,6 @@
 # LinuxSecMonitor
 
-LinuxSecMonitor is a command-line tool for collecting Linux host details, inventorying Debian-family packages, and comparing installed package versions with supported OSV vulnerability data. Host scans and assessment are read-only. Separate opt-in modes can scan a downloaded `.deb` without installing it, inventory a repository, or request an explicitly confirmed local-package installation after scanning. It does not claim complete vulnerability coverage or package safety.
+LinuxSecMonitor is a command-line tool for collecting Linux host details, inventorying Debian-family packages, and comparing installed package versions with supported OSV vulnerability data. Host scans and assessment are read-only. Separate opt-in modes can scan a downloaded `.deb` without installing it, inventory and statically review a repository, or request an explicitly confirmed local-package installation after scanning. It does not claim complete vulnerability coverage or package safety.
 
 ## Key features
 
@@ -12,6 +12,7 @@ LinuxSecMonitor is a command-line tool for collecting Linux host details, invent
 - Provides optional progress and timing diagnostics on standard error.
 - Caches validated full Debian OSV advisory records on disk for 24 hours by default.
 - Inventories local repository files and can separately scan a bounded snapshot with ClamAV; repository code is never executed.
+- Runs bounded static heuristics over repository files to produce review leads for selected secrets, dependency sources, lifecycle scripts, and risky command patterns. These heuristics are not a malware verdict or a complete code audit.
 - Can scan a local `.deb` without installing it, and has a separate pre-install workflow that blocks installation unless a complete scan returns `no_detection` and the user explicitly confirms.
 
 ## How a scan works
@@ -28,11 +29,15 @@ main.py
   `-- Render text or JSON
 ```
 
-The opt-in `--scan-repo` mode runs repository inventory and ClamAV malware
-assessment as separate stages. It copies eligible regular files into private
-temporary storage and gives ClamAV that staged snapshot, not the original
-repository directory. It does not run scripts, hooks, builds, package
-managers, or repository commands.
+The opt-in `--scan-repo` mode runs repository inventory, ClamAV malware
+assessment, and a separate bounded static review. ClamAV scans eligible files
+copied into private temporary storage; static checks read files using
+no-follow POSIX directory descriptors. Neither stage runs scripts, hooks,
+builds, package managers, Git commands, or other repository content. The
+static stage reports heuristic review leads; it does not establish that a
+repository is malicious or safe. These are separate passes over the supplied
+path, not one atomic snapshot; do not allow an untrusted concurrent writer to
+change the repository during a scan.
 
 The assessment runs only after package inventory succeeds. Eligible Debian assessments query OSV on each run; package-to-advisory query results are not cached. Full advisory records are read from the persistent cache when valid and unexpired; otherwise, they are retrieved from OSV. Package inventory and assessment are read-only.
 
@@ -43,9 +48,9 @@ Python 3.10 or newer is recommended. Full package inventory is intended for Debi
 Repository malware assessment additionally requires the `clamscan` executable
 and an available ClamAV signature database. Safe repository scanning requires
 POSIX no-follow directory-descriptor support; Windows can run the mocked tests,
-but this repository malware mode reports `unavailable` there. Linux is the
-validated target. LinuxSecMonitor does not install ClamAV or download/update
-signatures.
+but repository malware assessment and static repository review report
+`unavailable` there. Linux is the validated target. LinuxSecMonitor does not
+install ClamAV or download/update signatures.
 
 The WSL instructions apply when WSL is running a supported Debian, Ubuntu, or Kali Linux distribution; WSL itself is not a separate package-inventory target.
 
@@ -99,14 +104,54 @@ python main.py --scan-repo /path/to/repository --json
 python main.py --scan-repo /path/to/repository --json --output repository-report.json
 ```
 
-Repository JSON keeps the inventory fields at the top level and adds a separate
-`malware_assessment` object. Text output labels the inventory and malware
-assessment separately. Exit code `0` requires both a complete inventory and a
-complete ClamAV scan with `no_detection`; a detection, unavailable scanner,
-error, or incomplete coverage returns `1`. A report-file write failure returns
-`2`. For read-only operation, choose an `--output` path outside the repository
-being scanned; the CLI rejects an output path inside that tree. `--scan-repo`
-does not run the host package inventory or OSV assessment.
+Repository JSON keeps the inventory fields at the top level and adds separate
+`malware_assessment` and `repository_security_assessment` objects. Text output
+labels the inventory, ClamAV assessment, and static review separately. The
+static result includes heuristic findings, inspected file/byte counts, errors,
+limitations, and coverage state. Its bounded checks include private-key and
+token-like material (matched values are redacted), direct URL/VCS dependencies,
+package lifecycle scripts, selected command patterns, and common build/CI
+files. It is not a full secret scanner, malware detector, dependency
+vulnerability scanner, or code audit. It examines regular files below the
+supplied directory, including ignored and untracked files, and skips `.git`
+internals and links.
+
+Exit code `0` requires complete inventory, complete ClamAV coverage with
+`no_detection`, and completed static review with no heuristic findings. Any
+detection, review lead, unavailable scanner, error, or incomplete coverage
+returns `1`. A report-file write failure returns `2`. A static finding is a
+reason to inspect its evidence, not proof of malicious behavior. `--scan-repo`
+does not run host package inventory or OSV assessment. It is a manual review
+command: it does not intercept or block `git clone`, `pip install`, `npm
+install`, `make`, or arbitrary shell commands. Review the report before you
+choose to execute code or install dependencies.
+
+For read-only operation, choose an `--output` path outside the repository being
+scanned; the CLI rejects an output path inside that tree.
+
+Static-review statuses are `completed` (the bounded pass completed without a
+heuristic finding), `requires_review` (one or more review leads were found),
+`incomplete` (a limit, unreadable/changing file, or parse problem left a gap),
+`error` (the requested path could not be safely inspected), and `unavailable`
+(the platform lacks the required safe POSIX walk support). A completed static
+pass is not a safety certification.
+Finding severity labels are heuristic triage priorities; they are not CVSS
+scores or a probability that the repository is malicious.
+
+#### Guarded manual repository workflow
+
+Run the review before deciding whether to run code or install dependencies:
+
+```bash
+python main.py --scan-repo /path/to/cloned-repository --json --output ../repository-review.json
+python -m json.tool ../repository-review.json
+```
+
+Read all three result sections and investigate findings, errors, and
+limitations. The scanner does not execute the repository, and it cannot
+prevent a later command from doing so. It does not wrap Git, pip, npm, Cargo,
+Go, Make, or a shell; the user must choose whether to proceed after reviewing
+the report.
 
 ### Scan and optionally install a local Debian package
 
@@ -150,6 +195,15 @@ set safely, installation is not attempted. A
 `error`, and `unavailable` results also block installation. A no-detection
 result means only that ClamAV reported no known detection in the inspected
 contents; it does not guarantee safety.
+
+This workflow scans only the explicitly supplied `.deb` snapshot. APT may
+resolve and install additional dependencies from configured sources; those
+dependency archives are not scanned by this command. The scope warning is
+shown before the confirmation prompt. Once the user approves, APT's own hooks
+and package configuration scripts may run; this is after the requested local
+archive has been scanned, but dependencies and earlier APT hook behavior are
+outside this scan's coverage. This is a controlled workflow for one specified
+archive, not a gate for every package in an APT transaction.
 
 With `--json`, the final JSON report is written to stdout or to `--output`.
 The pre-install scan summary, confirmation prompt, and APT output go to stderr,
@@ -213,12 +267,17 @@ and no unrelated installs, removals, or upgrades.
 
 Check that the interpreter, every code file and each parent directory in the
 hook path are trusted and not writable by unprivileged users. Also inspect the
-existing `Pre-Install-Pkgs` hooks. A configured `dpkg-preconfigure --apt` hook
-can run a package's `config` maintainer script before later hooks; this fixture
-has no maintainer scripts, but this implementation cannot guarantee ordering
-ahead of other configured hooks for arbitrary packages. Do not use the hook as
-a security boundary for packages with scripts until hook ordering and the
-host's other APT hooks have been audited.
+existing `Pre-Install-Pkgs` hooks and their order with `apt-config dump`. APT
+invokes these hooks after obtaining package archives and before it starts the
+dpkg installation/configuration phase. However, hooks are invoked in configured
+order. An earlier `dpkg-preconfigure --apt` hook can run a package's `config`
+maintainer script before LinuxSecMonitor is called; other earlier hooks may
+also perform relevant actions. This fixture has no maintainer scripts. The
+one-command hook option does not guarantee it runs before existing hooks, so
+the hook cannot guarantee that arbitrary package-controlled code has not
+already run when its scan begins. Do not treat it as a pre-execution security
+boundary unless the VM's hook order and behavior have been verified and no
+earlier hook can execute package-controlled code.
 
 Run one APT command with temporary `-o` options. The version option is keyed
 to the hook executable's first word (`/usr/bin/python3`), as APT expects:
@@ -256,13 +315,18 @@ command above performs a real installation if APT and the hook both allow it.
 The hook reads the complete v3 protocol from standard input, validates the
 configuration and package-action records, and scans every scheduled `.deb`
 archive with the existing package scanner. `**CONFIGURE**` and `**REMOVE**`
-records do not refer to package archives and are not scanned. Archive paths
+records do not refer to package archives and are not scanned. For each archive,
+it compares package name, target version, architecture, and Multi-Arch identity
+with APT's corresponding transaction record. Archive paths
 must be absolute, regular, non-symlink files within configured size limits.
 When the hook runs as root, it validates archive paths and ownership first,
 then permanently drops its real, effective, and saved user/group IDs to APT's
 `_apt` sandbox identity before running package parsing or ClamAV. Paths
-containing spaces are supported by the protocol parser. Malformed
-transactions, missing archives, file changes during scanning, unavailable
+containing spaces are supported by the protocol parser. During scanner calls,
+the hook temporarily sets `PATH` to standard system binary directories so
+`dpkg-deb` and `clamscan` are not resolved from the invoking user's current
+directory or another inherited path entry. Malformed
+transactions, identity mismatches, missing archives, file changes during scanning, unavailable
 scanners, errors, and incomplete coverage cause a nonzero hook exit so APT
 aborts. The hook compares archive identity before and after scanning and
 requires root-protected paths when running as root. It cannot hold an open
@@ -283,6 +347,14 @@ an automatic APT configuration change. APT's v3 stream has no transaction
 record count or checksum, so a stream truncated exactly at a valid record
 boundary cannot be detected from the protocol alone. Validate hook invocation
 and behavior in a disposable Debian VM before considering any broader use.
+
+The documented command supplies temporary `-o` settings for one APT process;
+it does not install or alter a permanent hook configuration. There is therefore
+no persistent LinuxSecMonitor hook entry to remove after this procedure. If
+you separately choose to create a permanent configuration file, back up that
+specific file first and remove only the exact LinuxSecMonitor entry/file during
+recovery; do not delete unrelated APT hook configuration. To stop a blocked
+transaction, let the hook fail closed and inspect its report and APT error.
 
 ### Example report shape
 
@@ -432,6 +504,39 @@ These results are observations from that Debian VM, not guarantees for other hos
 
 The CLI exit code reflects package inventory and report writing. OSV retrieval can fail after a successful inventory; in that case the report should still show the inventory result and identify the assessment error. `no_known_match` only means no matching record was found in the queried data; it does not mean the system or package is safe. Kali package inventory is supported, but Kali vulnerability assessment remains explicitly unsupported; Debian or Ubuntu records are not authoritative for Kali.
 
+### Controlled Kali validation (pending)
+
+Kali is supported for `dpkg-query` package inventory, but its vulnerability
+assessment is explicitly unsupported. The Windows test results do not validate
+Kali filesystem behavior, ClamAV behavior, or APT protocol compatibility. Use a
+disposable Kali VM or snapshot, run as a normal user, and first record the
+installed tool versions and existing hook configuration:
+
+```bash
+python3 --version
+apt-get --version
+command -v dpkg-query dpkg-deb clamscan
+apt-config dump | grep -i 'DPkg::Pre-Install-Pkgs'
+```
+
+Then exercise read-only modes against known local inputs, without installing a
+package or running repository code:
+
+```bash
+python3 main.py --diagnostics --json --output kali-host-report.json
+python3 -m json.tool kali-host-report.json
+python3 main.py
+python3 main.py --scan-deb /path/to/already-downloaded-package.deb
+python3 main.py --scan-repo /path/to/local-repository
+```
+
+Record inventory status/count, vulnerability status (`unsupported` is expected
+for Kali), ClamAV signature state, repository static-review status, coverage,
+and exit codes. Do not treat `no_detection` as safety proof. Do not run the APT
+hook smoke test on Kali until its APT version, protocol-v3 behavior, existing
+hook order, and package-configuration-script behavior have been reviewed on
+that VM. No real Kali validation is recorded here.
+
 ### Optional live OSV integration tests
 
 Live tests are skipped unless explicitly enabled. They require network access to `api.osv.dev` and verify documented Ubuntu or Debian OSV cases; they are separate from the normal offline suite.
@@ -455,6 +560,20 @@ LINUXSECMONITOR_LIVE_DEBIAN_OSV=1 python -m pytest -m live_debian_osv tests/inte
 
 ## Security and safety
 
+### Threat model and boundaries
+
+The scanner treats package archives and repository contents as untrusted data
+and avoids executing them during inspection. It assumes the running OS, Python
+interpreter, LinuxSecMonitor source, and trusted system tools have not already
+been compromised. It is not a sandbox against a kernel flaw, a privileged local
+attacker, a malicious/compromised ClamAV or `dpkg-deb`, or every parser/resource
+exhaustion attack. The APT hook drops to `_apt` before package parsing/scanning,
+but it must import and run its own Python code as root first; that installation
+path and its parents must therefore be root-controlled. Earlier APT hooks may
+run before this hook, so it cannot promise that package-controlled scripts have
+not already run. Repository scanning is an advisory manual workflow and does
+not intercept future execution or dependency installation.
+
 - Host collection, package inventory, OSV assessment, `--scan-deb`, and repository
   inventory/scanning are read-only. The explicitly selected
   `--preinstall-deb` workflow can install the specified local package after
@@ -468,6 +587,7 @@ LINUXSECMONITOR_LIVE_DEBIAN_OSV=1 python -m pytest -m live_debian_osv tests/inte
 - `no_known_match` means only that no matching record was found in the queried data; it does **not** mean safe.
 - Network failures, unsupported distributions, and uncertain package/version evidence are represented as errors, unsupported states, or items requiring review rather than silently treated as safe.
 - Repository malware assessment stages regular files using no-follow directory descriptors, skips `.git`, links, junctions and non-regular entries, and applies limits of 100,000 files, 20,000 directories, 50 MiB per file, 512 MiB total staged data, 30 seconds for staging, and 120 seconds for ClamAV scanning. Limit alerts and skipped content make coverage incomplete. Time checks are cooperative for filesystem operations; they are not a hard bound on a blocked filesystem call.
+- Repository static review uses no-follow POSIX directory descriptors, skips `.git`, and does not follow links. Its current limits are 50,000 files, 10,000 directories, 20,000 entries per directory, depth 128, 2 MiB per file, 64 MiB total read, and a cooperative 20-second deadline. These limits bound ordinary traversal and reading but are not an OS-enforced CPU/memory sandbox or a hard deadline for a blocked filesystem call.
 - ClamAV scans only the temporary staged snapshot and may inspect supported nested archives. Unsupported or encrypted content, ClamAV errors, missing signatures, and timeouts do not produce a clean result. A `no_detection` result means only that this ClamAV run reported no known detection in the fully staged input; it does not guarantee that the repository is safe.
 - Malware findings are separate from OSV vulnerability findings. A ClamAV signature match is evidence reported by the scanner, not a complete assessment of repository security or a claim about exploitability.
 
@@ -503,12 +623,14 @@ LinuxSecMonitor/
 |   |-- package_scanner.py
 |   |-- repository_scanner.py
 |   |-- repository_malware_scanner.py
+|   |-- repository_security_scanner.py
 |   `-- vulnerability_assessment.py
 `-- tests/
     |-- test_system_info.py
     |-- test_package_scanner.py
     |-- test_repository_scanner.py
     |-- test_repository_malware_scanner.py
+    |-- test_repository_security_scanner.py
     |-- test_vulnerability_assessment.py
     |-- test_debian_assessment.py
     |-- test_main.py

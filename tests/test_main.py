@@ -14,12 +14,28 @@ from scanner.repository_malware_scanner import (
     RepositoryMalwareAssessment,
     RepositoryMalwareDetection,
 )
+from scanner.repository_security_scanner import (
+    RepositorySecurityAssessment,
+    RepositorySecurityFinding,
+)
 from scanner.system_info import SystemInfo
 from scanner.vulnerability_assessment import (
     PackageAssessment,
     VulnerabilityFinding,
     VulnerabilityAssessmentReport,
 )
+
+
+@pytest.fixture(autouse=True)
+def _mock_posix_only_static_repository_review(monkeypatch):
+    """Keep CLI tests deterministic on Windows unless a case overrides this."""
+    monkeypatch.setattr(
+        main,
+        "scan_repository_security",
+        lambda path: RepositorySecurityAssessment(
+            status="completed", repository_path=str(path), coverage_complete=True,
+        ),
+    )
 
 
 def test_json_output_format(monkeypatch):
@@ -167,7 +183,10 @@ def test_preinstall_deb_requires_explicit_confirmation_and_keeps_json_stdout_cle
     assert exit_code == 0
     assert report["malware_assessment"]["status"] == "no_detection"
     assert report["installation"]["status"] == "installed"
-    assert "does not guarantee safety" in capsys.readouterr().err
+    stderr = capsys.readouterr().err
+    assert "does not guarantee safety" in stderr
+    assert "only the requested .deb snapshot was scanned" in stderr
+    assert "dependency packages that were not scanned" in stderr
     assert len(commands) == 5
     assert commands[0][0] == ["/usr/bin/sudo", "-v"]
     assert commands[1][0] == [
@@ -528,9 +547,13 @@ def test_scan_repo_cli_text_displays_separate_inventory_and_malware_results(
     assert "Inventory only" in report
     assert "Repository malware assessment:" in report
     assert "Status: no_detection" in report
+    assert "Repository static security review:" in report
+    assert "Review findings: None reported" in report
     assert "No detection does not guarantee" in report
     assert "malware" in report
-    assert "not executed" not in report
+    # The safety note says repository code was not executed; source contents
+    # must not be echoed into the report.
+    assert "print('not executed')" not in report
 
 
 def test_scan_repo_cli_json_writes_parseable_report_file(tmp_path, monkeypatch):
@@ -559,6 +582,8 @@ def test_scan_repo_cli_json_writes_parseable_report_file(tmp_path, monkeypatch):
     assert report["manifests"] == [{"name": "go.mod", "path": "go.mod"}]
     assert report["malware_assessment"]["status"] == "no_detection"
     assert report["malware_assessment"]["coverage_complete"] is True
+    assert report["repository_security_assessment"]["status"] == "completed"
+    assert report["repository_security_assessment"]["findings"] == []
     assert "vulnerability_assessment" not in report
     assert "malware" in report["note"]
 
@@ -648,6 +673,57 @@ def test_scan_repo_cli_nonclean_malware_status_returns_one(monkeypatch, tmp_path
     report = json.loads(output.getvalue())
     assert exit_code == 1
     assert report["malware_assessment"]["status"] == status
+
+
+def test_scan_repo_static_review_finding_is_visible_and_requires_review(monkeypatch, tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    monkeypatch.setattr(
+        main,
+        "scan_repository_malware",
+        lambda path: RepositoryMalwareAssessment(
+            status="no_detection", repository_path=str(path), coverage_complete=True,
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "scan_repository_security",
+        lambda path: RepositorySecurityAssessment(
+            status="requires_review", repository_path=str(path), coverage_complete=True,
+            findings=[RepositorySecurityFinding(
+                rule_id="package-lifecycle-script", severity="medium",
+                path="package.json", evidence="scripts.postinstall is configured",
+                explanation="Review before dependency installation.",
+            )],
+        ),
+    )
+    output = StringIO()
+
+    exit_code = main.main(["--scan-repo", str(root)], stdout=output)
+
+    assert exit_code == 1
+    assert "scripts.postinstall is configured" in output.getvalue()
+    assert "Review before dependency installation." in output.getvalue()
+    assert "does not guarantee" in output.getvalue()
+
+
+def test_repository_security_renderer_escapes_controls_and_handles_legacy_data():
+    rendered = main._render_repository_security_text({
+        "status": "requires_review", "coverage_complete": True,
+        "findings": [{
+            "rule_id": "suspicious\x1b[2J", "severity": "medium",
+            "path": "package\r.json", "evidence": "token redacted\n",
+            "explanation": "Review this.\x1b[31m",
+        }],
+        "errors": [], "limitations": [], "note": "No detection does not prove safety.",
+    })
+    assert "suspicious\\x1b[2J" in rendered
+    assert "package\\r.json" in rendered
+    assert "token redacted\\n" in rendered
+    assert "Review this.\\x1b[31m" in rendered
+    assert "\x1b" not in rendered
+    assert "\r" not in rendered
+    assert "Review findings: None reported" in main._render_repository_security_text({"findings": None})
 
 
 def test_scan_repo_text_escapes_control_characters_in_malware_paths_and_errors():

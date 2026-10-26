@@ -18,12 +18,14 @@ from scanner.apt_hook import run_apt_preinstall_hook
 from scanner.malware_scanner import MAX_PACKAGE_BYTES, MalwareAssessment, scan_deb
 from scanner.repository_scanner import scan_repository
 from scanner.repository_malware_scanner import scan_repository_malware
+from scanner.repository_security_scanner import scan_repository_security
 from scanner.vulnerability_assessment import assess_packages
 
 T = TypeVar("T")
 DiagnosticCallback = Callable[[str], None]
 DETAILS_PREVIEW_LIMIT = 240
 REPOSITORY_MANIFEST_PREVIEW_LIMIT = 20
+REPOSITORY_SECURITY_FINDING_PREVIEW_LIMIT = 20
 _SYSTEM_COMMAND_PATHS = {
     "apt-get": "/usr/bin/apt-get",
     "sudo": "/usr/bin/sudo",
@@ -421,6 +423,61 @@ def _render_repository_malware_text(assessment: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _render_repository_security_text(assessment: dict[str, object]) -> str:
+    """Render static review leads without exposing secret values or controls."""
+    def terminal_text(value: object, fallback: str = "Unavailable") -> str:
+        if not isinstance(value, str):
+            return fallback
+        return "".join(
+            character if character.isprintable()
+            else character.encode("unicode_escape").decode("ascii")
+            for character in value
+        )
+
+    lines = [
+        "Repository static security review:",
+        f"  Status: {terminal_text(assessment.get('status'), 'error')}",
+        f"  Coverage complete: {'yes' if assessment.get('coverage_complete') is True else 'no'}",
+        f"  Files inspected: {assessment.get('files_inspected', 0)}",
+        f"  Bytes inspected: {assessment.get('bytes_inspected', 0)}",
+    ]
+    findings = assessment.get("findings")
+    if isinstance(findings, list) and findings:
+        lines.append("  Review findings:")
+        for finding in findings[:REPOSITORY_SECURITY_FINDING_PREVIEW_LIMIT]:
+            if not isinstance(finding, dict):
+                continue
+            lines.append(
+                f"    [{terminal_text(finding.get('severity'), 'unknown')}] "
+                f"{terminal_text(finding.get('rule_id'))} at "
+                f"{terminal_text(finding.get('path'))}"
+            )
+            evidence = finding.get("evidence")
+            explanation = finding.get("explanation")
+            if isinstance(evidence, str) and evidence.strip():
+                lines.append(f"      Evidence: {terminal_text(evidence)}")
+            if isinstance(explanation, str) and explanation.strip():
+                lines.append(f"      Review: {terminal_text(explanation)}")
+        if len(findings) > REPOSITORY_SECURITY_FINDING_PREVIEW_LIMIT:
+            lines.append(
+                f"    … and {len(findings) - REPOSITORY_SECURITY_FINDING_PREVIEW_LIMIT} more findings"
+            )
+    else:
+        lines.append("  Review findings: None reported")
+    for label, key in (("Error", "errors"), ("Limitation", "limitations")):
+        values = assessment.get(key)
+        if isinstance(values, list):
+            lines.extend(
+                f"  {label}: {terminal_text(value)}"
+                for value in values if isinstance(value, str) and value.strip()
+            )
+    lines.append(terminal_text(
+        assessment.get("note"),
+        "Static review is heuristic; no finding does not establish safety.",
+    ))
+    return "\n".join(lines)
+
+
 def _output_is_inside_repository(output_path: Path, repository_path: Path) -> bool:
     """Reject output paths that would write into the repository being scanned."""
     try:
@@ -737,6 +794,13 @@ def _run_preinstall_snapshot(
         return assessment, installation, 1
 
     print(
+        "Scope warning: only the requested .deb snapshot was scanned. APT may "
+        "install dependency packages that were not scanned; after approval, "
+        "their APT hooks or package configuration scripts may run. Review the "
+        "transaction and do not treat no_detection as proof of safety.",
+        file=sys.stderr,
+    )
+    print(
         "Type INSTALL to continue with this local package; anything else cancels: ",
         end="", file=sys.stderr, flush=True,
     )
@@ -920,7 +984,7 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
     )
     parser.add_argument(
         "--scan-repo", type=Path, metavar="REPOSITORY",
-        help="Inventory a repository and scan staged file contents with ClamAV when available.",
+        help="Inventory a repository, scan staged files with ClamAV, and run bounded static checks.",
     )
     args = parser.parse_args(argv)
     if args.output and not args.json:
@@ -953,12 +1017,15 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
     if args.scan_repo:
         result = scan_repository(args.scan_repo).to_dict()
         assessment = scan_repository_malware(args.scan_repo).to_dict()
+        security_assessment = scan_repository_security(args.scan_repo).to_dict()
         result["malware_assessment"] = assessment
+        result["repository_security_assessment"] = security_assessment
         rendered = (
             json.dumps(result, indent=2) + "\n"
             if args.json else (
                 _render_repository_text(result) + "\n"
                 + _render_repository_malware_text(assessment) + "\n"
+                + _render_repository_security_text(security_assessment) + "\n"
             )
         )
         if args.output:
@@ -973,6 +1040,9 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
             result["coverage_complete"] is True
             and assessment.get("status") == "no_detection"
             and assessment.get("coverage_complete") is True
+            and security_assessment.get("status") == "completed"
+            and security_assessment.get("coverage_complete") is True
+            and not security_assessment.get("findings")
         ) else 1
 
     if args.scan_deb:
