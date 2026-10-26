@@ -302,6 +302,27 @@ def _render_malware_text(assessment: dict[str, object]) -> str:
                     f"Detection: {terminal_text(detection.get('name'), 'Unknown')} — "
                     f"{terminal_text(detection.get('path'), 'path unavailable')}"
                 )
+    script_findings = assessment.get("maintainer_script_findings")
+    if isinstance(script_findings, list) and script_findings:
+        lines.append("Maintainer-script static review (heuristic; scripts were not executed):")
+        for finding in script_findings:
+            if not isinstance(finding, dict):
+                continue
+            location = terminal_text(finding.get("path"), "path unavailable")
+            line_number = finding.get("line_number")
+            if isinstance(line_number, int) and not isinstance(line_number, bool) and line_number > 0:
+                location += f":{line_number}"
+            lines.append(
+                f"Review lead [{terminal_text(finding.get('severity'), 'unknown')}]: "
+                f"{terminal_text(finding.get('rule_id'), 'unknown')} at {location}"
+            )
+            evidence = finding.get("evidence")
+            if isinstance(evidence, str) and evidence.strip():
+                lines.append(f"  Evidence: {terminal_text(evidence)}")
+            explanation = finding.get("explanation")
+            if isinstance(explanation, str) and explanation.strip():
+                lines.append(f"  Explanation: {terminal_text(explanation)}")
+        lines.append("Review leads are heuristic and do not establish malicious behavior.")
     error = assessment.get("error")
     if isinstance(error, str) and error.strip():
         lines.append(f"Error: {terminal_text(error)}")

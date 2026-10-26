@@ -12,7 +12,9 @@ from types import SimpleNamespace
 import pytest
 
 from scanner import apt_hook
-from scanner.malware_scanner import MalwareAssessment, MalwareDetection, MAX_PACKAGE_BYTES
+from scanner.malware_scanner import (
+    MalwareAssessment, MalwareDetection, MaintainerScriptFinding, MAX_PACKAGE_BYTES,
+)
 
 
 def _install_record(path: str, name: str = "demo") -> str:
@@ -23,7 +25,10 @@ def _protocol(*actions: str, config: str = "APT::Architecture=amd64") -> bytes:
     return ("VERSION 3\n" + config + "\n\n" + "\n".join(actions) + "\n").encode()
 
 
-def _assessment(status: str = "no_detection", *, complete: bool | None = None) -> MalwareAssessment:
+def _assessment(
+    status: str = "no_detection", *, complete: bool | None = None,
+    script_findings=None,
+) -> MalwareAssessment:
     if complete is None:
         complete = status in {"detected", "no_detection"}
     return MalwareAssessment(
@@ -40,6 +45,7 @@ def _assessment(status: str = "no_detection", *, complete: bool | None = None) -
         error="mock provider error" if status == "error" else None,
         limitations=[] if complete else ["mock incomplete coverage"],
         coverage_complete=complete,
+        maintainer_script_findings=script_findings or [],
     )
 
 
@@ -78,9 +84,13 @@ def _install_path_validation(monkeypatch, *, changed=False):
     monkeypatch.setattr(apt_hook, "_identity_at_path", current_identity)
 
 
-def _run(monkeypatch, actions, *, statuses=None, answer=None, changed=False, info_fd=None):
+def _run(
+    monkeypatch, actions, *, statuses=None, answer=None, changed=False,
+    info_fd=None, script_findings_by_name=None,
+):
     _install_path_validation(monkeypatch, changed=changed)
     statuses = statuses or {}
+    script_findings_by_name = script_findings_by_name or {}
     scanned = []
     transaction = apt_hook.parse_pre_install_v3(_protocol(*actions))
     actions_by_filename = {
@@ -91,7 +101,10 @@ def _run(monkeypatch, actions, *, statuses=None, answer=None, changed=False, inf
 
     def scanner(path):
         scanned.append(path)
-        result = _assessment(statuses.get(path.name, "no_detection"))
+        result = _assessment(
+            statuses.get(path.name, "no_detection"),
+            script_findings=script_findings_by_name.get(path.name),
+        )
         action = actions_by_filename[path.name]
         result.package = {
             "name": action.package_name,
@@ -186,6 +199,40 @@ def test_clean_transaction_scans_every_archive_and_continues_without_prompt(monk
     assert output.count("Status: no_detection") == 2
     assert "protocol version 3 accepted" in output
     assert "does not guarantee" in output
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected_code"),
+    [(None, 1), ("install\n", 1), ("INSTALL \n", 1), ("INSTALL\n", 0)],
+)
+def test_maintainer_script_review_lead_requires_exact_approval(
+    monkeypatch, answer, expected_code,
+):
+    finding = MaintainerScriptFinding(
+        rule_id="download-piped-to-shell",
+        severity="high",
+        path="control/postinst",
+        line_number=4,
+        evidence="A selected risky-command pattern matched; command text is omitted.",
+        explanation="Inspect this package script.",
+    )
+    code, output, scanned = _run(
+        monkeypatch,
+        [_install_record("/cache/review.deb")],
+        answer=answer,
+        script_findings_by_name={"review.deb": [finding]},
+    )
+
+    assert code == expected_code
+    assert [path.name for path in scanned] == ["review.deb"]
+    assert "Status: no_detection" in output
+    assert "Maintainer-script static review (heuristic" in output
+    assert "download-piped-to-shell" in output
+    assert "not confirmed malware detections" in output
+    if expected_code == 1:
+        assert "transaction blocked" in output
+    else:
+        assert "Explicit INSTALL approval" in output
 
 
 def test_detection_requires_exact_terminal_approval(monkeypatch):

@@ -322,6 +322,25 @@ def _render_assessment(package_path: str, result: dict[str, object]) -> str:
     limitations = result.get("limitations", [])
     if isinstance(limitations, list):
         lines.extend(f"Coverage limitation: {_terminal_safe(item)}" for item in limitations)
+    script_findings = result.get("maintainer_script_findings", [])
+    if isinstance(script_findings, list) and script_findings:
+        lines.append("Maintainer-script static review (heuristic; scripts were not executed):")
+        for finding in script_findings:
+            if not isinstance(finding, dict):
+                continue
+            location = _terminal_safe(finding.get("path", "unknown"))
+            line_number = finding.get("line_number")
+            if isinstance(line_number, int) and not isinstance(line_number, bool):
+                location += f":{line_number}"
+            lines.append(
+                f"Review lead [{_terminal_safe(finding.get('severity', 'unknown'))}]: "
+                f"{_terminal_safe(finding.get('rule_id', 'unknown'))} at {location}"
+            )
+            if finding.get("evidence"):
+                lines.append(f"Evidence: {_terminal_safe(finding['evidence'])}")
+            if finding.get("explanation"):
+                lines.append(f"Explanation: {_terminal_safe(finding['explanation'])}")
+        lines.append("Review leads are heuristic and are not confirmed malware detections.")
     return "\n".join(lines)
 
 
@@ -370,6 +389,21 @@ def _validated_assessment_dict(assessment: object) -> dict[str, object]:
         not isinstance(item, str) for item in limitations
     ):
         raise ValueError("scanner returned malformed coverage limitations")
+
+    script_findings = result.get("maintainer_script_findings", [])
+    if not isinstance(script_findings, list):
+        raise ValueError("scanner returned a malformed maintainer-script findings list")
+    for finding in script_findings:
+        if not isinstance(finding, dict):
+            raise ValueError("scanner returned a malformed maintainer-script finding")
+        if any(
+            not isinstance(finding.get(key), str) or not finding[key].strip()
+            for key in ("rule_id", "severity", "path", "evidence", "explanation")
+        ):
+            raise ValueError("scanner returned an incomplete maintainer-script finding")
+        line_number = finding.get("line_number")
+        if isinstance(line_number, bool) or not isinstance(line_number, int) or line_number < 1:
+            raise ValueError("scanner returned a maintainer-script finding with an invalid line")
 
     if status == "no_detection":
         if not coverage_complete or detections or error or limitations:
@@ -424,15 +458,15 @@ def _scan_with_trusted_path(
 
 
 def _prompt_for_detection(terminal: TextIO | None = None) -> bool:
-    """Require exact interactive approval for a complete scan with detections."""
+    """Require exact interactive approval for a complete scan with review leads."""
     opened = None
     try:
         if terminal is None:
             opened = open("/dev/tty", "r+", encoding="utf-8", errors="replace")
             terminal = opened
         terminal.write(
-            "Malware detection(s) were reported. Type exactly INSTALL to continue "
-            "anyway; anything else aborts: "
+            "Security review finding(s) were reported. Type exactly INSTALL to "
+            "continue; anything else aborts: "
         )
         terminal.flush()
         answer = terminal.readline()
@@ -590,6 +624,7 @@ def run_apt_preinstall_hook(
         result.get("status") == "no_detection"
         and result.get("coverage_complete") is True
         and unchanged
+        and not result.get("maintainer_script_findings", [])
         for _, result, unchanged in results
     )
     if complete_no_detection:
@@ -613,11 +648,17 @@ def run_apt_preinstall_hook(
         )
         return 1
 
-    print(
-        "Malware detection found. Approval will allow APT to continue despite the "
-        "reported finding(s).",
-        file=output_stream,
-    )
+    if any(result.get("status") == "detected" for _, result, _ in results):
+        print(
+            "Malware detection found. Approval will allow APT to continue despite the "
+            "reported finding(s).",
+            file=output_stream,
+        )
+    else:
+        print(
+            "Maintainer-script review lead(s) require explicit approval before APT continues.",
+            file=output_stream,
+        )
     if not _prompt_for_detection(terminal):
         print("APT transaction blocked: explicit terminal approval was not received.", file=output_stream)
         return 1

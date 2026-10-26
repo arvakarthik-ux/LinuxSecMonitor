@@ -201,6 +201,15 @@ upgrade or add dependencies, access configured repositories, and execute
 package maintainer scripts after the user approves. Scanning does not execute
 package scripts.
 
+As a separate check, the scanner reads the standard `preinst`, `postinst`,
+`prerm`, `postrm`, and `config` maintainer scripts as bounded text. It reports
+heuristic review leads for selected download-to-shell, destructive-device, and
+startup-persistence write patterns. These leads are not ClamAV detections and
+do not prove malicious behavior; the matched command text is omitted from the
+report to avoid exposing embedded values. Oversized, unreadable, or changing
+scripts make scan coverage incomplete. This is a small rule set, not a full
+shell analysis or script sandbox.
+
 Only a complete `no_detection` assessment reaches the confirmation prompt. The
 user must type exactly `INSTALL`; lowercase input, extra spaces, empty input,
 EOF, or any other response cancels. For a normal-user run, `sudo` is used only
@@ -212,6 +221,12 @@ set safely, installation is not attempted. A
 `error`, and `unavailable` results also block installation. A no-detection
 result means only that ClamAV reported no known detection in the inspected
 contents; it does not guarantee safety.
+
+When the APT v3 hook sees a maintainer-script review lead, it also requires
+exact `INSTALL` approval even if ClamAV found no signature. The report keeps
+that heuristic lead separate from ClamAV's `status`; declining or lacking a
+terminal blocks the transaction. A complete scan with no signature and no
+script review lead retains the existing automatic-continuation behavior.
 
 This workflow scans only the explicitly supplied `.deb` snapshot. APT may
 resolve and install additional dependencies from configured sources; those

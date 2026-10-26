@@ -520,6 +520,34 @@ def test_malware_text_escapes_package_and_detection_terminal_controls():
     assert "\r" not in text
 
 
+def test_malware_text_displays_maintainer_script_review_separately():
+    report = {
+        "status": "no_detection",
+        "scanner": "dpkg-deb + ClamAV clamscan",
+        "package": {"name": "demo", "version": "1.0"},
+        "detections": [],
+        "maintainer_script_findings": [{
+            "rule_id": "download-piped-to-shell",
+            "severity": "high",
+            "path": "control/postinst\x1b[2J",
+            "line_number": 3,
+            "evidence": "Selected pattern matched; command omitted.",
+            "explanation": "Inspect this script before installation.",
+        }],
+        "error": None,
+        "limitations": [],
+    }
+
+    text = main._render_malware_text(report)
+
+    assert "Status: no_detection" in text
+    assert "Maintainer-script static review (heuristic; scripts were not executed)" in text
+    assert "Review lead [high]: download-piped-to-shell at control/postinst\\x1b[2J:3" in text
+    assert "command omitted" in text
+    assert "do not establish malicious behavior" in text
+    assert "\x1b" not in text
+
+
 def test_scan_repo_cli_text_displays_separate_inventory_and_malware_results(
     tmp_path, monkeypatch
 ):
