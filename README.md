@@ -274,12 +274,14 @@ Exit codes for this command:
   a nonzero status.
 - `2`: invalid CLI combination or JSON output could not be safely written.
 
-### Experimental APT Pre-Install-Pkgs hook (manual, one-command testing)
+### Experimental APT Pre-Install-Pkgs hook (manual, temporary-config testing)
 
 LinuxSecMonitor also has an opt-in `--apt-preinstall-hook` mode for APT's
-Pre-Install-Pkgs protocol version 3. On Debian 12, APT 2.6.1 can be asked to
-use protocol version 3 for one invocation with command-line configuration
-options. This does not write an APT configuration file:
+Pre-Install-Pkgs protocol version 3. On Debian 12, APT 2.6.1 can be given a
+temporary configuration file passed only to the test commands. The procedure
+below clears and rebuilds only the `DPkg::Pre-Install-Pkgs` list so LinuxSecMonitor runs
+before the currently configured hooks. It does not modify permanent APT
+configuration:
 
 Use only a disposable Debian 12 VM or snapshot. Run all commands below in the
 same interactive Bash session. Build harmless packages with no maintainer
@@ -310,6 +312,18 @@ sudo install -o root -g root -m 0644 \
   "$tmp_dir/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb" \
   "$hook_root/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb"
 sudo chmod 0755 "$hook_root"
+hook_command="/usr/bin/python3 -B $hook_root/main.py --apt-preinstall-hook"
+cat > "$tmp_dir/apt-hook-order.conf" <<EOF
+#clear DPkg::Pre-Install-Pkgs;
+DPkg::Pre-Install-Pkgs {
+  "$hook_command";
+  "/usr/bin/apt-listchanges --apt || test \$? -lt 10";
+  "/usr/sbin/dpkg-preconfigure --apt || true";
+};
+DPkg::Tools::Options::/usr/bin/python3::Version "3";
+EOF
+sudo install -o root -g root -m 0644 \
+  "$tmp_dir/apt-hook-order.conf" "$hook_root/apt-hook-order.conf"
 sudo namei -l "$hook_root/main.py"
 sudo find "$hook_root" -printf '%u:%g %m %p\n'
 sudo stat -c '%U:%G %a %n' /usr/bin/python3 \
@@ -323,62 +337,74 @@ if dpkg-query -s linuxsecmonitor-apt-hook-eicar 2>/dev/null | grep -q '^Status: 
   echo 'Stop: the EICAR test package is already installed.' >&2
   exit 1
 fi
-sudo apt-get -s --no-remove install "$hook_root/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb"
+sudo apt-get -s -c "$hook_root/apt-hook-order.conf" --no-remove install \
+  "$hook_root/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb"
 ```
 
-`mktemp` creates a unique hook directory atomically; the package is staged only
-inside that directory. This avoids overwriting an existing hook installation or
-staged package. This creates only a root-owned code copy and local fixture; it does not create
-or edit an APT configuration file. The hook is enabled only for each individual
-`apt-get` invocation shown below through command-line `-o` options.
+`mktemp` creates a unique hook directory atomically; the package, scanner copy,
+and temporary APT config are staged only inside that directory. This avoids
+overwriting an existing hook installation or staged package. The config is
+root-owned and supplied with `apt-get -c` for the test commands; no permanent
+APT configuration file is edited.
 
 The simulation is only a transaction-plan check; it does not prove that the
 hook runs. Proceed only if the plan contains the single new smoke-test package
 and no unrelated installs, removals, or upgrades. Do not use `-y`.
 
 Check that the interpreter, every code file and each parent directory in the
-hook path are trusted and not writable by unprivileged users. Inspect the
-configured hooks and the effective list after applying the exact temporary
-command-line options below:
+hook path are trusted and not writable by unprivileged users. The supplied
+Debian output showed exactly `apt-listchanges` followed by
+`dpkg-preconfigure`; verify this remains true and check for any pre-invocation
+hooks. The temporary config reorders only those two hooks after LinuxSecMonitor.
+Stop if an additional or different pre-install hook is configured, or if any
+pre-invocation hook exists and its behavior has not been reviewed:
 
 ```bash
-sudo apt-config dump | grep -i 'DPkg::Pre-Install-Pkgs' || true
-hook_command="/usr/bin/python3 -B $hook_root/main.py --apt-preinstall-hook"
-sudo apt-config \
-  -o "DPkg::Pre-Install-Pkgs::=$hook_command" \
-  -o 'DPkg::Tools::Options::/usr/bin/python3::Version=3' \
-  dump | grep -i 'DPkg::Pre-Install-Pkgs'
-read -r -p 'If the effective list is understood and LinuxSecMonitor is last, type ORDER-VERIFIED: ' hook_order
+existing_hooks="$(sudo apt-config dump | grep -F 'DPkg::Pre-Install-Pkgs::' || true)"
+expected_existing="$(printf '%s\n' \
+  'DPkg::Pre-Install-Pkgs:: "/usr/bin/apt-listchanges --apt || test $? -lt 10";' \
+  'DPkg::Pre-Install-Pkgs:: "/usr/sbin/dpkg-preconfigure --apt || true";')"
+if [[ "$existing_hooks" != "$expected_existing" ]]; then
+  echo 'Stop: configured pre-install hooks differ from the reviewed Debian list.' >&2
+  exit 1
+fi
+if sudo apt-config dump | grep -qiE '^(DPkg|APT)::Pre-Invoke(::| |$)'; then
+  echo 'Stop: a pre-invocation hook is configured; review it before testing.' >&2
+  exit 1
+fi
+effective_hooks="$(sudo apt-config -c "$hook_root/apt-hook-order.conf" dump | grep -F 'DPkg::Pre-Install-Pkgs::')"
+printf '%s\n' "$effective_hooks"
+expected_effective="$(printf '%s\n' \
+  "DPkg::Pre-Install-Pkgs:: \"$hook_command\";" \
+  'DPkg::Pre-Install-Pkgs:: "/usr/bin/apt-listchanges --apt || test $? -lt 10";' \
+  'DPkg::Pre-Install-Pkgs:: "/usr/sbin/dpkg-preconfigure --apt || true";')"
+[[ "$effective_hooks" == "$expected_effective" ]] || {
+  echo 'Stop: effective temporary hook list is not in the required order.' >&2
+  exit 1
+}
+read -r -p 'If the effective order is understood and verified, type ORDER-VERIFIED: ' hook_order
 [[ "$hook_order" == ORDER-VERIFIED ]] || { echo 'Stop: hook order was not confirmed.' >&2; exit 1; }
 ```
 
-APT applies command-line configuration after its configuration files. The
-trailing `::` appends this hook to the existing list; it does not put it first
-or replace existing hooks. APT runs `Pre-Install-Pkgs` commands in configured
-list order. Therefore the effective dump must show the existing entries first
-and LinuxSecMonitor last. Stop before either installation command if that order
-is not clear, if an unexpected hook appears, or if you cannot account for what
-each earlier hook does. In particular, an earlier `dpkg-preconfigure --apt`
-can run a package `config` maintainer script before LinuxSecMonitor. The two
-synthetic fixtures below contain no maintainer scripts, so they can test hook
-invocation without running package-provided configuration code; this does not
-establish a pre-execution guarantee for other packages. APT invokes these
-hooks after obtaining archives and before its dpkg installation/configuration
-phase, but the configured order still applies. Do not describe this as a
-universal pre-execution security boundary.
+APT reads the temporary `-c` file after its system config. `#clear` removes the
+existing `DPkg::Pre-Install-Pkgs` list for that APT process, then the file
+recreates the exact reviewed hooks with LinuxSecMonitor first, followed by
+`apt-listchanges` and `dpkg-preconfigure`. APT runs these hooks in configured
+list order before invoking dpkg. Thus, for these commands and the verified
+configuration, `dpkg-preconfigure --apt` runs only after the LinuxSecMonitor
+decision. If the scan blocks, later hooks are not run. The synthetic fixtures
+contain no maintainer scripts. This is not a universal pre-execution barrier:
+it does not cover other APT entry points, changed local configuration, other
+hook types that execute package code, or concurrent privileged processes.
 
-The configuration semantics are documented in Debian's
-[`apt.conf(5)`](https://manpages.debian.org/bookworm/apt/apt.conf.5.en.html):
-command-line settings are applied after configuration files, and `::` appends
-an item to a list.
+Debian documents the `#clear` directive, config-file loading, and hook order in
+[`apt.conf(5)`](https://manpages.debian.org/bookworm/apt/apt.conf.5.en.html).
 
-Run one APT command with temporary `-o` options. The version option is keyed
-to the hook executable's first word (`/usr/bin/python3`), as APT expects:
+Run one APT command with the temporary config. Protocol version 3 is selected
+for `/usr/bin/python3` by the tool option in that config:
 
 ```bash
-sudo apt-get --no-remove \
-  -o "DPkg::Pre-Install-Pkgs::=$hook_command" \
-  -o 'DPkg::Tools::Options::/usr/bin/python3::Version=3' \
+sudo apt-get -c "$hook_root/apt-hook-order.conf" --no-remove \
   install "$hook_root/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb" 2>&1 | tee "$tmp_dir/clean-apt.log"
 grep -F 'APT Pre-Install-Pkgs protocol version 3 accepted.' "$tmp_dir/clean-apt.log"
 ```
@@ -446,10 +472,14 @@ is not installed. If APT lacks the detection prompt, the hook's blocked
 message, or the expected debug evidence, stop and revert the VM snapshot.
 
 ```bash
-sudo apt-get -s --no-remove install "$hook_root/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb"
+sudo apt-get -s -c "$hook_root/apt-hook-order.conf" --no-remove install \
+  "$hook_root/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb"
 set +e
 set -o pipefail
-sudo apt-get --no-remove -o Debug::pkgDPkgPM=1 -o "DPkg::Pre-Install-Pkgs::=$hook_command" -o 'DPkg::Tools::Options::/usr/bin/python3::Version=3' install "$hook_root/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb" 2>&1 | tee "$tmp_dir/eicar-apt.log"
+sudo apt-get -c "$hook_root/apt-hook-order.conf" --no-remove \
+  -o Debug::pkgDPkgPM=1 \
+  install "$hook_root/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb" \
+  2>&1 | tee "$tmp_dir/eicar-apt.log"
 apt_exit=$?
 set -e
 test "$apt_exit" -ne 0
@@ -500,6 +530,7 @@ or any path other than the exact `hook_root` shown by the current shell:
 sudo find "$hook_root" -printf '%u:%g %m %p\n'
 expected_entries="$(printf '%s\n' \
   'd scanner' \
+  'f apt-hook-order.conf' \
   'f main.py' \
   'f linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb' \
   'f linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb' \
@@ -519,6 +550,7 @@ if [[ "$actual_entries" != "$expected_entries" ]]; then
   exit 1
 fi
 if ! sudo rm -- "$hook_root/main.py" \
+  "$hook_root/apt-hook-order.conf" \
   "$hook_root/scanner/__init__.py" \
   "$hook_root/scanner/apt_hook.py" \
   "$hook_root/scanner/malware_scanner.py" \
