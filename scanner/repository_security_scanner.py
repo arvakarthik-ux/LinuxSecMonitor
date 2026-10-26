@@ -2,8 +2,8 @@
 
 Findings are heuristic review leads, not malware or safety verdicts. The
 scanner reads regular files through no-follow directory descriptors on POSIX,
-skips Git internals, and never invokes Git, a shell, a build tool, or a package
-manager.
+skips Git internals except the default local hooks directory, and never invokes
+Git, a shell, a build tool, or a package manager.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_SCAN_SECONDS = 20.0
 READ_CHUNK_BYTES = 64 * 1024
+MAX_GIT_CONFIG_BYTES = 1024 * 1024
 
 _PRIVATE_KEY = re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")
 _TOKEN_PATTERNS = (
@@ -39,6 +40,13 @@ _RISKY_COMMAND_PATTERNS = (
 )
 _LIFECYCLE_KEYS = ("preinstall", "install", "postinstall", "prepare")
 _EXECUTION_FILES = {"setup.py", "makefile", "dockerfile", "build.rs"}
+_GIT_HOOK_NAMES = {
+    "applypatch-msg", "commit-msg", "fsmonitor-watchman", "post-applypatch",
+    "post-checkout", "post-commit", "post-merge", "post-receive",
+    "post-rewrite", "post-update", "pre-applypatch", "pre-commit",
+    "pre-merge-commit", "pre-push", "pre-rebase", "pre-receive",
+    "prepare-commit-msg", "push-to-checkout", "reference-transaction", "update",
+}
 _PYTHON_CACHE_DIRECTORIES = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
 _PYTHON_BYTECODE_SUFFIXES = {".pyc", ".pyo"}
 _URL_DEPENDENCY = re.compile(rb"(?im)^\s*(?:-e\s+|--editable\s+|[A-Za-z0-9_.-]+\s*@\s*)?(?:git\+|https?://|ssh://)\S+")
@@ -149,6 +157,48 @@ def _is_generated_python_cache(path: str, is_directory: bool) -> bool:
     if is_directory:
         return name in _PYTHON_CACHE_DIRECTORIES
     return Path(name).suffix in _PYTHON_BYTECODE_SUFFIXES
+
+
+def _git_hook_config_state(data: bytes) -> tuple[bool, bool, bool]:
+    """Return local custom-hook-path, include, and malformed-config flags.
+
+    This intentionally parses only enough Git config syntax to recognize the
+    settings that can redirect hook lookup. It never resolves includes or
+    expands paths; those cases are surfaced as coverage limitations.
+    """
+    section: bytes | None = None
+    custom_hooks_path = False
+    has_include = False
+    malformed = False
+    section_pattern = re.compile(
+        rb'^\[\s*([A-Za-z][A-Za-z0-9.-]*)(?:\s+[^\]]*)?\s*\]$'
+    )
+    for raw_line in data.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith((b"#", b";")):
+            continue
+        if line.startswith(b"["):
+            match = section_pattern.fullmatch(line)
+            if match is None:
+                malformed = True
+                section = None
+            else:
+                section = match.group(1).lower()
+            continue
+        if section is None:
+            malformed = True
+            continue
+        key, separator, _value = line.partition(b"=")
+        if not separator:
+            # Git config permits valueless boolean keys. They cannot name a
+            # hooksPath or include target, so they need no special handling.
+            continue
+        key = key.strip().lower()
+        if section == b"core" and key == b"hookspath":
+            custom_hooks_path = True
+        elif section in {b"include", b"includeif"} and key == b"path":
+            has_include = True
+    return custom_hooks_path, has_include, malformed
 
 
 def _finding(
@@ -338,6 +388,11 @@ def scan_repository_security(
             if stopped:
                 return
             if name == ".git":
+                if parents:
+                    _add_once(
+                        result.limitations,
+                        "Nested Git metadata and hook configuration were skipped.",
+                    )
                 continue
             if time.monotonic() - started >= MAX_SCAN_SECONDS:
                 result.limitations.append("Static review time limit reached.")
@@ -389,6 +444,11 @@ def scan_repository_security(
                 return
             if not stat.S_ISREG(entry_stat.st_mode):
                 result.limitations.append("Symlinks and non-regular entries were skipped.")
+                continue
+            if (
+                parents == (".git", "hooks")
+                and name in {f"{hook}.sample" for hook in _GIT_HOOK_NAMES}
+            ):
                 continue
             if not include_generated and _is_generated_python_cache(relative_path, is_directory=False):
                 result.generated_paths_excluded += 1
@@ -447,6 +507,16 @@ def scan_repository_security(
                 parse_error = _analyze_file(relative_path, data, findings, seen)
                 if parse_error:
                     result.errors.append(parse_error)
+                if (
+                    parents == (".git", "hooks")
+                    and name in _GIT_HOOK_NAMES
+                    and bool(opened.st_mode & 0o111)
+                ):
+                    _finding(
+                        findings, seen, "active-git-hook", "medium", relative_path,
+                        "Executable file uses a standard Git hook name",
+                        "Git may execute this hook during matching Git operations. Review it before using Git with this repository; the scanner did not execute it.",
+                    )
             except OSError as exc:
                 result.errors.append(f"Could not read {relative_path}: {exc}")
             finally:
@@ -470,6 +540,115 @@ def scan_repository_security(
             result.status = "error"
             result.errors.append("Repository root changed before static review began.")
             return result
+
+        # Review the default local hook directory without walking Git object
+        # storage, refs, or index data. Alternate hook locations are reported
+        # as a coverage limitation rather than followed outside the repository.
+        git_info = None
+        try:
+            git_info = os.stat(".git", dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            result.limitations.append(f"Could not inspect the repository Git metadata entry: {exc}")
+        if git_info is not None:
+            if not stat.S_ISDIR(git_info.st_mode):
+                result.limitations.append(
+                    "The .git entry is not a real directory; worktree or linked Git hook configuration was not inspected."
+                )
+            else:
+                git_fd = None
+                try:
+                    git_fd = os.open(".git", flags, dir_fd=root_fd)
+                    opened_git = os.fstat(git_fd)
+                    if (opened_git.st_dev, opened_git.st_ino) != (git_info.st_dev, git_info.st_ino):
+                        result.limitations.append("Git metadata changed before its hooks could be reviewed.")
+                    else:
+                        config_data: bytes | None = None
+                        config_missing = False
+                        try:
+                            config_info = os.stat("config", dir_fd=git_fd, follow_symlinks=False)
+                            if not stat.S_ISREG(config_info.st_mode) or config_info.st_size > MAX_GIT_CONFIG_BYTES:
+                                result.limitations.append("Git configuration is not a bounded regular file; hook configuration could not be reviewed.")
+                            else:
+                                config_fd = os.open(
+                                    "config", os.O_RDONLY | os.O_NOFOLLOW
+                                    | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0),
+                                    dir_fd=git_fd,
+                                )
+                                try:
+                                    opened_config = os.fstat(config_fd)
+                                    chunks: list[bytes] = []
+                                    size = 0
+                                    while size <= MAX_GIT_CONFIG_BYTES:
+                                        chunk = os.read(config_fd, min(READ_CHUNK_BYTES, MAX_GIT_CONFIG_BYTES + 1 - size))
+                                        if not chunk:
+                                            break
+                                        chunks.append(chunk)
+                                        size += len(chunk)
+                                    after_config = os.fstat(config_fd)
+                                    current_config = os.stat("config", dir_fd=git_fd, follow_symlinks=False)
+                                    if (
+                                        not stat.S_ISREG(opened_config.st_mode)
+                                        or not _same_file_metadata(config_info, opened_config)
+                                        or size > MAX_GIT_CONFIG_BYTES
+                                        or not _same_file_metadata(opened_config, after_config)
+                                        or not _same_file_metadata(opened_config, current_config)
+                                    ):
+                                        result.limitations.append("Git configuration changed or exceeded its review limit.")
+                                    else:
+                                        config_data = b"".join(chunks)
+                                finally:
+                                    os.close(config_fd)
+                        except FileNotFoundError:
+                            config_missing = True
+                        except OSError as exc:
+                            result.limitations.append(f"Could not safely review Git configuration: {exc}")
+
+                        if config_data is not None:
+                            custom_hooks_path, has_external_config, malformed_config = (
+                                _git_hook_config_state(config_data)
+                            )
+                            if custom_hooks_path:
+                                result.limitations.append("A custom core.hooksPath is configured; that alternate hook location was not inspected.")
+                            if has_external_config:
+                                result.limitations.append("Git configuration includes are not resolved and may change the active hook path.")
+                            if malformed_config:
+                                result.limitations.append("Git configuration contains malformed or unsupported syntax; effective hook settings could not be fully reviewed.")
+                        if config_missing:
+                            result.limitations.append("The local Git configuration is missing; effective hook settings could not be fully reviewed.")
+
+                        # System/global configuration and Git configuration
+                        # environment overrides can also redirect hook lookup.
+                        # Do not invoke Git or resolve untrusted include paths.
+                        _add_once(
+                            result.limitations,
+                            "System, global, and environment Git configuration is not resolved; alternate hook locations may be active.",
+                        )
+
+                        hooks_info = None
+                        try:
+                            hooks_info = os.stat("hooks", dir_fd=git_fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            pass
+                        if hooks_info is not None:
+                            if not stat.S_ISDIR(hooks_info.st_mode):
+                                result.limitations.append("The default Git hooks entry is not a real directory and was not followed.")
+                            else:
+                                hooks_fd = os.open("hooks", flags, dir_fd=git_fd)
+                                try:
+                                    opened_hooks = os.fstat(hooks_fd)
+                                    if (opened_hooks.st_dev, opened_hooks.st_ino) != (hooks_info.st_dev, hooks_info.st_ino):
+                                        result.limitations.append("The default Git hooks directory changed before review.")
+                                    else:
+                                        walk(hooks_fd, (".git", "hooks"))
+                                finally:
+                                    os.close(hooks_fd)
+                except OSError as exc:
+                    result.limitations.append(f"Could not safely inspect the default Git hooks: {exc}")
+                finally:
+                    if git_fd is not None:
+                        os.close(git_fd)
         walk(root_fd, ())
     finally:
         os.close(root_fd)

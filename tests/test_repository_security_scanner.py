@@ -41,6 +41,19 @@ def test_add_once_deduplicates_repeated_coverage_limitations():
 
 
 @pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (b"[core]\nhooksPath = /tmp/custom-hooks\n", (True, False, False)),
+        (b'[includeIf "gitdir:~/work/"]\npath = ../shared-config\n', (False, True, False)),
+        (b"[]\n", (False, False, True)),
+        (b"core.hooksPath = hooks\n", (False, False, True)),
+    ],
+)
+def test_git_hook_config_parser_reports_redirects_and_malformed_data(config, expected):
+    assert scanner._git_hook_config_state(config) == expected
+
+
+@pytest.mark.parametrize(
     ("path", "is_directory", "expected"),
     [
         ("tests/__pycache__", True, True),
@@ -160,11 +173,88 @@ def test_repository_walk_skips_git_and_reviews_untracked_files(tmp_path):
 
     result = scanner.scan_repository_security(root)
 
-    assert result.status == "requires_review"
-    assert result.coverage_complete is True
+    assert result.status == "incomplete"
+    assert result.coverage_complete is False
     assert result.files_inspected == 2
     assert any(item.rule_id == "package-lifecycle-script" for item in result.findings)
     assert all(".git/" not in item.path for item in result.findings)
+    assert any("global" in item for item in result.limitations)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="safe directory-descriptor walk requires POSIX")
+def test_repository_scan_reviews_active_default_git_hooks_but_not_other_git_internals(tmp_path):
+    root = tmp_path / "repo"
+    hooks = root / ".git" / "hooks"
+    hooks.mkdir(parents=True)
+    (root / ".git" / "config").write_text("[core]\n\trepositoryformatversion = 0\n", encoding="utf-8")
+    (root / ".git" / "credential.txt").write_text("ordinary private metadata\n", encoding="utf-8")
+    hook = hooks / "pre-commit"
+    hook.write_text("#!/bin/sh\necho review-me\n", encoding="utf-8")
+    hook.chmod(0o755)
+
+    result = scanner.scan_repository_security(root)
+
+    assert result.status == "incomplete"
+    assert result.coverage_complete is False
+    active_hooks = [finding for finding in result.findings if finding.rule_id == "active-git-hook"]
+    assert len(active_hooks) == 1
+    assert active_hooks[0].path == ".git/hooks/pre-commit"
+    assert "did not execute" in active_hooks[0].explanation
+    assert all("credential.txt" not in finding.path for finding in result.findings)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="safe directory-descriptor walk requires POSIX")
+def test_repository_scan_reports_custom_or_unparseable_git_hook_configuration(tmp_path):
+    root = tmp_path / "repo"
+    git = root / ".git"
+    git.mkdir(parents=True)
+    (git / "config").write_text("[core]\nhooksPath = /tmp/external-hooks\n[]\n", encoding="utf-8")
+
+    result = scanner.scan_repository_security(root)
+
+    assert result.status == "incomplete"
+    assert result.coverage_complete is False
+    assert any("custom core.hooksPath" in item for item in result.limitations)
+    assert any("malformed or unsupported syntax" in item for item in result.limitations)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="safe directory-descriptor walk requires POSIX")
+def test_repository_scan_does_not_follow_symlinked_git_hook(tmp_path):
+    root = tmp_path / "repo"
+    hooks = root / ".git" / "hooks"
+    hooks.mkdir(parents=True)
+    (root / ".git" / "config").write_text("[core]\nrepositoryformatversion = 0\n", encoding="utf-8")
+    outside = tmp_path / "outside-hook"
+    outside.write_text("#!/bin/sh\n", encoding="utf-8")
+    outside.chmod(0o755)
+    try:
+        (hooks / "pre-commit").symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation unavailable")
+
+    result = scanner.scan_repository_security(root)
+
+    assert result.status == "incomplete"
+    assert result.coverage_complete is False
+    assert not any(finding.rule_id == "active-git-hook" for finding in result.findings)
+    assert any("non-regular entries were skipped" in item for item in result.limitations)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="safe directory-descriptor walk requires POSIX")
+def test_repository_scan_reports_nested_git_metadata_as_uninspected(tmp_path):
+    root = tmp_path / "repo"
+    nested_git = root / "vendor" / ".git"
+    (nested_git / "hooks").mkdir(parents=True)
+    nested_hook = nested_git / "hooks" / "pre-commit"
+    nested_hook.write_text("#!/bin/sh\n", encoding="utf-8")
+    nested_hook.chmod(0o755)
+
+    result = scanner.scan_repository_security(root)
+
+    assert result.status == "incomplete"
+    assert result.coverage_complete is False
+    assert not any(finding.path == "vendor/.git/hooks/pre-commit" for finding in result.findings)
+    assert any("Nested Git metadata" in item for item in result.limitations)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="safe directory-descriptor walk requires POSIX")

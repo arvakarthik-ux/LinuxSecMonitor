@@ -114,8 +114,14 @@ token-like material (matched values are redacted), direct URL/VCS dependencies,
 package lifecycle scripts, selected command patterns, and common build/CI
 files. It is not a full secret scanner, malware detector, dependency
 vulnerability scanner, or code audit. It examines regular files below the
-supplied directory, including ignored and untracked files, and skips `.git`
-internals and links.
+supplied directory, including ignored and untracked files, and does not follow
+links. It skips Git object/index data but reviews the repository's default
+`.git/hooks` directory for active standard hook names. Executable hooks are
+reported as review leads; their contents are never run. `.git/config` is read
+with a size limit to identify a local custom `core.hooksPath` or include
+directives. The scanner does not resolve included configuration or
+system/global Git configuration, so alternate hook locations may remain
+uninspected and are reported as a coverage limitation.
 
 Static heuristics exclude Python bytecode (`.pyc` and `.pyo`) and common Python
 cache directories (`__pycache__`, `.pytest_cache`, `.mypy_cache`, and
@@ -154,6 +160,23 @@ heuristic finding), `requires_review` (one or more review leads were found),
 pass is not a safety certification.
 Finding severity labels are heuristic triage priorities; they are not CVSS
 scores or a probability that the repository is malicious.
+
+The static pass reviews only directly present, executable files with standard
+Git hook names under the root `.git/hooks`; standard sample hooks are ignored.
+Nested repositories, linked worktree metadata, custom hook directories, Git
+configuration includes, and global or system Git configuration can redirect
+hook execution and are not followed or executed by the scanner. Such cases are
+reported as incomplete coverage. Before using Git with an untrusted
+repository, inspect effective hook configuration
+and origins yourself. This read-only inspection does not execute repository
+hooks:
+
+```bash
+git -C /path/to/repository config --includes --show-origin --show-scope --get-all core.hooksPath
+```
+
+Repository review remains advisory and does not intercept subsequent Git
+operations.
 
 #### Guarded manual repository workflow
 
@@ -678,7 +701,7 @@ not intercept future execution or dependency installation.
 - `no_known_match` means only that no matching record was found in the queried data; it does **not** mean safe.
 - Network failures, unsupported distributions, and uncertain package/version evidence are represented as errors, unsupported states, or items requiring review rather than silently treated as safe.
 - Repository malware assessment stages regular files using no-follow directory descriptors, skips `.git`, links, junctions and non-regular entries, and applies limits of 100,000 files, 20,000 directories, 50 MiB per file, 512 MiB total staged data, 30 seconds for staging, and 120 seconds for ClamAV scanning. Limit alerts and skipped content make coverage incomplete. Time checks are cooperative for filesystem operations; they are not a hard bound on a blocked filesystem call.
-- Repository static review uses no-follow POSIX directory descriptors, skips `.git`, and does not follow links. It excludes `.pyc`/`.pyo` files and common Python cache directories by default; `--include-generated` opts them into the static heuristic pass. The excluded-path count is reported. Its current limits are 50,000 files, 10,000 directories, 20,000 entries per directory, depth 128, 2 MiB per file, 64 MiB total read, and a cooperative 20-second deadline. These limits bound ordinary traversal and reading but are not an OS-enforced CPU/memory sandbox or a hard deadline for a blocked filesystem call.
+- Repository static review uses no-follow POSIX directory descriptors, skips Git object/index data, and does not follow links. It reviews direct standard executable hooks in `.git/hooks` and limited local Git configuration, while reporting external configuration and hook paths as coverage limitations. It excludes `.pyc`/`.pyo` files and common Python cache directories by default; `--include-generated` opts them into the static heuristic pass. The excluded-path count is reported. Its current limits are 50,000 files, 10,000 directories, 20,000 entries per directory, depth 128, 2 MiB per file, 64 MiB total read, and a cooperative 20-second deadline. These limits bound ordinary traversal and reading but are not an OS-enforced CPU/memory sandbox or a hard deadline for a blocked filesystem call.
 - ClamAV scans only the temporary staged snapshot and may inspect supported nested archives. Unsupported or encrypted content, ClamAV errors, missing signatures, and timeouts do not produce a clean result. A `no_detection` result means only that this ClamAV run reported no known detection in the fully staged input; it does not guarantee that the repository is safe.
 - Malware findings are separate from OSV vulnerability findings. A ClamAV signature match is evidence reported by the scanner, not a complete assessment of repository security or a claim about exploitability.
 
