@@ -104,6 +104,24 @@ def _supports_safe_walk() -> bool:
     )
 
 
+def _same_file_metadata(before: os.stat_result, after: os.stat_result) -> bool:
+    """Return whether two file snapshots describe unchanged relevant metadata.
+
+    Comparing mode and ownership explicitly catches changes such as ``chmod``
+    even on filesystems where two rapid updates can share a ctime timestamp.
+    """
+    return (
+        before.st_dev == after.st_dev
+        and before.st_ino == after.st_ino
+        and before.st_mode == after.st_mode
+        and before.st_uid == after.st_uid
+        and before.st_gid == after.st_gid
+        and before.st_size == after.st_size
+        and getattr(before, "st_mtime_ns", None) == getattr(after, "st_mtime_ns", None)
+        and getattr(before, "st_ctime_ns", None) == getattr(after, "st_ctime_ns", None)
+    )
+
+
 def _finding(
     findings: list[RepositorySecurityFinding],
     seen: set[tuple[str, str, str]],
@@ -325,8 +343,8 @@ def scan_repository_security(repository_path: str | Path) -> RepositorySecurityA
                 continue
             try:
                 opened = os.fstat(file_fd)
-                if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (entry_stat.st_dev, entry_stat.st_ino):
-                    result.limitations.append("A file was replaced during static review.")
+                if not stat.S_ISREG(opened.st_mode) or not _same_file_metadata(entry_stat, opened):
+                    result.limitations.append("A file changed or was replaced before static review.")
                     continue
                 chunks: list[bytes] = []
                 read_size = 0
@@ -347,11 +365,8 @@ def scan_repository_security(repository_path: str | Path) -> RepositorySecurityA
                 after = os.fstat(file_fd)
                 current_path = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                 stable = (
-                    opened.st_dev == after.st_dev
-                    and opened.st_ino == after.st_ino
-                    and opened.st_size == after.st_size == read_size
-                    and getattr(opened, "st_mtime_ns", None) == getattr(after, "st_mtime_ns", None)
-                    and getattr(opened, "st_ctime_ns", None) == getattr(after, "st_ctime_ns", None)
+                    _same_file_metadata(opened, after)
+                    and after.st_size == read_size
                     and (current_path.st_dev, current_path.st_ino) == (opened.st_dev, opened.st_ino)
                 )
                 if not stable:

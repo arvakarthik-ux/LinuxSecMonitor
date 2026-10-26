@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,19 @@ def _analyze(path: str, content: bytes):
     seen = set()
     error = scanner._analyze_file(path, content, findings, seen)
     return findings, error
+
+
+def test_file_metadata_comparison_detects_mode_change_without_ctime_change():
+    before = SimpleNamespace(
+        st_dev=1, st_ino=2, st_mode=0o100644, st_uid=1000, st_gid=1000,
+        st_size=12, st_mtime_ns=100, st_ctime_ns=200,
+    )
+    after = SimpleNamespace(
+        st_dev=1, st_ino=2, st_mode=0o100600, st_uid=1000, st_gid=1000,
+        st_size=12, st_mtime_ns=100, st_ctime_ns=200,
+    )
+
+    assert not scanner._same_file_metadata(before, after)
 
 
 def test_package_lifecycle_script_is_reviewed_without_echoing_command():
