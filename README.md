@@ -286,7 +286,9 @@ no maintainer scripts, stage it in a root-owned location readable by `_apt`,
 and install a trusted copy of the hook code under `/opt`:
 
 ```bash
+set -euo pipefail
 tmp_dir="$(mktemp -d)"
+trap 'rm -rf -- "$tmp_dir"' EXIT
 mkdir -p "$tmp_dir/package/DEBIAN" "$tmp_dir/package/usr/share/doc/linuxsecmonitor-apt-hook-smoke"
 cat > "$tmp_dir/package/DEBIAN/control" <<'EOF'
 Package: linuxsecmonitor-apt-hook-smoke
@@ -299,7 +301,8 @@ printf '%s\n' 'Harmless APT hook test fixture.' > \
 dpkg-deb --build "$tmp_dir/package" "$tmp_dir/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb"
 
 if sudo test -e /opt/linuxsecmonitor || \
-   sudo test -e /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb; then
+   sudo test -e /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb || \
+   sudo test -e /var/tmp/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb; then
   echo 'Stop: a smoke-test target already exists; do not overwrite it.' >&2
   exit 1
 fi
@@ -314,12 +317,16 @@ sudo namei -l /opt/linuxsecmonitor/main.py
 sudo find /opt/linuxsecmonitor -printf '%u:%g %m %p\n'
 sudo stat -c '%U:%G %a %n' /usr/bin/python3 \
   /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb
-apt-config dump | grep -i 'DPkg::Pre-Install-Pkgs'
+sudo apt-config dump | grep -i 'DPkg::Pre-Install-Pkgs'
 if dpkg-query -W -f='${db:Status-Abbrev}\n' linuxsecmonitor-apt-hook-smoke 2>/dev/null | grep -q '^ii'; then
   echo 'Stop: the smoke-test package is already installed.' >&2
   exit 1
 fi
-sudo apt-get -s install /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb
+if dpkg-query -s linuxsecmonitor-apt-hook-eicar 2>/dev/null | grep -q '^Status: install ok installed$'; then
+  echo 'Stop: the EICAR test package is already installed.' >&2
+  exit 1
+fi
+sudo apt-get -s --no-remove install /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb
 ```
 
 The setup commands refuse to overwrite an existing hook installation or
@@ -330,48 +337,144 @@ or edit an APT configuration file. The hook is enabled only for the single
 
 The simulation is only a transaction-plan check; it does not prove that the
 hook runs. Proceed only if the plan contains the single new smoke-test package
-and no unrelated installs, removals, or upgrades.
+and no unrelated installs, removals, or upgrades. Do not use `-y`.
 
 Check that the interpreter, every code file and each parent directory in the
-hook path are trusted and not writable by unprivileged users. Also inspect the
-existing `Pre-Install-Pkgs` hooks and their order with `apt-config dump`. APT
-invokes these hooks after obtaining package archives and before it starts the
-dpkg installation/configuration phase. However, hooks are invoked in configured
-order. An earlier `dpkg-preconfigure --apt` hook can run a package's `config`
-maintainer script before LinuxSecMonitor is called; other earlier hooks may
-also perform relevant actions. This fixture has no maintainer scripts. The
-one-command hook option does not guarantee it runs before existing hooks, so
-the hook cannot guarantee that arbitrary package-controlled code has not
-already run when its scan begins. Do not treat it as a pre-execution security
-boundary unless the VM's hook order and behavior have been verified and no
-earlier hook can execute package-controlled code.
+hook path are trusted and not writable by unprivileged users. Inspect the
+configured hooks and the effective list after applying the exact temporary
+command-line options below:
+
+```bash
+sudo apt-config dump | grep -i 'DPkg::Pre-Install-Pkgs' || true
+sudo apt-config \
+  -o 'DPkg::Pre-Install-Pkgs::=/usr/bin/python3 /opt/linuxsecmonitor/main.py --apt-preinstall-hook' \
+  -o 'DPkg::Tools::Options::/usr/bin/python3::Version=3' \
+  dump | grep -i 'DPkg::Pre-Install-Pkgs'
+read -r -p 'If the effective list is understood and LinuxSecMonitor is last, type ORDER-VERIFIED: ' hook_order
+[[ "$hook_order" == ORDER-VERIFIED ]] || { echo 'Stop: hook order was not confirmed.' >&2; exit 1; }
+```
+
+APT applies command-line configuration after its configuration files. The
+trailing `::` appends this hook to the existing list; it does not put it first
+or replace existing hooks. APT runs `Pre-Install-Pkgs` commands in configured
+list order. Therefore the effective dump must show the existing entries first
+and LinuxSecMonitor last. Stop before either installation command if that order
+is not clear, if an unexpected hook appears, or if you cannot account for what
+each earlier hook does. In particular, an earlier `dpkg-preconfigure --apt`
+can run a package `config` maintainer script before LinuxSecMonitor. The two
+synthetic fixtures below contain no maintainer scripts, so they can test hook
+invocation without running package-provided configuration code; this does not
+establish a pre-execution guarantee for other packages. APT invokes these
+hooks after obtaining archives and before its dpkg installation/configuration
+phase, but the configured order still applies. Do not describe this as a
+universal pre-execution security boundary.
+
+The configuration semantics are documented in Debian's
+[`apt.conf(5)`](https://manpages.debian.org/bookworm/apt/apt.conf.5.en.html):
+command-line settings are applied after configuration files, and `::` appends
+an item to a list.
 
 Run one APT command with temporary `-o` options. The version option is keyed
 to the hook executable's first word (`/usr/bin/python3`), as APT expects:
 
 ```bash
-sudo apt-get \
+sudo apt-get --no-remove \
   -o 'DPkg::Pre-Install-Pkgs::=/usr/bin/python3 /opt/linuxsecmonitor/main.py --apt-preinstall-hook' \
   -o 'DPkg::Tools::Options::/usr/bin/python3::Version=3' \
-  install /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb
+  install /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb 2>&1 | tee "$tmp_dir/clean-apt.log"
+grep -F 'APT Pre-Install-Pkgs protocol version 3 accepted.' "$tmp_dir/clean-apt.log"
 ```
 
 APT's normal transaction confirmation occurs before the pre-install hook. At
 that prompt, proceed only after reviewing the simulation above. The hook's
 `APT Pre-Install-Pkgs protocol version 3 accepted` line and per-archive report
-then show that it ran and parsed v3. After a clean result, APT continues to
-`dpkg` without another transaction-plan prompt and installs the harmless
-fixture; verify it with `dpkg-query -W linuxsecmonitor-apt-hook-smoke`. Do not
-add `-y`.
-For a detection-path check, build a second fixture containing the harmless
-EICAR antivirus test string as a payload file. If ClamAV recognizes it, answer
-anything other than exact `INSTALL` at the hook prompt and verify APT aborts
-before `dpkg` starts and the fixture is not installed. EICAR is a test
-signature, not real malware.
-If the local ClamAV database does not recognize it, that check is inconclusive.
-Scanner error and incomplete-result behavior are covered by mocked tests, not
-this real APT procedure. The fixture can be removed later with an explicit
-APT command if desired; review that transaction as well.
+show that it ran and parsed v3. Confirm the harmless package with
+`dpkg-query -W linuxsecmonitor-apt-hook-smoke`.
+
+For the detection/cancellation path, build an EICAR-only package (the EICAR
+string is a harmless antivirus test signature, not real malware). Use a new
+package name and do not add `preinst`, `postinst`, `prerm`, `postrm`, or `config`
+files:
+
+```bash
+mkdir -p "$tmp_dir/eicar/DEBIAN" "$tmp_dir/eicar/usr/share/linuxsecmonitor-eicar"
+cat > "$tmp_dir/eicar/DEBIAN/control" <<'EOF'
+Package: linuxsecmonitor-apt-hook-eicar
+Version: 0.0.1
+Architecture: all
+Description: Harmless antivirus test-signature fixture
+EOF
+printf '%s' 'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > \
+  "$tmp_dir/eicar/usr/share/linuxsecmonitor-eicar/eicar.txt"
+dpkg-deb --build "$tmp_dir/eicar" "$tmp_dir/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb"
+if sudo test -e /var/tmp/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb; then
+  echo 'Stop: the EICAR fixture target already exists; do not overwrite it.' >&2
+  exit 1
+fi
+sudo install -o root -g root -m 0644 \
+  "$tmp_dir/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb" \
+  /var/tmp/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb
+dpkg-deb --control "$tmp_dir/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb" "$tmp_dir/eicar-control"
+if find "$tmp_dir/eicar-control" -maxdepth 1 -type f ! -name control -print -quit | grep -q .; then
+  echo 'Stop: unexpected control files are present; do not install this fixture.' >&2
+  exit 1
+fi
+```
+
+First require LinuxSecMonitor itself to return `detected` with at least one
+detection for that archive. A nonzero exit by itself is not enough because
+errors and incomplete scans also return nonzero:
+
+```bash
+set +e
+python3 /opt/linuxsecmonitor/main.py --scan-deb \
+  /var/tmp/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb \
+  --json --output "$tmp_dir/eicar-scan.json"
+scan_exit=$?
+set -e
+python3 -m json.tool "$tmp_dir/eicar-scan.json"
+python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["status"] == "detected" and r["detections"], r' \
+  "$tmp_dir/eicar-scan.json"
+test "$scan_exit" -eq 1
+```
+
+If this check fails or ClamAV has no usable signatures, stop; do not run the
+APT detection test. Simulate the EICAR fixture transaction and inspect it just
+as for the clean fixture. Then run the APT command below. At APT's ordinary
+transaction prompt, continue only after checking the plan. At LinuxSecMonitor's
+detection prompt, enter `CANCEL` (not `INSTALL`). The hook must print that the
+transaction was blocked and APT must exit nonzero. `Debug::pkgDPkgPM=1` asks APT
+to show the dpkg command line if it starts dpkg; save the output and confirm no
+dpkg invocation for this transaction appears. Also confirm the EICAR package
+is not installed. If APT lacks the detection prompt, the hook's blocked
+message, or the expected debug evidence, stop and revert the VM snapshot.
+
+```bash
+sudo apt-get -s --no-remove install /var/tmp/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb
+set +e
+set -o pipefail
+sudo apt-get --no-remove -o Debug::pkgDPkgPM=1 -o 'DPkg::Pre-Install-Pkgs::=/usr/bin/python3 /opt/linuxsecmonitor/main.py --apt-preinstall-hook' -o 'DPkg::Tools::Options::/usr/bin/python3::Version=3' install /var/tmp/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb 2>&1 | tee "$tmp_dir/eicar-apt.log"
+apt_exit=$?
+set -e
+test "$apt_exit" -ne 0
+grep -F 'APT Pre-Install-Pkgs protocol version 3 accepted.' "$tmp_dir/eicar-apt.log"
+grep -F 'APT transaction blocked:' "$tmp_dir/eicar-apt.log"
+if grep -E '(/usr/bin/dpkg|dpkg --)' "$tmp_dir/eicar-apt.log"; then
+  echo 'Failure: APT appears to have invoked dpkg for the cancelled transaction.' >&2
+  exit 1
+fi
+if dpkg-query -s linuxsecmonitor-apt-hook-eicar 2>/dev/null | grep -q '^Status: install ok installed$'; then
+  echo 'Failure: the EICAR fixture is installed; revert the VM snapshot.' >&2
+  exit 1
+fi
+```
+
+For the last command, record its exit status in the interactive shell. It must
+be nonzero after `CANCEL`. Verify that the package query is not `ii` and that
+the APT debug output contains no dpkg invocation. If ClamAV does not detect the
+EICAR fixture, the cancellation test is inconclusive and must not be replaced
+with an assumption that it was blocked. Scanner error and incomplete-result
+paths remain covered by mocked tests, not this real APT procedure.
 
 After testing, the safest rollback is to revert the disposable VM snapshot.
 That restores the package database and removes the temporary hook code and
@@ -408,6 +511,7 @@ sudo rm -f /opt/linuxsecmonitor/scanner/__init__.py \
   /opt/linuxsecmonitor/scanner/vulnerability_assessment.py
 sudo rmdir /opt/linuxsecmonitor/scanner /opt/linuxsecmonitor
 sudo rm -f /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb
+sudo rm -f /var/tmp/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb
 rm -rf "$tmp_dir"
 ```
 
