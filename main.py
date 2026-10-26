@@ -14,6 +14,7 @@ from time import perf_counter
 from typing import Callable, TextIO, TypeVar
 
 from scanner import collect_system_info, scan_installed_packages
+from scanner.apt_hook import run_apt_preinstall_hook
 from scanner.malware_scanner import MAX_PACKAGE_BYTES, MalwareAssessment, scan_deb
 from scanner.repository_scanner import scan_repository
 from scanner.repository_malware_scanner import scan_repository_malware
@@ -914,6 +915,10 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
         help="Scan a local .deb and offer installation only after explicit confirmation.",
     )
     parser.add_argument(
+        "--apt-preinstall-hook", action="store_true",
+        help="Handle APT Pre-Install-Pkgs protocol version 3 and gate the transaction.",
+    )
+    parser.add_argument(
         "--scan-repo", type=Path, metavar="REPOSITORY",
         help="Inventory a repository and scan staged file contents with ClamAV when available.",
     )
@@ -921,10 +926,18 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
     if args.output and not args.json:
         parser.error("--output requires --json")
     selected_modes = sum(bool(mode) for mode in (
-        args.scan_deb, args.preinstall_deb, args.scan_repo,
+        args.scan_deb, args.preinstall_deb, args.apt_preinstall_hook, args.scan_repo,
     ))
     if selected_modes > 1:
-        parser.error("--scan-deb, --preinstall-deb, and --scan-repo cannot be used together")
+        parser.error(
+            "--scan-deb, --preinstall-deb, --apt-preinstall-hook, and --scan-repo "
+            "cannot be used together"
+        )
+    if args.apt_preinstall_hook and (args.json or args.output or args.diagnostics):
+        parser.error("--apt-preinstall-hook cannot be combined with --json, --output, or --diagnostics")
+
+    if args.apt_preinstall_hook:
+        return run_apt_preinstall_hook()
     if args.scan_repo and args.output and _output_is_inside_repository(args.output, args.scan_repo):
         print("Could not write JSON output inside the repository being scanned.", file=sys.stderr)
         return 2

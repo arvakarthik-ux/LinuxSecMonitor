@@ -165,6 +165,125 @@ Exit codes for this command:
   a nonzero status.
 - `2`: invalid CLI combination or JSON output could not be safely written.
 
+### Experimental APT Pre-Install-Pkgs hook (manual, one-command testing)
+
+LinuxSecMonitor also has an opt-in `--apt-preinstall-hook` mode for APT's
+Pre-Install-Pkgs protocol version 3. On Debian 12, APT 2.6.1 can be asked to
+use protocol version 3 for one invocation with command-line configuration
+options. This does not write an APT configuration file:
+
+Use only a disposable Debian 12 VM or snapshot. Build a harmless package with
+no maintainer scripts, stage it in a root-owned location readable by `_apt`,
+and install a trusted copy of the hook code under `/opt`:
+
+```bash
+tmp_dir="$(mktemp -d)"
+mkdir -p "$tmp_dir/package/DEBIAN" "$tmp_dir/package/usr/share/doc/linuxsecmonitor-apt-hook-smoke"
+cat > "$tmp_dir/package/DEBIAN/control" <<'EOF'
+Package: linuxsecmonitor-apt-hook-smoke
+Version: 0.0.1
+Architecture: all
+Description: Harmless LinuxSecMonitor APT hook integration fixture
+EOF
+printf '%s\n' 'Harmless APT hook test fixture.' > \
+  "$tmp_dir/package/usr/share/doc/linuxsecmonitor-apt-hook-smoke/README"
+dpkg-deb --build "$tmp_dir/package" "$tmp_dir/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb"
+
+sudo install -d -o root -g root -m 0755 /opt/linuxsecmonitor/scanner
+sudo install -o root -g root -m 0644 main.py /opt/linuxsecmonitor/main.py
+sudo install -o root -g root -m 0644 scanner/*.py /opt/linuxsecmonitor/scanner/
+sudo install -o root -g root -m 0644 \
+  "$tmp_dir/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb" \
+  /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb
+sudo namei -l /opt/linuxsecmonitor/main.py
+sudo find /opt/linuxsecmonitor -printf '%u:%g %m %p\n'
+sudo stat -c '%U:%G %a %n' /usr/bin/python3 \
+  /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb
+apt-config dump | grep -i 'DPkg::Pre-Install-Pkgs'
+if dpkg-query -W -f='${db:Status-Abbrev}\n' linuxsecmonitor-apt-hook-smoke 2>/dev/null | grep -q '^ii'; then
+  echo 'Stop: the smoke-test package is already installed.' >&2
+  exit 1
+fi
+sudo apt-get -s install /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb
+```
+
+The simulation is only a transaction-plan check; it does not prove that the
+hook runs. Proceed only if the plan contains the single new smoke-test package
+and no unrelated installs, removals, or upgrades.
+
+Check that the interpreter, every code file and each parent directory in the
+hook path are trusted and not writable by unprivileged users. Also inspect the
+existing `Pre-Install-Pkgs` hooks. A configured `dpkg-preconfigure --apt` hook
+can run a package's `config` maintainer script before later hooks; this fixture
+has no maintainer scripts, but this implementation cannot guarantee ordering
+ahead of other configured hooks for arbitrary packages. Do not use the hook as
+a security boundary for packages with scripts until hook ordering and the
+host's other APT hooks have been audited.
+
+Run one APT command with temporary `-o` options. The version option is keyed
+to the hook executable's first word (`/usr/bin/python3`), as APT expects:
+
+```bash
+sudo apt-get \
+  -o 'DPkg::Pre-Install-Pkgs::=/usr/bin/python3 /opt/linuxsecmonitor/main.py --apt-preinstall-hook' \
+  -o 'DPkg::Tools::Options::/usr/bin/python3::Version=3' \
+  install /var/tmp/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb
+```
+
+APT's normal transaction confirmation occurs before the pre-install hook. At
+that prompt, proceed only after reviewing the simulation above. The hook's
+`APT Pre-Install-Pkgs protocol version 3 accepted` line and per-archive report
+then show that it ran and parsed v3. After a clean result, APT continues to
+`dpkg` without another transaction-plan prompt and installs the harmless
+fixture; verify it with `dpkg-query -W linuxsecmonitor-apt-hook-smoke`. Do not
+add `-y`.
+For a detection-path check, build a second fixture containing the harmless
+EICAR antivirus test string as a payload file. If ClamAV recognizes it, answer
+anything other than exact `INSTALL` at the hook prompt and verify APT aborts
+before `dpkg` starts and the fixture is not installed. EICAR is a test
+signature, not real malware.
+If the local ClamAV database does not recognize it, that check is inconclusive.
+Scanner error and incomplete-result behavior are covered by mocked tests, not
+this real APT procedure. The fixture can be removed later with an explicit
+APT command if desired; review that transaction as well.
+
+Do not point a root-run APT hook at a checkout under a user's writable home
+directory: Python imports and executes the hook code with root privileges
+before the scanner can drop to APT's sandbox user. Keep the test VM disposable
+or take a snapshot first. Review APT's proposed transaction; the clean-path
+command above performs a real installation if APT and the hook both allow it.
+
+The hook reads the complete v3 protocol from standard input, validates the
+configuration and package-action records, and scans every scheduled `.deb`
+archive with the existing package scanner. `**CONFIGURE**` and `**REMOVE**`
+records do not refer to package archives and are not scanned. Archive paths
+must be absolute, regular, non-symlink files within configured size limits.
+When the hook runs as root, it validates archive paths and ownership first,
+then permanently drops its real, effective, and saved user/group IDs to APT's
+`_apt` sandbox identity before running package parsing or ClamAV. Paths
+containing spaces are supported by the protocol parser. Malformed
+transactions, missing archives, file changes during scanning, unavailable
+scanners, errors, and incomplete coverage cause a nonzero hook exit so APT
+aborts. The hook compares archive identity before and after scanning and
+requires root-protected paths when running as root. It cannot hold an open
+handle for APT's later installation step, so a concurrent privileged process
+could still replace an archive after the final check and before APT opens it.
+
+APT proceeds automatically only when every archive has a complete
+`no_detection` result. This means ClamAV found no known signature; it does not
+prove that a package is safe. If complete scans report detections, the hook
+shows the findings and asks on `/dev/tty` for the exact token `INSTALL`;
+declining, any other input, or no terminal aborts the transaction. Detection
+approval does not bypass incomplete scans or errors. The hook does not run
+package maintainer scripts; APT/dpkg may run those scripts later if installation
+is approved.
+
+This is an experimental hook integration, not a permanent APT policy and not
+an automatic APT configuration change. APT's v3 stream has no transaction
+record count or checksum, so a stream truncated exactly at a valid record
+boundary cannot be detected from the protocol alone. Validate hook invocation
+and behavior in a disposable Debian VM before considering any broader use.
+
 ### Example report shape
 
 This is a format template, not a recorded scan result. Values in angle brackets are filled from the current host and data sources.

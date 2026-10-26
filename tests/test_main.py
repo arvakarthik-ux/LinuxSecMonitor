@@ -32,6 +32,25 @@ def test_json_output_format(monkeypatch):
     assert json.loads(output.getvalue())["package_scan"]["packages"][0]["name"] == "bash"
 
 
+def test_apt_preinstall_hook_cli_dispatches_to_hook_runner(monkeypatch):
+    monkeypatch.setattr(main, "run_apt_preinstall_hook", lambda: 7)
+    assert main.main(["--apt-preinstall-hook"], stdout=StringIO()) == 7
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["--apt-preinstall-hook", "--json"], ["--apt-preinstall-hook", "--diagnostics"],
+     ["--apt-preinstall-hook", "--scan-deb", "demo.deb"],
+     ["--apt-preinstall-hook", "--preinstall-deb", "demo.deb"],
+     ["--apt-preinstall-hook", "--scan-repo", "repository"],
+     ["--apt-preinstall-hook", "--output", "report.json"]],
+)
+def test_apt_preinstall_hook_cli_rejects_conflicting_modes(args):
+    with pytest.raises(SystemExit) as error:
+        main.main(args, stdout=StringIO())
+    assert error.value.code == 2
+
+
 def test_scan_deb_cli_keeps_malware_report_separate_and_serializes_json(monkeypatch):
     monkeypatch.setattr(
         main,
