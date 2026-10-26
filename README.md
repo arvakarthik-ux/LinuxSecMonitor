@@ -329,7 +329,7 @@ sudo apt-get -s --no-remove install "$hook_root/linuxsecmonitor-apt-hook-smoke_0
 `mktemp` creates a unique hook directory atomically; the package is staged only
 inside that directory. This avoids overwriting an existing hook installation or
 staged package. This creates only a root-owned code copy and local fixture; it does not create
-or edit an APT configuration file. The hook is enabled only for the single
+or edit an APT configuration file. The hook is enabled only for each individual
 `apt-get` invocation shown below through command-line `-o` options.
 
 The simulation is only a transaction-plan check; it does not prove that the
@@ -438,8 +438,10 @@ as for the clean fixture. Then run the APT command below. At APT's ordinary
 transaction prompt, continue only after checking the plan. At LinuxSecMonitor's
 detection prompt, enter `CANCEL` (not `INSTALL`). The hook must print that the
 transaction was blocked and APT must exit nonzero. `Debug::pkgDPkgPM=1` asks APT
-to show the dpkg command line if it starts dpkg; save the output and confirm no
-dpkg invocation for this transaction appears. Also confirm the EICAR package
+to show the actual command line whenever APT invokes dpkg; save the output and
+inspect any matching line. If a match is ambiguous rather than clearly an
+actual dpkg command line, treat the result as inconclusive and restore the
+snapshot. Also confirm the EICAR package
 is not installed. If APT lacks the detection prompt, the hook's blocked
 message, or the expected debug evidence, stop and revert the VM snapshot.
 
@@ -454,7 +456,7 @@ test "$apt_exit" -ne 0
 grep -F 'APT Pre-Install-Pkgs protocol version 3 accepted.' "$tmp_dir/eicar-apt.log"
 grep -F 'APT transaction blocked:' "$tmp_dir/eicar-apt.log"
 if grep -E '(^|[[:space:]])(/usr/bin/)?dpkg[[:space:]]' "$tmp_dir/eicar-apt.log"; then
-  echo 'Failure: APT appears to have invoked dpkg for the cancelled transaction.' >&2
+  echo 'Inconclusive: possible dpkg command line; inspect it and restore the VM snapshot if ambiguous.' >&2
   exit 1
 fi
 if dpkg-query -s linuxsecmonitor-apt-hook-eicar 2>/dev/null | grep -q '^Status: install ok installed$'; then
@@ -464,8 +466,10 @@ fi
 ```
 
 For the last command, record its exit status in the interactive shell. It must
-be nonzero after `CANCEL`. Verify that the package query is not `ii` and that
-the APT debug output contains no dpkg invocation. If ClamAV does not detect the
+be nonzero after `CANCEL`. The hook marker and blocked message must both appear.
+Verify that the package query is not `ii` and that the APT debug output contains
+no dpkg command line. A matching but ambiguous line makes the result
+inconclusive. If ClamAV does not detect the
 EICAR fixture, the cancellation test is inconclusive and must not be replaced
 with an assumption that it was blocked. Scanner error and incomplete-result
 paths remain covered by mocked tests, not this real APT procedure.
@@ -494,7 +498,27 @@ or any path other than the exact `hook_root` shown by the current shell:
 
 ```bash
 sudo find "$hook_root" -printf '%u:%g %m %p\n'
-sudo rm -- "$hook_root/main.py" \
+expected_entries="$(printf '%s\n' \
+  'd scanner' \
+  'f main.py' \
+  'f linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb' \
+  'f linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb' \
+  'f scanner/__init__.py' \
+  'f scanner/apt_hook.py' \
+  'f scanner/malware_scanner.py' \
+  'f scanner/package_scanner.py' \
+  'f scanner/repository_malware_scanner.py' \
+  'f scanner/repository_scanner.py' \
+  'f scanner/repository_security_scanner.py' \
+  'f scanner/system_info.py' \
+  'f scanner/vulnerability_assessment.py' | LC_ALL=C sort)"
+actual_entries="$(sudo find "$hook_root" -mindepth 1 -printf '%y %P\n' | LC_ALL=C sort)"
+if [[ "$actual_entries" != "$expected_entries" ]]; then
+  echo 'Cleanup stopped: staging contents differ from this test’s expected files.' >&2
+  echo 'Do not delete additional files; restore the disposable VM snapshot.' >&2
+  exit 1
+fi
+if ! sudo rm -- "$hook_root/main.py" \
   "$hook_root/scanner/__init__.py" \
   "$hook_root/scanner/apt_hook.py" \
   "$hook_root/scanner/malware_scanner.py" \
@@ -505,9 +529,19 @@ sudo rm -- "$hook_root/main.py" \
   "$hook_root/scanner/system_info.py" \
   "$hook_root/scanner/vulnerability_assessment.py" \
   "$hook_root/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb" \
-  "$hook_root/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb"
-sudo rmdir -- "$hook_root/scanner" "$hook_root"
-rm -rf "$tmp_dir"
+  "$hook_root/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb"; then
+  echo 'Cleanup failed while removing known test files; restore the VM snapshot.' >&2
+  exit 1
+fi
+if ! sudo rmdir -- "$hook_root/scanner" "$hook_root"; then
+  echo 'Cleanup failed because the staging directory is not empty; restore the VM snapshot.' >&2
+  exit 1
+fi
+if ! rm -rf -- "$tmp_dir"; then
+  echo 'Cleanup failed for the private test temporary directory; restore the VM snapshot.' >&2
+  exit 1
+fi
+trap - EXIT
 ```
 
 If `rmdir` fails or inspection shows any unexpected file, stop cleanup and
