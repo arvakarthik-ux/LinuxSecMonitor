@@ -343,7 +343,7 @@ command-line options below:
 
 ```bash
 sudo apt-config dump | grep -i 'DPkg::Pre-Install-Pkgs' || true
-hook_command="/usr/bin/python3 $hook_root/main.py --apt-preinstall-hook"
+hook_command="/usr/bin/python3 -B $hook_root/main.py --apt-preinstall-hook"
 sudo apt-config \
   -o "DPkg::Pre-Install-Pkgs::=$hook_command" \
   -o 'DPkg::Tools::Options::/usr/bin/python3::Version=3' \
@@ -421,7 +421,7 @@ errors and incomplete scans also return nonzero:
 
 ```bash
 set +e
-python3 "$hook_root/main.py" --scan-deb \
+python3 -B "$hook_root/main.py" --scan-deb \
   "$hook_root/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb" \
   --json --output "$tmp_dir/eicar-scan.json"
 scan_exit=$?
