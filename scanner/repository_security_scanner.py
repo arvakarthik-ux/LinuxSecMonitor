@@ -39,6 +39,8 @@ _RISKY_COMMAND_PATTERNS = (
 )
 _LIFECYCLE_KEYS = ("preinstall", "install", "postinstall", "prepare")
 _EXECUTION_FILES = {"setup.py", "makefile", "dockerfile", "build.rs"}
+_PYTHON_CACHE_DIRECTORIES = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+_PYTHON_BYTECODE_SUFFIXES = {".pyc", ".pyo"}
 _URL_DEPENDENCY = re.compile(rb"(?im)^\s*(?:-e\s+|--editable\s+|[A-Za-z0-9_.-]+\s*@\s*)?(?:git\+|https?://|ssh://)\S+")
 
 
@@ -51,15 +53,19 @@ class RepositorySecurityFinding:
     path: str
     evidence: str
     explanation: str
+    line_number: int | None = None
 
-    def to_dict(self) -> dict[str, str]:
-        return {
+    def to_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {
             "rule_id": self.rule_id,
             "severity": self.severity,
             "path": self.path,
             "evidence": self.evidence,
             "explanation": self.explanation,
         }
+        if self.line_number is not None:
+            result["line_number"] = self.line_number
+        return result
 
 
 @dataclass
@@ -78,6 +84,8 @@ class RepositorySecurityAssessment:
         "Static heuristics identify review leads only. They do not prove a repository "
         "malicious or safe; repository code was not executed."
     )
+    include_generated: bool = False
+    generated_paths_excluded: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -90,6 +98,8 @@ class RepositorySecurityAssessment:
             "limitations": list(self.limitations),
             "coverage_complete": self.coverage_complete,
             "note": self.note,
+            "include_generated": self.include_generated,
+            "generated_paths_excluded": self.generated_paths_excluded,
         }
 
 
@@ -122,6 +132,19 @@ def _same_file_metadata(before: os.stat_result, after: os.stat_result) -> bool:
     )
 
 
+def _line_number(data: bytes, offset: int) -> int:
+    """Return a one-based source line for a byte offset."""
+    return data.count(b"\n", 0, offset) + 1
+
+
+def _is_generated_python_cache(path: str, is_directory: bool) -> bool:
+    """Identify Python bytecode and common Python tool-cache directories."""
+    name = path.rsplit("/", 1)[-1].casefold()
+    if is_directory:
+        return name in _PYTHON_CACHE_DIRECTORIES
+    return Path(name).suffix in _PYTHON_BYTECODE_SUFFIXES
+
+
 def _finding(
     findings: list[RepositorySecurityFinding],
     seen: set[tuple[str, str, str]],
@@ -130,11 +153,14 @@ def _finding(
     path: str,
     evidence: str,
     explanation: str,
+    line_number: int | None = None,
 ) -> None:
     key = (rule_id, path, evidence)
     if key not in seen:
         seen.add(key)
-        findings.append(RepositorySecurityFinding(rule_id, severity, path, evidence, explanation))
+        findings.append(RepositorySecurityFinding(
+            rule_id, severity, path, evidence, explanation, line_number,
+        ))
 
 
 def _analyze_file(
@@ -144,28 +170,36 @@ def _analyze_file(
     seen: set[tuple[str, str, str]],
 ) -> str | None:
     """Add review findings for one bounded file; return parse error if any."""
-    if _PRIVATE_KEY.search(data):
+    private_key_match = _PRIVATE_KEY.search(data)
+    if private_key_match:
         _finding(findings, seen, "private-key-material", "high", path,
                  "private-key header found; key material redacted",
-                 "A private-key marker appears in this file. Verify whether it is a test fixture or exposed credential and rotate real secrets.")
+                 "A private-key marker appears in this file. Verify whether it is a test fixture or exposed credential and rotate real secrets.",
+                 _line_number(data, private_key_match.start()))
     for label, pattern in _TOKEN_PATTERNS:
-        if pattern.search(data):
+        token_match = pattern.search(data)
+        if token_match:
             _finding(findings, seen, "token-like-value", "high", path,
                      f"{label}; matched value redacted",
-                     "A token-shaped value was found. The value is intentionally omitted from the report; verify and rotate it if genuine.")
+                     "A token-shaped value was found. The value is intentionally omitted from the report; verify and rotate it if genuine.",
+                     _line_number(data, token_match.start()))
 
-    if _URL_DEPENDENCY.search(data) and Path(path).name.lower() in {
+    url_match = _URL_DEPENDENCY.search(data)
+    if url_match and Path(path).name.lower() in {
         "requirements.txt", "pyproject.toml", "pipfile", "cargo.toml", "go.mod",
     }:
         _finding(findings, seen, "external-dependency-source", "medium", path,
                  "direct URL, VCS, or editable dependency reference found",
-                 "Review the source, pinning, and integrity of dependencies fetched directly from URLs or version-control systems.")
+                 "Review the source, pinning, and integrity of dependencies fetched directly from URLs or version-control systems.",
+                 _line_number(data, url_match.start()))
 
     for rule_id, pattern in _RISKY_COMMAND_PATTERNS:
-        if pattern.search(data):
+        command_match = pattern.search(data)
+        if command_match:
             _finding(findings, seen, rule_id, "high", path,
                      f"static rule matched: {rule_id}",
-                     "This command pattern can download or execute code, alter privileges, or make destructive changes. Review the exact context before running the repository.")
+                     "This command pattern can download or execute code, alter privileges, or make destructive changes. Review the exact context before running the repository.",
+                     _line_number(data, command_match.start()))
 
     filename = Path(path).name.lower()
     if filename == "package.json":
@@ -217,12 +251,18 @@ def _analyze_file(
     return None
 
 
-def scan_repository_security(repository_path: str | Path) -> RepositorySecurityAssessment:
+def scan_repository_security(
+    repository_path: str | Path,
+    *,
+    include_generated: bool = False,
+) -> RepositorySecurityAssessment:
     """Inspect bounded repository files using no-follow POSIX filesystem APIs.
 
-    Every non-``.git`` regular file is considered, including ignored and
-    untracked files. Oversized, unreadable, linked, changing, or over-limit
-    entries make coverage incomplete rather than being treated as safe.
+    Regular files are considered, including ignored and untracked files,
+    except Python bytecode and common cache directories excluded by default.
+    Pass ``include_generated=True`` to include those paths. Oversized,
+    unreadable, linked, changing, or over-limit entries make coverage
+    incomplete rather than being treated as safe.
     """
     try:
         root = Path(repository_path).expanduser().absolute()
@@ -237,7 +277,16 @@ def scan_repository_security(repository_path: str | Path) -> RepositorySecurityA
             f"Could not inspect repository path: {exc}"
         ])
 
-    result = RepositorySecurityAssessment("completed", display_path)
+    result = RepositorySecurityAssessment(
+        "completed", display_path, include_generated=include_generated,
+    )
+    if include_generated:
+        result.note += " Generated Python bytecode and cache directories were included in static review."
+    else:
+        result.note += (
+            " Generated Python bytecode and common Python cache directories are excluded from static review "
+            "by default; the separate ClamAV scan is not affected."
+        )
     if not _supports_safe_walk():
         result.status = "unavailable"
         result.errors.append("Safe static review requires POSIX no-follow directory-descriptor support.")
@@ -296,6 +345,13 @@ def scan_repository_security(repository_path: str | Path) -> RepositorySecurityA
                 result.errors.append(f"Could not inspect {relative_path}: {exc}")
                 continue
             if stat.S_ISDIR(entry_stat.st_mode):
+                if not include_generated and _is_generated_python_cache(relative_path, is_directory=True):
+                    result.generated_paths_excluded += 1
+                    _add_once(
+                        result.limitations,
+                        "Generated Python bytecode/cache paths were excluded from static review; use --include-generated to inspect them.",
+                    )
+                    continue
                 directory_count += 1
                 if directory_count > MAX_DIRECTORIES:
                     result.limitations.append("Static review directory limit reached.")
@@ -327,6 +383,13 @@ def scan_repository_security(repository_path: str | Path) -> RepositorySecurityA
                 return
             if not stat.S_ISREG(entry_stat.st_mode):
                 result.limitations.append("Symlinks and non-regular entries were skipped.")
+                continue
+            if not include_generated and _is_generated_python_cache(relative_path, is_directory=False):
+                result.generated_paths_excluded += 1
+                _add_once(
+                    result.limitations,
+                    "Generated Python bytecode/cache paths were excluded from static review; use --include-generated to inspect them.",
+                )
                 continue
             if entry_stat.st_size < 0 or entry_stat.st_size > MAX_FILE_BYTES:
                 result.limitations.append("One or more files exceeded the static review per-file size limit.")
@@ -408,7 +471,7 @@ def scan_repository_security(repository_path: str | Path) -> RepositorySecurityA
     result.findings = sorted(findings, key=lambda item: (item.path, item.rule_id, item.evidence))
     result.errors = list(dict.fromkeys(result.errors))
     result.limitations = list(dict.fromkeys(result.limitations))
-    if result.errors or result.limitations:
+    if result.errors or result.limitations or result.generated_paths_excluded:
         result.status = "incomplete"
     elif result.findings:
         result.status = "requires_review"

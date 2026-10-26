@@ -32,8 +32,9 @@ def _mock_posix_only_static_repository_review(monkeypatch):
     monkeypatch.setattr(
         main,
         "scan_repository_security",
-        lambda path: RepositorySecurityAssessment(
+        lambda path, **kwargs: RepositorySecurityAssessment(
             status="completed", repository_path=str(path), coverage_complete=True,
+            include_generated=kwargs.get("include_generated", False),
         ),
     )
 
@@ -59,9 +60,10 @@ def test_apt_preinstall_hook_cli_dispatches_to_hook_runner(monkeypatch):
      ["--apt-preinstall-hook", "--scan-deb", "demo.deb"],
      ["--apt-preinstall-hook", "--preinstall-deb", "demo.deb"],
      ["--apt-preinstall-hook", "--scan-repo", "repository"],
+     ["--include-generated"],
      ["--apt-preinstall-hook", "--output", "report.json"]],
 )
-def test_apt_preinstall_hook_cli_rejects_conflicting_modes(args):
+def test_cli_rejects_conflicting_modes_or_unscoped_generated_option(args):
     with pytest.raises(SystemExit) as error:
         main.main(args, stdout=StringIO())
     assert error.value.code == 2
@@ -688,12 +690,13 @@ def test_scan_repo_static_review_finding_is_visible_and_requires_review(monkeypa
     monkeypatch.setattr(
         main,
         "scan_repository_security",
-        lambda path: RepositorySecurityAssessment(
+        lambda path, **kwargs: RepositorySecurityAssessment(
             status="requires_review", repository_path=str(path), coverage_complete=True,
             findings=[RepositorySecurityFinding(
                 rule_id="package-lifecycle-script", severity="medium",
                 path="package.json", evidence="scripts.postinstall is configured",
                 explanation="Review before dependency installation.",
+                line_number=4,
             )],
         ),
     )
@@ -703,8 +706,23 @@ def test_scan_repo_static_review_finding_is_visible_and_requires_review(monkeypa
 
     assert exit_code == 1
     assert "scripts.postinstall is configured" in output.getvalue()
+    assert "package.json:4" in output.getvalue()
     assert "Review before dependency installation." in output.getvalue()
     assert "does not guarantee" in output.getvalue()
+
+
+def test_scan_repo_include_generated_flag_is_reported_in_json(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    output = StringIO()
+
+    main.main([
+        "--scan-repo", str(root), "--json", "--include-generated",
+    ], stdout=output)
+
+    report = json.loads(output.getvalue())
+    assert report["repository_security_assessment"]["include_generated"] is True
+    assert report["repository_security_assessment"]["generated_paths_excluded"] == 0
 
 
 def test_repository_security_renderer_escapes_controls_and_handles_legacy_data():

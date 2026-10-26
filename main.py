@@ -440,6 +440,8 @@ def _render_repository_security_text(assessment: dict[str, object]) -> str:
         f"  Coverage complete: {'yes' if assessment.get('coverage_complete') is True else 'no'}",
         f"  Files inspected: {assessment.get('files_inspected', 0)}",
         f"  Bytes inspected: {assessment.get('bytes_inspected', 0)}",
+        f"  Generated paths included: {'yes' if assessment.get('include_generated') is True else 'no'}",
+        f"  Generated paths excluded: {assessment.get('generated_paths_excluded', 0)}",
     ]
     findings = assessment.get("findings")
     if isinstance(findings, list) and findings:
@@ -447,10 +449,14 @@ def _render_repository_security_text(assessment: dict[str, object]) -> str:
         for finding in findings[:REPOSITORY_SECURITY_FINDING_PREVIEW_LIMIT]:
             if not isinstance(finding, dict):
                 continue
+            location = terminal_text(finding.get("path"))
+            line_number = finding.get("line_number")
+            if isinstance(line_number, int) and not isinstance(line_number, bool) and line_number > 0:
+                location += f":{line_number}"
             lines.append(
                 f"    [{terminal_text(finding.get('severity'), 'unknown')}] "
                 f"{terminal_text(finding.get('rule_id'))} at "
-                f"{terminal_text(finding.get('path'))}"
+                f"{location}"
             )
             evidence = finding.get("evidence")
             explanation = finding.get("explanation")
@@ -986,9 +992,15 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
         "--scan-repo", type=Path, metavar="REPOSITORY",
         help="Inventory a repository, scan staged files with ClamAV, and run bounded static checks.",
     )
+    parser.add_argument(
+        "--include-generated", action="store_true",
+        help="Include Python bytecode and common cache directories in repository static review.",
+    )
     args = parser.parse_args(argv)
     if args.output and not args.json:
         parser.error("--output requires --json")
+    if args.include_generated and not args.scan_repo:
+        parser.error("--include-generated requires --scan-repo")
     selected_modes = sum(bool(mode) for mode in (
         args.scan_deb, args.preinstall_deb, args.apt_preinstall_hook, args.scan_repo,
     ))
@@ -1017,7 +1029,9 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
     if args.scan_repo:
         result = scan_repository(args.scan_repo).to_dict()
         assessment = scan_repository_malware(args.scan_repo).to_dict()
-        security_assessment = scan_repository_security(args.scan_repo).to_dict()
+        security_assessment = scan_repository_security(
+            args.scan_repo, include_generated=args.include_generated,
+        ).to_dict()
         result["malware_assessment"] = assessment
         result["repository_security_assessment"] = security_assessment
         rendered = (
