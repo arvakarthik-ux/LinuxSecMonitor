@@ -132,6 +132,12 @@ def _same_file_metadata(before: os.stat_result, after: os.stat_result) -> bool:
     )
 
 
+def _add_once(items: list[str], message: str) -> None:
+    """Add a coverage limitation once even when many excluded paths match."""
+    if message not in items:
+        items.append(message)
+
+
 def _line_number(data: bytes, offset: int) -> int:
     """Return a one-based source line for a byte offset."""
     return data.count(b"\n", 0, offset) + 1

@@ -31,6 +31,15 @@ def test_file_metadata_comparison_detects_mode_change_without_ctime_change():
     assert not scanner._same_file_metadata(before, after)
 
 
+def test_add_once_deduplicates_repeated_coverage_limitations():
+    limitations = []
+
+    scanner._add_once(limitations, "Generated cache path excluded.")
+    scanner._add_once(limitations, "Generated cache path excluded.")
+
+    assert limitations == ["Generated cache path excluded."]
+
+
 @pytest.mark.parametrize(
     ("path", "is_directory", "expected"),
     [
@@ -273,7 +282,6 @@ def test_generated_python_caches_are_excluded_from_static_review_by_default(tmp_
     root = tmp_path / "repo"
     cache = root / "tests" / "__pycache__"
     cache.mkdir(parents=True)
-    (root / "src.py").parent.mkdir(parents=True)
     (root / "src.py").write_text("ordinary source\n", encoding="utf-8")
     (cache / "compiled.pyc").write_bytes(bytes.fromhex(
         "2d2d2d2d2d424547494e2050524956415445204b45592d2d2d2d2d"
