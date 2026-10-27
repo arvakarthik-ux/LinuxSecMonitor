@@ -799,6 +799,288 @@ command -v dpkg-query dpkg-deb clamscan
 apt-config dump | grep -i 'DPkg::Pre-Install-Pkgs'
 ```
 
+APT 3.3.3's upstream `apt.conf(5)` documents protocol version 3, including its
+architecture and Multi-Arch fields and the `DPkg::Tools::Options::<command>::Version`
+setting. Kali's APT package tracker lists `apt 3.3.3+kali1` as synced with
+Debian, with a Kali-specific source-list modernization change. This documents
+the upstream capability but does not establish behavior of the installed Kali
+binary; use the abort-only local protocol probe below to verify that binary.
+See [APT 3.3.3 `apt.conf(5)`](https://sources.debian.org/src/apt/3.3.3/doc/apt.conf.5.xml)
+and the [Kali APT package tracker](https://pkg.kali.org/pkg/apt/news/).
+
+#### Abort-only protocol-v3 probe (not an installation test)
+
+This probe records APT's actual hook stream and intentionally fails before
+package processing. It uses a synthetic package containing only a control file
+and documentation text, an always-failing second pre-install hook, and a
+private `dpkg` executable guard selected through `DPkg::Path`. APT runs
+`DPkg::Pre-Invoke` before `DPkg::Pre-Install-Pkgs`, so this procedure does not
+use a failing Pre-Invoke hook. If the probe returns unexpectedly, the second
+pre-install hook stops APT before `dpkg-preconfigure`; if the pre-install hook
+is skipped, `DPkg::Path` makes the private guard fail instead of launching the
+system `dpkg`. This order is visible in APT's
+[`pkgDPkgPM::Go()` source](https://github.com/Debian/apt/blob/3.3.3/apt-pkg/deb/dpkgpm.cc);
+`DPkg::Path` defines the execution PATH documented in
+[`apt.conf(5)`](https://sources.debian.org/src/apt/3.3.3/doc/apt.conf.5.xml).
+Use only a disposable Kali VM or snapshot. If any precondition or result
+differs, stop and restore the snapshot.
+
+Run in one Bash session. These commands create two unique temporary
+directories and do not modify permanent APT configuration:
+
+```bash
+set -Eeuo pipefail
+command -v apt-get apt-config dpkg-deb dpkg-query python3 strace tee namei >/dev/null
+test -x /usr/bin/false
+apt-get --version | grep -Eq '^apt 3\.3\.3\+kali1 '
+
+hooks="$(sudo apt-config dump | grep -F 'DPkg::Pre-Install-Pkgs::' || true)"
+expected='DPkg::Pre-Install-Pkgs:: "/usr/sbin/dpkg-preconfigure --apt || true";'
+[[ "$hooks" == "$expected" ]] || { echo "Stop: unexpected pre-install hooks" >&2; exit 1; }
+if sudo apt-config dump | grep -qiE '::Pre-Invoke(::| |$)'; then
+  echo "Stop: existing Pre-Invoke hooks need review" >&2; exit 1
+fi
+dpkg_binary="$(sudo apt-config dump | grep -F 'Dir::Bin::dpkg ' || true)"
+if [[ -n "$dpkg_binary" && "$dpkg_binary" != 'Dir::Bin::dpkg "dpkg";' ]]; then
+  echo "Stop: APT's dpkg executable is not the expected PATH-searched name" >&2; exit 1
+fi
+if dpkg-query -W -f='${db:Status-Abbrev}\n' linuxsecmonitor-apt-v3-probe 2>/dev/null | grep -q '^ii'; then
+  echo "Stop: fixture package is already installed" >&2; exit 1
+fi
+
+work="$(mktemp -d "${TMPDIR:-/tmp}/linuxsecmonitor-apt-v3-build.XXXXXX")"
+probe="$(mktemp -d /var/tmp/linuxsecmonitor-apt-v3.XXXXXX)"
+sudo chown root:root "$probe"
+sudo chmod 0755 "$probe"
+sudo install -d -o root -g root -m 0755 "$probe/archives"
+mkdir -p "$work/pkg/DEBIAN" "$work/pkg/usr/share/doc/linuxsecmonitor-apt-v3-probe"
+cat > "$work/pkg/DEBIAN/control" <<'EOF'
+Package: linuxsecmonitor-apt-v3-probe
+Version: 0.0.1
+Section: misc
+Priority: optional
+Architecture: all
+Maintainer: Local test fixture
+Description: Harmless APT protocol probe fixture
+EOF
+printf '%s\n' 'Harmless protocol probe fixture.' > "$work/pkg/usr/share/doc/linuxsecmonitor-apt-v3-probe/README"
+deb="$work/linuxsecmonitor-apt-v3-probe_0.0.1_all.deb"
+dpkg-deb --build "$work/pkg" "$deb"
+dpkg-deb -e "$deb" "$work/control-check"
+[[ "$(find "$work/control-check" -mindepth 1 -maxdepth 1 -printf '%f\n')" == control ]] || {
+  echo "Stop: fixture has unexpected control files" >&2; exit 1
+}
+
+cat > "$work/probe.py" <<'PY'
+import os
+import sys
+
+data = sys.stdin.buffer.read(8 * 1024 * 1024 + 1)
+try:
+    fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as capture:
+        capture.write(data)
+except OSError as error:
+    print(f"LSM_PROBE_CAPTURE_ERROR: {error}", file=sys.stderr, flush=True)
+    raise SystemExit(24)
+
+lines = data.splitlines()
+if len(data) > 8 * 1024 * 1024 or not lines or lines[0] != b"VERSION 3":
+    print("LSM_PROBE_NOT_VERSION_3", flush=True)
+    raise SystemExit(23)
+try:
+    separator = lines.index(b"")
+except ValueError:
+    print("LSM_PROBE_MALFORMED_STREAM", flush=True)
+    raise SystemExit(23)
+
+print("LSM_PROBE_VERSION_3_CAPTURED", flush=True)
+for record in lines[separator + 1:]:
+    fields = record.decode("utf-8", "replace").split(maxsplit=8)
+    if len(fields) != 9:
+        print("LSM_PROBE_MALFORMED_ACTION", flush=True)
+        raise SystemExit(23)
+    action = fields[8]
+    print(
+        f"LSM_ACTION name={fields[0]} old={fields[1]} new={fields[5]} "
+        f"arch={fields[6]} operation={os.path.basename(action) if action.startswith('/') else action}",
+        flush=True,
+    )
+# Intentional failure: APT must abort at this first hook.
+raise SystemExit(23)
+PY
+sudo install -o root -g root -m 0644 "$deb" "$probe/linuxsecmonitor-apt-v3-probe_0.0.1_all.deb"
+sudo install -o root -g root -m 0644 "$work/probe.py" "$probe/probe.py"
+sudo install -d -o root -g root -m 0755 "$probe/dpkg-guard"
+printf '%s\n' '#!/bin/sh' 'if [ "$#" -eq 1 ]; then case "$1" in --assert-*|--print-architecture|--print-foreign-architectures|--version) exec /usr/bin/dpkg "$@";; esac; fi' 'echo LSM_DPKG_GUARD_INVOKED >&2' 'exit 97' > "$work/dpkg"
+sudo install -o root -g root -m 0755 "$work/dpkg" "$probe/dpkg-guard/dpkg"
+cat > "$work/apt.conf" <<EOF
+#clear DPkg::Pre-Install-Pkgs;
+DPkg::Pre-Install-Pkgs {
+  "/usr/bin/python3 -B $probe/probe.py $probe/protocol-v3.bin";
+  "/usr/bin/false";
+  "/usr/sbin/dpkg-preconfigure --apt || true";
+};
+DPkg::Tools::Options::/usr/bin/python3::Version "3";
+DPkg::Path "$probe/dpkg-guard:/usr/sbin:/usr/bin:/sbin:/bin";
+Dir::Bin::dpkg "dpkg";
+Dir::Cache::archives "$probe/archives";
+EOF
+sudo install -o root -g root -m 0644 "$work/apt.conf" "$probe/apt.conf"
+
+effective="$(sudo apt-config -c "$probe/apt.conf" dump | grep -F 'DPkg::Pre-Install-Pkgs::')"
+printf '%s\n' "$effective"
+printf '%s\n' "$effective" | grep -F "/usr/bin/python3 -B $probe/probe.py $probe/protocol-v3.bin"
+printf '%s\n' "$effective" | grep -F 'DPkg::Pre-Install-Pkgs:: "/usr/bin/false";'
+printf '%s\n' "$effective" | grep -F 'DPkg::Pre-Install-Pkgs:: "/usr/sbin/dpkg-preconfigure --apt || true";'
+sudo apt-config -c "$probe/apt.conf" dump | grep -F "DPkg::Path \"$probe/dpkg-guard:/usr/sbin:/usr/bin:/sbin:/bin\";"
+sudo apt-config -c "$probe/apt.conf" dump | grep -F "Dir::Cache::archives \"$probe/archives\";"
+sudo apt-config -c "$probe/apt.conf" dump | grep -F 'DPkg::Tools::Options::/usr/bin/python3::Version "3";'
+sudo apt-config -c "$probe/apt.conf" dump | grep -F 'Dir::Bin::dpkg "dpkg";'
+sudo namei -l /usr/bin/python3 /usr/bin/apt-get /usr/bin/strace \
+  "$probe/apt.conf" "$probe/probe.py" "$probe/dpkg-guard/dpkg" \
+  "$probe/linuxsecmonitor-apt-v3-probe_0.0.1_all.deb"
+
+# Simulation must show the fixture only. Do not continue if it plans any
+# unrelated install, removal, or configuration.
+sudo apt-get -s -c "$probe/apt.conf" --no-download --no-remove install "$probe/linuxsecmonitor-apt-v3-probe_0.0.1_all.deb" | tee "$work/simulation.log"
+if grep -E '^(Inst|Remv|Conf) ' "$work/simulation.log" | grep -v 'linuxsecmonitor-apt-v3-probe'; then
+  echo "Stop: simulation contains an unrelated package change" >&2; exit 1
+fi
+grep -F 'linuxsecmonitor-apt-v3-probe' "$work/simulation.log"
+read -r -p 'If the simulation lists only the fixture, type RUN-ABORT-ONLY-PROBE: ' answer
+[[ "$answer" == RUN-ABORT-ONLY-PROBE ]] || { echo "Cancelled"; exit 1; }
+# At the APT confirmation prompt, type y only after checking it still names
+# this fixture; otherwise type n and stop.
+
+# This attempts an APT transaction but has two failure barriers before dpkg.
+# strace is required to distinguish actual execs from APT debug text.
+set +e
+sudo strace -f -qq -e trace=execve -o "$probe/execve.log" /usr/bin/apt-get \
+  -c "$probe/apt.conf" --no-download --no-remove -o Debug::pkgDPkgPM=1 \
+  install "$probe/linuxsecmonitor-apt-v3-probe_0.0.1_all.deb" 2>&1 | tee "$work/probe.log"
+apt_status=${PIPESTATUS[0]}
+set -e
+[[ "$apt_status" -ne 0 ]] || { echo "Stop: APT unexpectedly succeeded; restore snapshot" >&2; exit 1; }
+grep -F 'LSM_PROBE_VERSION_3_CAPTURED' "$work/probe.log"
+sudo test -s "$probe/protocol-v3.bin"
+sudo python3 - "$probe/protocol-v3.bin" <<'PY'
+import sys
+
+data = open(sys.argv[1], "rb").read(8 * 1024 * 1024 + 1)
+if len(data) > 8 * 1024 * 1024 or not data.startswith(b"VERSION 3\n"):
+    raise SystemExit("Captured protocol is not a bounded VERSION 3 stream")
+lines = data.splitlines()
+separator = lines.index(b"")
+actions = [line.decode("utf-8", "replace").split(maxsplit=8)
+           for line in lines[separator + 1:]]
+if not any(len(row) == 9 and row[0] == "linuxsecmonitor-apt-v3-probe"
+           and row[5] == "0.0.1" and row[6] == "all"
+           and row[8].startswith("/") and row[8].endswith(".deb")
+           for row in actions):
+    raise SystemExit("Fixture archive identity is absent from protocol v3")
+print("VERSION 3 and the fixture archive action were captured.")
+PY
+
+# A guard invocation means APT did not reach the probe as expected. A
+# preconfigure execution or real dpkg package-processing argument is unsafe.
+if grep -F 'LSM_DPKG_GUARD_INVOKED' "$work/probe.log"; then
+  echo "Inconclusive: dpkg guard was invoked; APT did not follow the expected hook path." >&2
+  exit 1
+fi
+if sudo grep -F "execve(\"$probe/dpkg-guard/dpkg\"" "$probe/execve.log" | grep -E '"(--unpack|--configure|--install|--remove|--purge)"'; then
+  echo "Inconclusive: the dpkg guard received package-processing arguments." >&2
+  exit 1
+fi
+if sudo grep -F 'execve("/usr/sbin/dpkg-preconfigure"' "$probe/execve.log"; then
+  echo "Inconclusive: dpkg-preconfigure ran; restore the snapshot" >&2; exit 1
+fi
+if sudo grep -E 'execve\("[^\"]*/dpkg", .*"(--unpack|--configure|--install|--remove|--purge)"' "$probe/execve.log"; then
+  echo "Inconclusive: dpkg package processing ran; restore the snapshot" >&2; exit 1
+fi
+if dpkg-query -W -f='${db:Status-Abbrev}\n' linuxsecmonitor-apt-v3-probe 2>/dev/null | grep -q '^ii'; then
+  echo "Failure: fixture is installed; restore the snapshot" >&2; exit 1
+fi
+echo "Pass only if v3 was captured, APT failed, and strace shows no dpkg package-processing call."
+```
+
+The captured stream's configuration section may contain local APT settings; do
+not share `protocol-v3.bin`. Missing `strace` is a stop condition; do not
+install it for this test. The procedure does not test scanner detections,
+approval, or installation. It also cannot establish a universal
+pre-execution barrier.
+
+On success, inspect the trace and confirm there is no `dpkg-preconfigure`
+exec and no `dpkg` invocation with package-processing arguments. If the local
+APT cache contains a copy of the fixture, compare it byte-for-byte with the
+staged package. Confirm the archive cache contains only its expected `lock`,
+empty `partial` directory, and optional identical fixture copy. Then verify
+the probe directory contains exactly `apt.conf`, `archives`, `dpkg-guard`,
+`execve.log`, the fixture `.deb`, `probe.py`, and `protocol-v3.bin`:
+
+```bash
+expected_probe="$(printf '%s\n' apt.conf archives dpkg-guard execve.log \
+  linuxsecmonitor-apt-v3-probe_0.0.1_all.deb probe.py protocol-v3.bin | LC_ALL=C sort)"
+actual_probe="$(sudo find "$probe" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
+[[ "$actual_probe" == "$expected_probe" ]] || {
+  echo 'Unexpected probe directory contents; restore the VM snapshot.' >&2; exit 1;
+}
+sudo find "$probe/archives" -mindepth 1 -maxdepth 1 -printf '%y %f\n' \
+  | grep -vE '^(f lock|d partial|f linuxsecmonitor-apt-v3-probe_0\.0\.1_all\.deb)$' && {
+  echo 'Unexpected APT cache file; restore the VM snapshot.' >&2; exit 1;
+} || true
+if sudo test -e "$probe/archives/linuxsecmonitor-apt-v3-probe_0.0.1_all.deb"; then
+  sudo cmp -- "$probe/linuxsecmonitor-apt-v3-probe_0.0.1_all.deb" \
+    "$probe/archives/linuxsecmonitor-apt-v3-probe_0.0.1_all.deb"
+fi
+if sudo test -d "$probe/archives/partial"; then
+  sudo find "$probe/archives/partial" -mindepth 1 -maxdepth 1 -printf '%y %f\n' \
+    | grep -v '^f lock$' && {
+      echo 'Unexpected partial-download file; restore the VM snapshot.' >&2; exit 1;
+    } || true
+fi
+expected_work="$(printf '%s\n' apt.conf control-check dpkg linuxsecmonitor-apt-v3-probe_0.0.1_all.deb pkg probe.py probe.log simulation.log | LC_ALL=C sort)"
+actual_work="$(find "$work" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
+[[ "$actual_work" == "$expected_work" ]] || {
+  echo 'Unexpected build directory contents; restore the VM snapshot.' >&2; exit 1;
+}
+```
+
+Review the `namei -l` output as a precondition. `/var/tmp` may be the standard
+root-owned sticky, world-writable directory; the newly created probe directory
+and every item beneath it must be root-owned and not writable by unprivileged
+users. The Python interpreter, APT, strace, and their non-sticky parent
+directories must also be root-owned and protected. If any check fails, do not
+run the transaction attempt.
+
+Only after both comparisons succeed, remove the exact created files and
+directories. Never use wildcards or recursive deletion:
+
+```bash
+sudo rm -- "$probe/apt.conf" "$probe/execve.log" \
+  "$probe/linuxsecmonitor-apt-v3-probe_0.0.1_all.deb" \
+  "$probe/probe.py" "$probe/protocol-v3.bin" \
+  "$probe/dpkg-guard/dpkg"
+sudo rm -f -- "$probe/archives/lock" \
+  "$probe/archives/linuxsecmonitor-apt-v3-probe_0.0.1_all.deb"
+if sudo test -d "$probe/archives/partial"; then
+  sudo rm -f -- "$probe/archives/partial/lock"
+  sudo rmdir "$probe/archives/partial"
+fi
+sudo rmdir "$probe/dpkg-guard" "$probe/archives" "$probe"
+rm -- "$work/apt.conf" "$work/dpkg" "$work/linuxsecmonitor-apt-v3-probe_0.0.1_all.deb" \
+  "$work/probe.py" "$work/probe.log" "$work/simulation.log" \
+  "$work/control-check/control" \
+  "$work/pkg/DEBIAN/control" \
+  "$work/pkg/usr/share/doc/linuxsecmonitor-apt-v3-probe/README"
+rmdir "$work/control-check" \
+  "$work/pkg/DEBIAN" "$work/pkg/usr/share/doc/linuxsecmonitor-apt-v3-probe" \
+  "$work/pkg/usr/share/doc" "$work/pkg/usr/share" "$work/pkg/usr" "$work/pkg" "$work"
+```
+
+If any entry is unexpected or cleanup fails, stop and restore the VM snapshot;
+do not broaden cleanup or remove anything outside these directories.
+
 Then exercise read-only modes against known local inputs, without installing a
 package or running repository code:
 
@@ -812,10 +1094,11 @@ python3 main.py --scan-repo /path/to/local-repository
 
 Record inventory status/count, vulnerability status (`unsupported` is expected
 for Kali), ClamAV signature state, repository static-review status, coverage,
-and exit codes. Do not treat `no_detection` as safety proof. Do not run the APT
-hook smoke test on Kali until its APT version, protocol-v3 behavior, existing
-hook order, and package-configuration-script behavior have been reviewed on
-that VM. No real Kali validation is recorded here.
+and exit codes. Do not treat `no_detection` as safety proof. Do not run a
+scanner-enabled or installation-allowing hook test until the abort-only probe
+has established the installed APT's protocol-v3 behavior and the local hook
+order. The probe does not establish a universal pre-execution barrier. No real
+Kali validation is recorded here.
 
 ### Optional live OSV integration tests
 
@@ -867,6 +1150,7 @@ not intercept future execution or dependency installation.
 - `no_known_match` means only that no matching record was found in the queried data; it does **not** mean safe.
 - Network failures, unsupported distributions, and uncertain package/version evidence are represented as errors, unsupported states, or items requiring review rather than silently treated as safe.
 - Repository malware assessment stages regular files using no-follow directory descriptors, skips `.git`, links, junctions and non-regular entries, and applies limits of 100,000 files, 20,000 directories, 50 MiB per file, 512 MiB total staged data, 30 seconds for staging, and 120 seconds for ClamAV scanning. Limit alerts and skipped content make coverage incomplete. Time checks are cooperative for filesystem operations; they are not a hard bound on a blocked filesystem call.
+- Repository inventory reports a bounded list of skipped entry paths and reason codes (`symlink_or_junction`, `non_regular_entry`, `invalid_file_size`, `individual_file_size_limit`, `total_size_limit`, `file_count_limit`, or `inventory_error`) so expected exclusions can be distinguished from read failures. At most 100 path details are included; further omissions are counted. Because paths can reveal repository layout, treat reports as potentially sensitive. Older reports without these additive fields remain supported.
 - Repository static review uses no-follow POSIX directory descriptors, skips Git object/index data, and does not follow links. It reviews direct standard executable hooks in `.git/hooks` and limited local Git configuration, while reporting external configuration and hook paths as coverage limitations. It excludes `.pyc`/`.pyo` files and common Python cache directories by default; `--include-generated` opts them into the static heuristic pass. The excluded-path count is reported. Its current limits are 50,000 files, 10,000 directories, 20,000 entries per directory, depth 128, 2 MiB per file, 64 MiB total read, and a cooperative 20-second deadline. These limits bound ordinary traversal and reading but are not an OS-enforced CPU/memory sandbox or a hard deadline for a blocked filesystem call.
 - ClamAV scans only the temporary staged snapshot and may inspect supported nested archives. Unsupported or encrypted content, ClamAV errors, missing signatures, and timeouts do not produce a clean result. A `no_detection` result means only that this ClamAV run reported no known detection in the fully staged input; it does not guarantee that the repository is safe.
 - Malware findings are separate from OSV vulnerability findings. A ClamAV signature match is evidence reported by the scanner, not a complete assessment of repository security or a claim about exploitability.

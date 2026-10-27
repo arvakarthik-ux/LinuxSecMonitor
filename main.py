@@ -358,6 +358,18 @@ def _render_repository_text(result: dict[str, object]) -> str:
         f"Bytes inventoried (from file metadata): {result.get('bytes_scanned', 0)}",
         "File types:",
     ]
+    skipped_details = result.get("skipped_entry_details")
+    if isinstance(skipped_details, list) and skipped_details:
+        lines.append("Skipped-entry details:")
+        for item in skipped_details:
+            if isinstance(item, dict):
+                lines.append(
+                    f"  {terminal_text(item.get('path'))}: "
+                    f"{terminal_text(item.get('reason'))}"
+                )
+        omitted = result.get("skipped_entry_details_omitted", 0)
+        if isinstance(omitted, int) and omitted > 0:
+            lines.append(f"  … and {omitted} additional skipped entries omitted")
     file_types = result.get("file_types")
     if isinstance(file_types, dict) and file_types:
         lines.extend(

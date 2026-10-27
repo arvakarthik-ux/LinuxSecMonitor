@@ -18,6 +18,7 @@ MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_TOTAL_BYTES = 1024 * 1024 * 1024
 MAX_SCAN_SECONDS = 30.0
 TEXT_MANIFEST_PREVIEW_LIMIT = 20
+MAX_SKIPPED_ENTRY_DETAILS = 100
 
 MANIFEST_NAMES = {
     "package.json",
@@ -48,6 +49,9 @@ class RepositoryScanResult:
         "Inventory only: file contents were not analyzed for malware, secrets, "
         "vulnerabilities, or overall security. .git internals are excluded."
     )
+    # Appended to preserve the positional order of the original result fields.
+    skipped_entry_details: list[dict[str, str]] = field(default_factory=list)
+    skipped_entry_details_omitted: int = 0
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-ready copy of the inventory result."""
@@ -57,6 +61,8 @@ class RepositoryScanResult:
             "files_observed": self.files_observed,
             "files_scanned": self.files_scanned,
             "files_skipped": self.files_skipped,
+            "skipped_entry_details": [dict(item) for item in self.skipped_entry_details],
+            "skipped_entry_details_omitted": self.skipped_entry_details_omitted,
             "bytes_scanned": self.bytes_scanned,
             "file_types": dict(self.file_types),
             "manifests": [dict(manifest) for manifest in self.manifests],
@@ -129,11 +135,23 @@ def scan_repository(repository_path: str | Path) -> RepositoryScanResult:
     stop_scan = False
     root_read_error = False
 
-    def observe_file_entry() -> bool:
+    def record_skipped(path: str | Path, reason: str) -> None:
+        """Retain bounded path/reason details for entries omitted from inventory."""
+        if len(result.skipped_entry_details) >= MAX_SKIPPED_ENTRY_DETAILS:
+            result.skipped_entry_details_omitted += 1
+            return
+        try:
+            relative_path = Path(path).relative_to(root).as_posix()
+        except ValueError:
+            relative_path = str(path)
+        result.skipped_entry_details.append({"path": relative_path, "reason": reason})
+
+    def observe_file_entry(path: str | Path) -> bool:
         """Count every file-like entry against the traversal file limit."""
         result.files_observed += 1
         if result.files_observed > MAX_FILES:
             result.files_skipped += 1
+            record_skipped(path, "file_count_limit")
             _add_once(result.limitations, "File count limit reached.")
             return False
         return True
@@ -162,10 +180,11 @@ def scan_repository(repository_path: str | Path) -> RepositoryScanResult:
                         continue
                     try:
                         if _is_symlink_or_junction(entry.path, entry):
-                            if not observe_file_entry():
+                            if not observe_file_entry(entry.path):
                                 stop_scan = True
                                 break
                             result.files_skipped += 1
+                            record_skipped(entry.path, "symlink_or_junction")
                             _add_once(
                                 result.limitations,
                                 "Symbolic links and junctions were skipped and not followed.",
@@ -180,17 +199,18 @@ def scan_repository(repository_path: str | Path) -> RepositoryScanResult:
                             pending.append(Path(entry.path))
                             continue
                         if not entry.is_file(follow_symlinks=False):
-                            if not observe_file_entry():
+                            if not observe_file_entry(entry.path):
                                 stop_scan = True
                                 break
                             result.files_skipped += 1
+                            record_skipped(entry.path, "non_regular_entry")
                             _add_once(
                                 result.limitations,
                                 "Non-regular filesystem entries were skipped.",
                             )
                             continue
 
-                        if not observe_file_entry():
+                        if not observe_file_entry(entry.path):
                             stop_scan = True
                             break
 
@@ -198,10 +218,12 @@ def scan_repository(repository_path: str | Path) -> RepositoryScanResult:
                         size = file_stat.st_size
                         if size < 0:
                             result.files_skipped += 1
+                            record_skipped(entry.path, "invalid_file_size")
                             result.errors.append(f"File has an invalid size: {entry.path}")
                             continue
                         if size > MAX_FILE_BYTES:
                             result.files_skipped += 1
+                            record_skipped(entry.path, "individual_file_size_limit")
                             _add_once(
                                 result.limitations,
                                 "One or more files exceeded the individual file-size limit.",
@@ -209,6 +231,7 @@ def scan_repository(repository_path: str | Path) -> RepositoryScanResult:
                             continue
                         if result.bytes_scanned + size > MAX_TOTAL_BYTES:
                             result.files_skipped += 1
+                            record_skipped(entry.path, "total_size_limit")
                             _add_once(result.limitations, "Total file-size limit reached.")
                             stop_scan = True
                             break
@@ -225,6 +248,7 @@ def scan_repository(repository_path: str | Path) -> RepositoryScanResult:
                             })
                     except OSError as exc:
                         result.files_skipped += 1
+                        record_skipped(entry.path, "inventory_error")
                         result.errors.append(f"Could not inventory {entry.path}: {exc}")
         except OSError as exc:
             result.errors.append(f"Could not continue reading directory {directory}: {exc}")

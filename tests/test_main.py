@@ -851,6 +851,37 @@ def test_repository_text_escapes_untrusted_manifest_path_controls():
     assert "\r" not in text
 
 
+def test_repository_text_escapes_skipped_entry_details_and_supports_legacy_reports():
+    legacy_report = {
+        "status": "incomplete",
+        "repository_path": "repo",
+        "files_observed": 1,
+        "files_scanned": 0,
+        "files_skipped": 1,
+        "bytes_scanned": 0,
+        "limitations": ["A symbolic link was skipped."],
+        "errors": [],
+        "coverage_complete": False,
+    }
+    assert "Skipped-entry details:" not in main._render_repository_text(legacy_report)
+
+    report = {
+        **legacy_report,
+        "skipped_entry_details": [{
+            "path": "unsafe\x1b[2J\r\nforged",
+            "reason": "symlink_or_junction",
+        }],
+        "skipped_entry_details_omitted": 2,
+    }
+    text = main._render_repository_text(report)
+
+    assert "Skipped-entry details:" in text
+    assert "unsafe\\x1b[2J\\r\\nforged: symlink_or_junction" in text
+    assert "and 2 additional skipped entries omitted" in text
+    assert "\x1b" not in text
+    assert "\r" not in text
+
+
 def test_json_output_file(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(main, "build_result", lambda diagnostic=None: {
         "system_info": {}, "package_scan": {"success": True, "error": None, "packages": []},

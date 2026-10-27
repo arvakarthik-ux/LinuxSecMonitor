@@ -10,6 +10,16 @@ import pytest
 from scanner import repository_scanner as scanner
 
 
+def test_repository_scan_result_keeps_existing_positional_field_order():
+    result = scanner.RepositoryScanResult("completed", "repo", 1, 2, 3, 4)
+
+    assert result.files_observed == 1
+    assert result.files_scanned == 2
+    assert result.files_skipped == 3
+    assert result.bytes_scanned == 4
+    assert result.skipped_entry_details == []
+
+
 def test_reparse_point_attribute_is_treated_as_a_junction(monkeypatch):
     class Entry:
         path = "mock-junction"
@@ -125,6 +135,10 @@ def test_scan_repository_does_not_follow_symlinks(tmp_path):
     assert result.files_observed == 2
     assert result.files_skipped == 2
     assert result.manifests == []
+    assert {(item["path"], item["reason"]) for item in result.skipped_entry_details} == {
+        ("linked-file.json", "symlink_or_junction"),
+        ("linked-dir", "symlink_or_junction"),
+    }
     assert any("Symbolic links and junctions were skipped" in item
                for item in result.limitations)
 
@@ -188,6 +202,78 @@ def test_scan_repository_file_count_limit_includes_oversized_skipped_files(
     assert result.files_observed == 2
     assert result.files_skipped == 2
     assert any("File count limit" in item for item in result.limitations)
+    assert result.skipped_entry_details
+    assert all(item["reason"] in {"individual_file_size_limit", "file_count_limit"}
+               for item in result.skipped_entry_details)
+
+
+def test_scan_repository_bounds_skipped_entry_details(monkeypatch, tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "large-a.bin").write_bytes(b"large")
+    (root / "large-b.bin").write_bytes(b"also large")
+    monkeypatch.setattr(scanner, "MAX_SKIPPED_ENTRY_DETAILS", 1)
+    monkeypatch.setattr(scanner, "MAX_FILE_BYTES", 1)
+
+    result = scanner.scan_repository(root)
+    report = result.to_dict()
+
+    assert result.files_skipped == 2
+    assert len(report["skipped_entry_details"]) == 1
+    assert report["skipped_entry_details_omitted"] == 1
+    assert result.files_skipped == (
+        len(report["skipped_entry_details"])
+        + report["skipped_entry_details_omitted"]
+    )
+
+
+def test_scan_repository_records_path_for_file_inventory_error(monkeypatch, tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    class Entry:
+        name = "unreadable.bin"
+        path = str(root / name)
+
+        @staticmethod
+        def is_symlink():
+            return False
+
+        @staticmethod
+        def is_dir(*, follow_symlinks):
+            return False
+
+        @staticmethod
+        def is_file(*, follow_symlinks):
+            return True
+
+        @staticmethod
+        def stat(*, follow_symlinks):
+            raise PermissionError("read denied in test")
+
+    class Entries:
+        def __enter__(self):
+            return self
+
+        @staticmethod
+        def __exit__(*_args):
+            return False
+
+        @staticmethod
+        def __iter__():
+            return iter((Entry(),))
+
+    monkeypatch.setattr(scanner.os, "scandir", lambda _path: Entries())
+    monkeypatch.setattr(scanner, "_is_symlink_or_junction", lambda *_args: False)
+
+    result = scanner.scan_repository(root)
+
+    assert result.status == "incomplete"
+    assert result.files_skipped == 1
+    assert result.skipped_entry_details == [{
+        "path": "unreadable.bin", "reason": "inventory_error",
+    }]
+    assert any("read denied in test" in error for error in result.errors)
 
 
 def test_scan_repository_handles_unusual_unicode_filename(tmp_path):
