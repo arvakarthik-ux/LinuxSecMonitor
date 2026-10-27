@@ -265,4 +265,5 @@ def scan_repository(repository_path: str | Path) -> RepositoryScanResult:
 
     result.file_types = dict(sorted(result.file_types.items()))
     result.manifests.sort(key=lambda item: item["path"])
+    result.skipped_entry_details.sort(key=lambda item: (item["path"], item["reason"]))
     return result

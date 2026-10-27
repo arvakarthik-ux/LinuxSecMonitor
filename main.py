@@ -428,6 +428,21 @@ def _render_repository_malware_text(assessment: dict[str, object]) -> str:
         f"  Staged files scanned: {assessment.get('files_scanned', 0)}",
         f"  Staged bytes scanned: {assessment.get('bytes_scanned', 0)}",
     ]
+    skipped_count = assessment.get("entries_skipped")
+    if isinstance(skipped_count, int) and not isinstance(skipped_count, bool):
+        lines.append(f"  Entries skipped: {skipped_count}")
+    skipped_details = assessment.get("skipped_entry_details")
+    if isinstance(skipped_details, list) and skipped_details:
+        lines.append("  Skipped-entry details:")
+        for item in skipped_details:
+            if isinstance(item, dict):
+                lines.append(
+                    f"    {terminal_text(item.get('path'), 'path unavailable')}: "
+                    f"{terminal_text(item.get('reason'), 'reason unavailable')}"
+                )
+        omitted = assessment.get("skipped_entry_details_omitted", 0)
+        if isinstance(omitted, int) and omitted > 0:
+            lines.append(f"    … and {omitted} additional skipped details omitted")
     detections = assessment.get("detections")
     if isinstance(detections, list) and detections:
         lines.append("  Detections:")
@@ -476,6 +491,21 @@ def _render_repository_security_text(assessment: dict[str, object]) -> str:
         f"  Generated paths included: {'yes' if assessment.get('include_generated') is True else 'no'}",
         f"  Generated paths excluded: {assessment.get('generated_paths_excluded', 0)}",
     ]
+    skipped_count = assessment.get("entries_skipped")
+    if isinstance(skipped_count, int) and not isinstance(skipped_count, bool):
+        lines.append(f"  Entries skipped: {skipped_count}")
+    skipped_details = assessment.get("skipped_entry_details")
+    if isinstance(skipped_details, list) and skipped_details:
+        lines.append("  Skipped-entry details:")
+        for item in skipped_details:
+            if isinstance(item, dict):
+                lines.append(
+                    f"    {terminal_text(item.get('path'), 'path unavailable')}: "
+                    f"{terminal_text(item.get('reason'), 'reason unavailable')}"
+                )
+        omitted = assessment.get("skipped_entry_details_omitted", 0)
+        if isinstance(omitted, int) and omitted > 0:
+            lines.append(f"    … and {omitted} additional skipped details omitted")
     findings = assessment.get("findings")
     if isinstance(findings, list) and findings:
         lines.append("  Review findings:")

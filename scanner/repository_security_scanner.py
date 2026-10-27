@@ -25,6 +25,7 @@ MAX_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_SCAN_SECONDS = 20.0
 READ_CHUNK_BYTES = 64 * 1024
 MAX_GIT_CONFIG_BYTES = 1024 * 1024
+MAX_SKIPPED_ENTRY_DETAILS = 100
 
 _PRIVATE_KEY = re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")
 _TOKEN_PATTERNS = (
@@ -94,6 +95,9 @@ class RepositorySecurityAssessment:
     )
     include_generated: bool = False
     generated_paths_excluded: int = 0
+    entries_skipped: int = 0
+    skipped_entry_details: list[dict[str, str]] = field(default_factory=list)
+    skipped_entry_details_omitted: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -108,6 +112,9 @@ class RepositorySecurityAssessment:
             "note": self.note,
             "include_generated": self.include_generated,
             "generated_paths_excluded": self.generated_paths_excluded,
+            "entries_skipped": self.entries_skipped,
+            "skipped_entry_details": [dict(item) for item in self.skipped_entry_details],
+            "skipped_entry_details_omitted": self.skipped_entry_details_omitted,
         }
 
 
@@ -362,6 +369,20 @@ def scan_repository_security(
     findings: list[RepositorySecurityFinding] = []
     seen: set[tuple[str, str, str]] = set()
     stopped = False
+    skipped_paths: set[str] = set()
+
+    def record_skipped(path: str, reason: str) -> None:
+        """Count each affected path once and retain bounded reason details."""
+        if path not in skipped_paths:
+            skipped_paths.add(path)
+            result.entries_skipped += 1
+        if any(item["path"] == path and item["reason"] == reason
+               for item in result.skipped_entry_details):
+            return
+        if len(result.skipped_entry_details) >= MAX_SKIPPED_ENTRY_DETAILS:
+            result.skipped_entry_details_omitted += 1
+            return
+        result.skipped_entry_details.append({"path": path, "reason": reason})
 
     def walk(directory_fd: int, parents: tuple[str, ...]) -> None:
         nonlocal file_count, directory_count, stopped
@@ -374,6 +395,10 @@ def scan_repository_security(
             with os.scandir(directory_fd) as entries:
                 for entry in entries:
                     if len(names) >= MAX_DIRECTORY_ENTRIES:
+                        omitted_path = "/".join((*parents, entry.name))
+                        record_skipped(
+                            omitted_path, "directory_entry_limit",
+                        )
                         result.limitations.append(
                             "Static review per-directory entry limit reached."
                         )
@@ -382,6 +407,7 @@ def scan_repository_security(
                     names.append(entry.name)
             names.sort()
         except OSError as exc:
+            record_skipped("/".join(parents) or ".", "directory_read_error")
             result.errors.append(f"Could not read directory {'/'.join(parents) or '.'}: {exc}")
             return
         for name in names:
@@ -394,20 +420,23 @@ def scan_repository_security(
                         "Nested Git metadata and hook configuration were skipped.",
                     )
                 continue
+            relative_parts = (*parents, name)
+            relative_path = "/".join(relative_parts)
             if time.monotonic() - started >= MAX_SCAN_SECONDS:
+                record_skipped(relative_path, "static_review_time_limit")
                 result.limitations.append("Static review time limit reached.")
                 stopped = True
                 return
-            relative_parts = (*parents, name)
-            relative_path = "/".join(relative_parts)
             try:
                 entry_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             except OSError as exc:
+                record_skipped(relative_path, "entry_stat_error")
                 result.errors.append(f"Could not inspect {relative_path}: {exc}")
                 continue
             if stat.S_ISDIR(entry_stat.st_mode):
                 if not include_generated and _is_generated_python_cache(relative_path, is_directory=True):
                     result.generated_paths_excluded += 1
+                    record_skipped(relative_path, "generated_cache_excluded")
                     _add_once(
                         result.limitations,
                         "Generated Python bytecode/cache paths were excluded from static review; use --include-generated to inspect them.",
@@ -415,10 +444,12 @@ def scan_repository_security(
                     continue
                 directory_count += 1
                 if directory_count > MAX_DIRECTORIES:
+                    record_skipped(relative_path, "directory_count_limit")
                     result.limitations.append("Static review directory limit reached.")
                     stopped = True
                     return
                 if len(relative_parts) > MAX_DIRECTORY_DEPTH:
+                    record_skipped(relative_path, "directory_depth_limit")
                     result.limitations.append("Static review directory-depth limit reached.")
                     continue
                 try:
@@ -426,9 +457,11 @@ def scan_repository_security(
                     child_stat = os.fstat(child_fd)
                     if (child_stat.st_dev, child_stat.st_ino) != (entry_stat.st_dev, entry_stat.st_ino):
                         os.close(child_fd)
+                        record_skipped(relative_path, "directory_changed")
                         result.limitations.append("A directory changed during static review.")
                         continue
                 except OSError as exc:
+                    record_skipped(relative_path, "directory_open_error")
                     result.errors.append(f"Could not safely open directory {relative_path}: {exc}")
                     continue
                 try:
@@ -439,10 +472,15 @@ def scan_repository_security(
 
             file_count += 1
             if file_count > MAX_FILES:
+                record_skipped(relative_path, "file_count_limit")
                 result.limitations.append("Static review file-count limit reached.")
                 stopped = True
                 return
             if not stat.S_ISREG(entry_stat.st_mode):
+                record_skipped(
+                    relative_path,
+                    "symlink" if stat.S_ISLNK(entry_stat.st_mode) else "non_regular_entry",
+                )
                 result.limitations.append("Symlinks and non-regular entries were skipped.")
                 continue
             if (
@@ -452,15 +490,18 @@ def scan_repository_security(
                 continue
             if not include_generated and _is_generated_python_cache(relative_path, is_directory=False):
                 result.generated_paths_excluded += 1
+                record_skipped(relative_path, "generated_bytecode_excluded")
                 _add_once(
                     result.limitations,
                     "Generated Python bytecode/cache paths were excluded from static review; use --include-generated to inspect them.",
                 )
                 continue
             if entry_stat.st_size < 0 or entry_stat.st_size > MAX_FILE_BYTES:
+                record_skipped(relative_path, "individual_file_size_limit")
                 result.limitations.append("One or more files exceeded the static review per-file size limit.")
                 continue
             if result.bytes_inspected + entry_stat.st_size > MAX_TOTAL_BYTES:
+                record_skipped(relative_path, "total_size_limit")
                 result.limitations.append("Static review total-byte limit reached.")
                 stopped = True
                 return
@@ -468,17 +509,20 @@ def scan_repository_security(
             try:
                 file_fd = os.open(name, file_flags, dir_fd=directory_fd)
             except OSError as exc:
+                record_skipped(relative_path, "file_open_error")
                 result.errors.append(f"Could not safely open {relative_path}: {exc}")
                 continue
             try:
                 opened = os.fstat(file_fd)
                 if not stat.S_ISREG(opened.st_mode) or not _same_file_metadata(entry_stat, opened):
+                    record_skipped(relative_path, "file_changed")
                     result.limitations.append("A file changed or was replaced before static review.")
                     continue
                 chunks: list[bytes] = []
                 read_size = 0
                 while True:
                     if time.monotonic() - started >= MAX_SCAN_SECONDS:
+                        record_skipped(relative_path, "static_review_time_limit")
                         result.limitations.append("Static review time limit reached while reading a file.")
                         stopped = True
                         break
@@ -488,6 +532,7 @@ def scan_repository_security(
                     chunks.append(chunk)
                     read_size += len(chunk)
                     if read_size > MAX_FILE_BYTES or result.bytes_inspected + read_size > MAX_TOTAL_BYTES:
+                        record_skipped(relative_path, "read_size_limit")
                         result.limitations.append("Static review byte limit reached while reading a file.")
                         stopped = True
                         break
@@ -499,6 +544,7 @@ def scan_repository_security(
                     and (current_path.st_dev, current_path.st_ino) == (opened.st_dev, opened.st_ino)
                 )
                 if not stable:
+                    record_skipped(relative_path, "file_changed")
                     result.limitations.append("A file changed during static review and its content was discarded.")
                     continue
                 data = b"".join(chunks)
@@ -518,6 +564,7 @@ def scan_repository_security(
                         "Git may execute this hook during matching Git operations. Review it before using Git with this repository; the scanner did not execute it.",
                     )
             except OSError as exc:
+                record_skipped(relative_path, "file_read_error")
                 result.errors.append(f"Could not read {relative_path}: {exc}")
             finally:
                 os.close(file_fd)
@@ -528,8 +575,10 @@ def scan_repository_security(
                 getattr(before_directory, field_name, None) != getattr(after_directory, field_name, None)
                 for field_name in ("st_mtime_ns", "st_ctime_ns")
             ):
+                record_skipped("/".join(parents) or ".", "directory_changed")
                 result.limitations.append(f"Directory changed during static review: {'/'.join(parents) or '.'}")
         except OSError as exc:
+            record_skipped("/".join(parents) or ".", "directory_check_error")
             result.errors.append(f"Could not verify directory stability: {exc}")
         if directory_limit_reached:
             stopped = True
@@ -656,6 +705,7 @@ def scan_repository_security(
     result.findings = sorted(findings, key=lambda item: (item.path, item.rule_id, item.evidence))
     result.errors = list(dict.fromkeys(result.errors))
     result.limitations = list(dict.fromkeys(result.limitations))
+    result.skipped_entry_details.sort(key=lambda item: (item["path"], item["reason"]))
     if result.errors or result.limitations or result.generated_paths_excluded:
         result.status = "incomplete"
     elif result.findings:

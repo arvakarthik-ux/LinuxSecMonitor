@@ -882,6 +882,61 @@ def test_repository_text_escapes_skipped_entry_details_and_supports_legacy_repor
     assert "\r" not in text
 
 
+def test_repository_assessment_text_renders_bounded_skip_details_safely():
+    malware = {
+        "status": "incomplete",
+        "scanner": "ClamAV",
+        "coverage_complete": False,
+        "files_scanned": 3,
+        "bytes_scanned": 10,
+        "entries_skipped": 1,
+        "skipped_entry_details": [{
+            "path": "archive\x1b[31m.zip",
+            "reason": "encrypted_archive_content",
+        }],
+        "skipped_entry_details_omitted": 0,
+        "detections": [],
+        "errors": [],
+        "limitations": ["Encrypted content was not examined."],
+    }
+    static_review = {
+        "status": "incomplete",
+        "coverage_complete": False,
+        "files_inspected": 3,
+        "bytes_inspected": 10,
+        "entries_skipped": 1,
+        "generated_paths_excluded": 1,
+        "skipped_entry_details": [{
+            "path": "src/link\r\nforged",
+            "reason": "symlink",
+        }],
+        "skipped_entry_details_omitted": 0,
+        "findings": [],
+        "errors": [],
+        "limitations": ["Symlinks were skipped."],
+    }
+
+    malware_text = main._render_repository_malware_text(malware)
+    static_text = main._render_repository_security_text(static_review)
+    legacy_malware = {
+        key: value for key, value in malware.items()
+        if key not in {"entries_skipped", "skipped_entry_details", "skipped_entry_details_omitted"}
+    }
+    legacy_static = {
+        key: value for key, value in static_review.items()
+        if key not in {"entries_skipped", "skipped_entry_details", "skipped_entry_details_omitted"}
+    }
+
+    assert "Entries skipped: 1" in malware_text
+    assert "archive\\x1b[31m.zip: encrypted_archive_content" in malware_text
+    assert "\x1b" not in malware_text
+    assert "Entries skipped: 1" in static_text
+    assert "src/link\\r\\nforged: symlink" in static_text
+    assert "\r" not in static_text
+    assert "Entries skipped:" not in main._render_repository_malware_text(legacy_malware)
+    assert "Entries skipped:" not in main._render_repository_security_text(legacy_static)
+
+
 def test_json_output_file(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(main, "build_result", lambda diagnostic=None: {
         "system_info": {}, "package_scan": {"success": True, "error": None, "packages": []},

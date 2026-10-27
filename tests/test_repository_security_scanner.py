@@ -238,6 +238,10 @@ def test_repository_scan_does_not_follow_symlinked_git_hook(tmp_path):
     assert result.coverage_complete is False
     assert not any(finding.rule_id == "active-git-hook" for finding in result.findings)
     assert any("non-regular entries were skipped" in item for item in result.limitations)
+    assert {item["path"] for item in result.skipped_entry_details} == {".git/hooks/pre-commit"}
+    assert result.skipped_entry_details[0]["reason"] == "symlink"
+    assert result.entries_skipped == 1
+    assert result.to_dict()["skipped_entry_details"] == result.skipped_entry_details
 
 
 @pytest.mark.skipif(os.name != "posix", reason="safe directory-descriptor walk requires POSIX")
@@ -276,6 +280,11 @@ def test_repository_walk_marks_symlink_and_oversized_file_incomplete(tmp_path, m
     assert result.coverage_complete is False
     assert result.files_inspected == 0
     assert result.limitations
+    assert result.entries_skipped == 2
+    assert {(item["path"], item["reason"]) for item in result.skipped_entry_details} == {
+        ("linked.txt", "symlink"),
+        ("large.txt", "individual_file_size_limit"),
+    }
     assert not result.findings
 
 
@@ -388,6 +397,12 @@ def test_generated_python_caches_are_excluded_from_static_review_by_default(tmp_
     assert not result.findings
     assert any("excluded from static review" in item for item in result.limitations)
     assert "ClamAV scan is not affected" in result.note
+    assert result.entries_skipped == 2
+    assert {(item["path"], item["reason"]) for item in result.skipped_entry_details} == {
+        ("tests/__pycache__", "generated_cache_excluded"),
+        ("standalone.pyo", "generated_bytecode_excluded"),
+    }
+    assert result.to_dict()["skipped_entry_details"] == result.skipped_entry_details
 
 
 @pytest.mark.skipif(os.name != "posix", reason="safe directory-descriptor walk requires POSIX")

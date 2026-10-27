@@ -139,6 +139,10 @@ def test_scan_repository_does_not_follow_symlinks(tmp_path):
         ("linked-file.json", "symlink_or_junction"),
         ("linked-dir", "symlink_or_junction"),
     }
+    report = result.to_dict()
+    assert report["files_skipped"] == 2
+    assert report["skipped_entry_details"] == result.skipped_entry_details
+    assert report["skipped_entry_details_omitted"] == 0
     assert any("Symbolic links and junctions were skipped" in item
                for item in result.limitations)
 
@@ -167,6 +171,9 @@ def test_scan_repository_limits_return_incomplete_coverage(
     assert result.files_scanned == expected_scanned
     assert result.files_skipped >= 1
     assert result.limitations
+    assert result.files_skipped == (
+        len(result.skipped_entry_details) + result.skipped_entry_details_omitted
+    )
 
 
 def test_scan_repository_time_limit_is_incomplete(monkeypatch, tmp_path):
