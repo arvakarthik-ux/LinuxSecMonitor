@@ -158,6 +158,56 @@ def _line_number(data: bytes, offset: int) -> int:
     return data.count(b"\n", 0, offset) + 1
 
 
+def _is_shell_script(path: str, data: bytes) -> bool:
+    """Identify likely shell scripts without treating other file types as shell."""
+    if Path(path).suffix.casefold() in {".sh", ".bash", ".zsh", ".ksh"}:
+        return True
+
+    first_line = data.splitlines()[0] if data.splitlines() else b""
+    if not first_line.startswith(b"#!"):
+        return False
+
+    # Support direct interpreters (#!/bin/bash) and env-based shebangs
+    # (#!/usr/bin/env bash) without classifying arbitrary text files as shell.
+    return re.search(
+        rb"(?:^|[/\s])(?:ba|z|k|da)?sh(?:\s|$)",
+        first_line.lower(),
+    ) is not None
+
+
+def _mask_shell_comment_only_lines(path: str, data: bytes) -> bytes:
+    """Mask comment-only lines in likely shell scripts, preserving line numbers.
+
+    This deliberately does not attempt to parse inline comments, quotes,
+    here-documents, or shell syntax. It only avoids treating a whole line whose
+    first non-whitespace byte is ``#`` as a command.
+    """
+    if not _is_shell_script(path, data):
+        return data
+
+    masked_lines: list[bytes] = []
+    for line in data.splitlines(keepends=True):
+        has_newline = line.endswith(b"\n")
+        body = line[:-1] if has_newline else line
+        if body.endswith(b"\r"):
+            body_without_cr = body[:-1]
+            cr = b"\r"
+        else:
+            body_without_cr = body
+            cr = b""
+
+        if body_without_cr.lstrip().startswith(b"#"):
+            # Keep byte length and newline positions stable for source offsets.
+            masked = b" " * len(body_without_cr) + cr
+            if has_newline:
+                masked += b"\n"
+            masked_lines.append(masked)
+        else:
+            masked_lines.append(line)
+
+    return b"".join(masked_lines)
+
+
 def _is_generated_python_cache(path: str, is_directory: bool) -> bool:
     """Identify Python bytecode and common Python tool-cache directories."""
     name = path.rsplit("/", 1)[-1].casefold()
@@ -256,13 +306,14 @@ def _analyze_file(
                  "Review the source, pinning, and integrity of dependencies fetched directly from URLs or version-control systems.",
                  _line_number(data, url_match.start()))
 
+    command_data = _mask_shell_comment_only_lines(path, data)
     for rule_id, pattern in _RISKY_COMMAND_PATTERNS:
-        command_match = pattern.search(data)
+        command_match = pattern.search(command_data)
         if command_match:
             _finding(findings, seen, rule_id, "high", path,
                      f"static rule matched: {rule_id}",
                      "This command pattern can download or execute code, alter privileges, or make destructive changes. Review the exact context before running the repository.",
-                     _line_number(data, command_match.start()))
+                     _line_number(command_data, command_match.start()))
 
     filename = Path(path).name.lower()
     if filename == "package.json":
