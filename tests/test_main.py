@@ -2,6 +2,7 @@
 
 import json
 from io import StringIO
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -54,12 +55,110 @@ def test_apt_preinstall_hook_cli_dispatches_to_hook_runner(monkeypatch):
     assert main.main(["--apt-preinstall-hook"], stdout=StringIO()) == 7
 
 
+def test_apt_integration_status_is_read_only_and_json(monkeypatch):
+    seen = {}
+    def status(**paths):
+        seen.update(paths)
+        return {"status": "disabled", "hook_path": "/test/hook", "state_path": "/test/state"}
+    monkeypatch.setattr(main, "integration_status", status)
+    output = StringIO()
+    assert main.main(["--apt-integration", "status", "--json"], stdout=output) == 0
+    assert json.loads(output.getvalue())["status"] == "disabled"
+    assert seen["apt_conf_dir"] == Path("/etc/apt/apt.conf.d")
+
+
+def test_apt_integration_system_changes_require_root(monkeypatch):
+    monkeypatch.setattr(main, "_is_effective_root", lambda: False)
+    output = StringIO()
+    assert main.main(["--apt-integration", "install"], stdout=output) == 1
+
+
+def test_doctor_cli_emits_json_and_returns_status(monkeypatch):
+    monkeypatch.setattr(main, "collect_diagnostics", lambda: {
+        "status": "supported_host",
+        "python_supported": True,
+        "package_inventory_ready": True,
+        "deb_scan_prerequisites_available": True,
+        "apt_hook_prerequisites_available": False,
+        "commands": {"clamscan": {"available": True, "version": "ClamAV fixture"}},
+        "apt_pre_install_hook_count": 2,
+        "apt_pre_invoke_hook_count": 0,
+        "limitations": ["Hook timing not verified."],
+        "read_only": True,
+    })
+    output = StringIO()
+    assert main.main(["--doctor", "--json"], stdout=output) == 0
+    report = json.loads(output.getvalue())
+    assert report["read_only"] is True
+    assert report["apt_pre_install_hook_count"] == 2
+
+
+def test_doctor_cli_returns_one_for_incomplete_prerequisites(monkeypatch):
+    monkeypatch.setattr(main, "collect_diagnostics", lambda: {
+        "status": "supported_host", "python_supported": True,
+        "package_inventory_ready": True,
+        "deb_scan_prerequisites_available": False,
+    })
+    assert main.main(["--doctor"], stdout=StringIO()) == 1
+
+
+def test_safe_run_cli_reports_decision_without_serializing_command_arguments(
+    monkeypatch, tmp_path,
+):
+    report = {
+        "review_status": "review_complete",
+        "coverage_complete": True,
+        "command_status": "not_started",
+        "command_returncode": None,
+        "inventory": {},
+        "malware_assessment": {},
+        "repository_security_assessment": {},
+        "limitations": [],
+    }
+    seen = {}
+    monkeypatch.setattr(main, "review_repository_for_execution", lambda *a, **k: report)
+    monkeypatch.setattr(main, "_render_safe_run_text", lambda result: "review preview")
+
+    def approve(result, repository, command, *, json_output=False):
+        seen["command"] = command
+        seen["json_output"] = json_output
+        result["command_status"] = "completed"
+        result["command_returncode"] = 0
+        return 0
+
+    monkeypatch.setattr(main, "run_reviewed_command", approve)
+    output = StringIO()
+    assert main.main([
+        "--safe-run", str(tmp_path), "--json", "--",
+        "tool", "--token", "secret-value",
+    ], stdout=output) == 0
+    serialized = json.loads(output.getvalue())
+    assert seen["command"] == ["tool", "--token", "secret-value"]
+    assert seen["json_output"] is True
+    assert "secret-value" not in output.getvalue()
+    assert serialized["command_status"] == "completed"
+
+
+def test_safe_run_requires_repository_command_separator_and_command():
+    with pytest.raises(SystemExit) as error:
+        main.main(["--safe-run", "/tmp"], stdout=StringIO())
+    assert error.value.code == 2
+
+
+def test_safe_run_rejects_report_path_inside_repository(tmp_path):
+    assert main.main([
+        "--safe-run", str(tmp_path), "--json", "--output",
+        str(tmp_path / "report.json"), "--", "true",
+    ], stdout=StringIO()) == 2
+
+
 @pytest.mark.parametrize(
     "args",
     [["--apt-preinstall-hook", "--json"], ["--apt-preinstall-hook", "--diagnostics"],
      ["--apt-preinstall-hook", "--scan-deb", "demo.deb"],
      ["--apt-preinstall-hook", "--preinstall-deb", "demo.deb"],
      ["--apt-preinstall-hook", "--scan-repo", "repository"],
+     ["--doctor", "--scan-repo", "repository"],
      ["--include-generated"],
      ["--apt-preinstall-hook", "--output", "report.json"]],
 )
@@ -69,7 +168,20 @@ def test_cli_rejects_conflicting_modes_or_unscoped_generated_option(args):
     assert error.value.code == 2
 
 
-def test_scan_deb_cli_keeps_malware_report_separate_and_serializes_json(monkeypatch):
+def _mock_kali_system_info(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "collect_system_info",
+        lambda: SystemInfo(
+            operating_system="Linux", distribution="Kali GNU/Linux",
+            distribution_version="2026.3", kernel_version="test-kernel",
+            architecture="x86_64", python_version="3.14.0", hostname="fixture",
+        ),
+    )
+
+
+def test_scan_deb_cli_includes_unsupported_vulnerability_assessment(monkeypatch):
+    _mock_kali_system_info(monkeypatch)
     monkeypatch.setattr(
         main,
         "scan_deb",
@@ -92,10 +204,141 @@ def test_scan_deb_cli_keeps_malware_report_separate_and_serializes_json(monkeypa
     assert report["detections"][0] == {
         "name": "Test.Signature", "path": "payload/usr/bin/demo",
     }
-    assert "vulnerability_assessment" not in report
+    assert report["vulnerability_assessment"]["assessment_status"] == "unsupported"
+
+
+def test_scan_deb_assesses_source_identity_and_json_report(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "collect_system_info",
+        lambda: SystemInfo(
+            operating_system="Linux", distribution="Debian GNU/Linux 12 (bookworm)",
+            distribution_version="12", kernel_version="test-kernel",
+            architecture="x86_64", python_version="3.14.0", hostname="fixture",
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "scan_deb",
+        lambda path: MalwareAssessment(
+            status="no_detection", scanner="ClamAV clamscan",
+            package={
+                "name": "demo-bin", "version": "1.2-3", "architecture": "amd64",
+                "source_name": "demo-source", "source_version": "1.2-2",
+            }, coverage_complete=True,
+        ),
+    )
+    seen = {}
+    vulnerability = VulnerabilityAssessmentReport(
+        "no_known_match", "Debian GNU/Linux 12 (bookworm)", "12", "test-provider",
+        None, [PackageAssessment("demo-bin", "1.2-3", "no_known_match", "No matching record.", [])],
+    )
+
+    def assess(packages, distribution, release):
+        seen["packages"] = packages
+        seen["distribution"] = distribution
+        seen["release"] = release
+        return vulnerability
+
+    monkeypatch.setattr(main, "assess_packages", assess)
+    output = StringIO()
+
+    exit_code = main.main(["--scan-deb", "demo.deb", "--json"], stdout=output)
+
+    report = json.loads(output.getvalue())
+    assert exit_code == 0
+    assert seen["packages"] == [Package("demo-bin", "1.2-3", "demo-source", "1.2-2")]
+    assert seen["distribution"] == "Debian GNU/Linux 12 (bookworm)"
+    assert seen["release"] == "12"
+    assert report["vulnerability_assessment"]["assessment_status"] == "no_known_match"
+
+
+def test_scan_deb_does_not_substitute_binary_version_for_missing_debian_source(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "collect_system_info",
+        lambda: SystemInfo(
+            operating_system="Linux", distribution="Debian GNU/Linux 12 (bookworm)",
+            distribution_version="12", kernel_version="test-kernel",
+            architecture="x86_64", python_version="3.14.0", hostname="fixture",
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "scan_deb",
+        lambda path: MalwareAssessment(
+            status="no_detection", scanner="test scanner",
+            package={"name": "demo-bin", "version": "1.2-3"},
+            coverage_complete=True,
+        ),
+    )
+    output = StringIO()
+
+    exit_code = main.main(["--scan-deb", "demo.deb", "--json"], stdout=output)
+
+    report = json.loads(output.getvalue())
+    assert exit_code == 1
+    assert report["vulnerability_assessment"]["assessment_status"] == "requires_review"
+    assert report["vulnerability_assessment"]["packages"][0]["assessment_status"] == "requires_review"
+
+
+def test_scan_deb_returns_failure_when_vulnerability_assessment_is_unsupported(monkeypatch):
+    _mock_kali_system_info(monkeypatch)
+    monkeypatch.setattr(
+        main,
+        "scan_deb",
+        lambda path: MalwareAssessment(
+            status="no_detection", scanner="test scanner",
+            package={"name": "demo", "version": "1.0"},
+            coverage_complete=True,
+        ),
+    )
+    # Kali's assessment is unsupported, so a clean malware scan alone is not
+    # represented by a successful combined scan exit status.
+    output = StringIO()
+
+    exit_code = main.main(["--scan-deb", "demo.deb", "--json"], stdout=output)
+
+    assert exit_code == 1
+    assert json.loads(output.getvalue())["vulnerability_assessment"]["assessment_status"] == "unsupported"
+
+
+def test_scan_deb_converts_unexpected_vulnerability_failure_to_error(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "collect_system_info",
+        lambda: SystemInfo(
+            operating_system="Linux", distribution="Debian GNU/Linux 12 (bookworm)",
+            distribution_version="12", kernel_version="test-kernel",
+            architecture="x86_64", python_version="3.14.0", hostname="fixture",
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "scan_deb",
+        lambda path: MalwareAssessment(
+            status="no_detection", scanner="test scanner",
+            package={"name": "demo", "version": "1.0"},
+            coverage_complete=True,
+        ),
+    )
+    monkeypatch.setattr(
+        main, "assess_packages",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("private detail")),
+    )
+    output = StringIO()
+
+    exit_code = main.main(["--scan-deb", "demo.deb", "--json"], stdout=output)
+
+    report = json.loads(output.getvalue())
+    assert exit_code == 1
+    assert report["vulnerability_assessment"]["assessment_status"] == "error"
+    assert "RuntimeError" in report["vulnerability_assessment"]["error"]
+    assert "private detail" not in output.getvalue()
 
 
 def test_scan_deb_text_report_explains_status_and_safety_limit(monkeypatch):
+    _mock_kali_system_info(monkeypatch)
     monkeypatch.setattr(
         main,
         "scan_deb",
@@ -118,9 +361,12 @@ def test_scan_deb_text_report_explains_status_and_safety_limit(monkeypatch):
     assert "Scanner: ClamAV clamscan" in text
     assert "Coverage limitation: A symbolic link was skipped." in text
     assert "No detection does not guarantee" in text
+    assert "Vulnerability assessment:" in text
+    assert "Status: unsupported" in text
 
 
 def _prepare_preinstall(monkeypatch, tmp_path, *, status="no_detection", coverage=True):
+    _mock_kali_system_info(monkeypatch)
     package_path = tmp_path / "downloaded package.deb"
     package_path.write_bytes(b"fixture package bytes")
     monkeypatch.setattr(main.tempfile, "tempdir", str(tmp_path), raising=False)
@@ -184,9 +430,12 @@ def test_preinstall_deb_requires_explicit_confirmation_and_keeps_json_stdout_cle
     report = json.loads(stdout.getvalue())
     assert exit_code == 0
     assert report["malware_assessment"]["status"] == "no_detection"
+    assert report["malware_assessment"]["vulnerability_assessment"]["assessment_status"] == "unsupported"
     assert report["installation"]["status"] == "installed"
     stderr = capsys.readouterr().err
     assert "does not guarantee safety" in stderr
+    assert "Vulnerability assessment:" in stderr
+    assert "Status: unsupported" in stderr
     assert "only the requested .deb snapshot was scanned" in stderr
     assert "dependency packages that were not scanned" in stderr
     assert len(commands) == 5

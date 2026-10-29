@@ -35,8 +35,8 @@ class FakeResponse:
     def __exit__(self, *args):
         return None
 
-    def read(self):
-        return self.payload
+    def read(self, size=-1):
+        return self.payload if size < 0 else self.payload[:size]
 
 
 @pytest.fixture(autouse=True)
@@ -1066,6 +1066,37 @@ def test_debian_provider_reports_network_and_malformed_record_errors():
         opener=lambda *args, **kwargs: next(responses)
     ).fetch_records([package()], "Debian:12")
     assert "malformed package identity" in malformed_identity.error
+
+
+def test_debian_provider_rejects_oversized_query_response():
+    class OversizedResponse(FakeResponse):
+        def read(self, size=-1):
+            return b"x" * size if size >= 0 else b"x"
+
+    result = OSVDebianProvider(
+        opener=lambda *args, **kwargs: OversizedResponse({}),
+    ).fetch_records([package()], "Debian:12")
+
+    assert result.error is not None
+    assert "response exceeded" in result.error
+
+
+def test_debian_provider_rejects_oversized_hydrated_advisory(tmp_path):
+    class OversizedResponse(FakeResponse):
+        def read(self, size=-1):
+            return b"x" * size if size >= 0 else b"x"
+
+    responses = iter([
+        FakeResponse({"results": [{"vulns": [{"id": "DEBIAN-CVE-2024-6387"}]}]}),
+        OversizedResponse({}),
+    ])
+    result = OSVDebianProvider(
+        opener=lambda *args, **kwargs: next(responses),
+        cache_dir=tmp_path / "cache",
+    ).fetch_records([package()], "Debian:12")
+
+    assert result.error is not None
+    assert "response exceeded" in result.error
 
 
 def test_debian_version_comparator_matches_dpkg_when_available():

@@ -10,10 +10,12 @@ LinuxSecMonitor is a command-line tool for collecting Linux host details, invent
 - Adds available OSV summaries, details, references, and Debian urgency as advisory context. Urgency is kept separate from severity.
 - Writes human-readable text or structured JSON reports.
 - Provides optional progress and timing diagnostics on standard error.
+- Provides read-only `--doctor` checks for supported-host status, tool availability, and effective APT hook counts without displaying hook contents.
 - Caches validated full Debian OSV advisory records on disk for 24 hours by default.
 - Inventories local repository files and can separately scan a bounded snapshot with ClamAV; repository code is never executed.
 - Runs bounded static heuristics over repository files to produce review leads for selected secrets, dependency sources, lifecycle scripts, and risky command patterns. These heuristics are not a malware verdict or a complete code audit.
-- Can scan a local `.deb` without installing it, and has a separate pre-install workflow that blocks installation unless a complete scan returns `no_detection` and the user explicitly confirms.
+- Offers `--safe-run` to review a repository and require exact interactive approval before one explicit command; this is a user-mediated wrapper, not automatic execution interception or a sandbox.
+- Can scan a local `.deb` without installing it, with separate manual pre-install and experimental APT-hook workflows. The manual workflow requires complete no-detection coverage; the APT hook requires explicit terminal approval for every transaction and never allows incomplete scans.
 
 ## How a scan works
 
@@ -41,9 +43,43 @@ change the repository during a scan.
 
 The assessment runs only after package inventory succeeds. Eligible Debian assessments query OSV on each run; package-to-advisory query results are not cached. Full advisory records are read from the persistent cache when valid and unexpired; otherwise, they are retrieved from OSV. Package inventory and assessment are read-only.
 
+OSV query responses are limited to 16 MiB per batch and full advisory responses
+to 8 MiB each. JSON nesting deeper than 128 levels is rejected. Oversized or
+excessively nested responses produce an assessment error; they are not treated
+as an empty advisory result.
+
 ## Requirements and installation
 
-Python 3.10 or newer is recommended. Full package inventory is intended for Debian, Ubuntu, and Kali Linux systems with `dpkg-query` available. On Windows, system information and the mocked automated tests can run, but package inventory reports that the operating system is unsupported.
+Python 3.11 or newer is required. Python 3.10 reached end of life on 2026-10-01 and no longer receives security fixes ([final Python 3.10 security release](https://www.python.org/downloads/release/python-31022/)). Debian 12 and newer supported Ubuntu/Kali releases provide suitable Python versions; Ubuntu 22.04's system Python 3.10 does not meet this requirement unless a separately maintained Python 3.11+ interpreter is available. Full package inventory is intended for Debian, Ubuntu, and Kali Linux systems with `dpkg-query` available. On Windows, system information and the mocked automated tests can run, but package inventory reports that the operating system is unsupported.
+
+Install the CLI into a Python virtual environment without changing system APT
+configuration:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install .
+.venv/bin/linuxsecmonitor --help
+```
+
+The installed command exposes the CLI. System APT integration remains opt-in;
+the installation command below explicitly changes `/etc/apt/apt.conf.d` and
+creates an ownership receipt under `/var/lib/linuxsecmonitor`.
+Use `python -m pip install '.[test]'` in the virtual environment to add pytest.
+
+Use `linuxsecmonitor --doctor` inside the environment to check read-only
+platform and tool prerequisites. To stop using the command in the current
+shell, deactivate the virtual environment. To uninstall only LinuxSecMonitor
+from that environment, run:
+
+```bash
+.venv/bin/python -m pip uninstall linuxsecmonitor
+```
+
+This removes the Python distribution and its console entry point; it leaves
+the virtual environment and other packages intact. To restore the command,
+run `.venv/bin/python -m pip install .` again. Since this installation does not
+enable a system hook or service, uninstalling it requires no APT configuration
+recovery.
 
 Repository malware assessment additionally requires the `clamscan` executable
 and an available ClamAV signature database. Safe repository scanning requires
@@ -94,7 +130,7 @@ python main.py --json --output scan.json
 python main.py --diagnostics --json --output scan.json
 ```
 
-The same CLI forms work in PowerShell when `python` resolves to the intended interpreter, or with the Windows launcher, for example `py main.py --json`. The implemented options are `--json`, `-o`/`--output`, and `--diagnostics`. `--output` requires `--json`. Diagnostics go to standard error so JSON written to standard output remains parseable. A completed package scan returns exit code `0`; a package-inventory failure returns `1`; a JSON output-file write failure returns `2`.
+The same CLI forms work in PowerShell when `python` resolves to the intended interpreter, or with the Windows launcher, for example `py main.py --json`. The implemented report options include `--json`, `-o`/`--output`, and `--diagnostics`. `--output` requires `--json`. Diagnostics go to standard error so JSON written to standard output remains parseable. A completed package scan returns exit code `0`; a package-inventory failure returns `1`; a JSON output-file write failure returns `2`.
 
 For an opt-in repository inventory and ClamAV scan:
 
@@ -188,10 +224,42 @@ python -m json.tool ../repository-review.json
 ```
 
 Read all three result sections and investigate findings, errors, and
-limitations. The scanner does not execute the repository, and it cannot
-prevent a later command from doing so. It does not wrap Git, pip, npm, Cargo,
-Go, Make, or a shell; the user must choose whether to proceed after reviewing
-the report.
+limitations. The standalone `--scan-repo` mode does not execute the repository
+and cannot prevent a later command from doing so. It does not wrap Git, pip,
+npm, Cargo, Go, Make, or a shell; the user must choose whether to proceed after
+reviewing the report.
+
+#### Explicit command review wrapper
+
+`--safe-run` scans a repository before launching one command that the user
+supplies explicitly:
+
+```bash
+python main.py --safe-run /path/to/repository -- python -m pip install .
+python main.py --safe-run /path/to/repository --json --output ../review.json -- make build
+```
+
+The wrapper runs repository inventory, ClamAV assessment, and static review.
+It blocks if any stage is incomplete or unavailable, and blocks a ClamAV
+detection. If coverage is complete and static heuristics report review leads,
+the user can inspect them and type exactly `RUN` to continue. It also requires
+that confirmation when no findings were reported. Without an interactive
+terminal, the command is not started. JSON mode sends the human preview to
+standard error and writes the final review and command outcome as JSON; command
+arguments are deliberately omitted from the report. In JSON mode, child stdout
+and stderr are routed to standard error so standard output remains valid JSON.
+In text mode, child output uses the current terminal. The command's exit status
+is returned (signals map to 128 plus the signal number); cancellation returns
+3 and incomplete review or launch failure returns 1. Keep output reports
+outside the repository being scanned.
+
+This is an explicit user-mediated wrapper, not a sandbox or an enforcement
+boundary. It runs the command with an argument vector and without a shell, but
+the selected program can itself start shells or child processes. Direct Git,
+shell, build, and package-manager commands still bypass the wrapper. A
+concurrent writer can also change repository contents after review. Do not
+describe `--safe-run` as automatic protection for normal APT or repository
+operations.
 
 ### Scan and optionally install a local Debian package
 
@@ -205,7 +273,14 @@ python main.py --preinstall-deb /path/to/downloaded-package.deb --json --output 
 ```
 
 This mode requires Linux, `dpkg-deb`, `clamscan`, and a usable ClamAV signature
-database for a completed scan. Installation additionally requires `apt-get`
+database for a completed scan. A ClamAV warning that its virus database is
+older than seven days makes coverage incomplete; LinuxSecMonitor does not
+update signatures. It also reads the package's `Source` metadata and queries
+the configured OSV provider for the current host distribution where a provider
+is supported. Kali vulnerability assessment is explicitly unsupported;
+Debian and Ubuntu use their respective release-specific matching logic. An
+OSV error or unsupported result is included in the report and does not mean
+that no vulnerability exists. Installation additionally requires `apt-get`
 and the privileges needed by APT. Run LinuxSecMonitor as a normal user so the
 package inspection remains unprivileged. After a complete scan and exact user
 approval, it requests administrator authorization for installation only. It
@@ -243,13 +318,39 @@ set safely, installation is not attempted. A
 `detected` result blocks installation without offering a bypass. `incomplete`,
 `error`, and `unavailable` results also block installation. A no-detection
 result means only that ClamAV reported no known detection in the inspected
-contents; it does not guarantee safety.
+contents; it does not guarantee safety. The separate vulnerability assessment
+is advisory in this manual workflow: its findings, `requires_review`,
+`unsupported`, or `error` state are shown before the same explicit `INSTALL`
+decision. The command does not claim that a package without a matching OSV
+record is safe.
 
-When the APT v3 hook sees a maintainer-script review lead, it also requires
-exact `INSTALL` approval even if ClamAV found no signature. The report keeps
-that heuristic lead separate from ClamAV's `status`; declining or lacking a
-terminal blocks the transaction. A complete scan with no signature and no
-script review lead retains the existing automatic-continuation behavior.
+### Inspect a downloaded `.deb` without installing it
+
+Use `--scan-deb` for a report without the optional installation step:
+
+```bash
+python main.py --scan-deb ./downloaded-package.deb
+python main.py --scan-deb ./downloaded-package.deb --json --output package-report.json
+```
+
+The report contains separate malware and vulnerability assessment results.
+The vulnerability query uses the current host's distribution and release, and
+the package's binary and source identity when available. If source identity is
+missing or malformed, Debian matching requires review rather than substituting
+the binary version. Kali is explicitly unsupported for automated OSV matching.
+OSV network errors and incomplete or unsupported results remain visible and
+produce a nonzero exit status. Exit status zero requires complete malware
+coverage with no detection and a conclusive vulnerability result (`no_known_match`,
+`fixed`, `not_affected`, or `mixed`); `no_known_match` is not a safety claim.
+This operation does not install the archive or execute package scripts.
+
+The APT v3 hook always requires exact `INSTALL` approval after a complete
+transaction review, including when no detection or script review lead exists.
+If a complete scan reports a signature detection or a maintainer-script review
+lead, the report displays it before the same approval prompt. The report keeps
+heuristic leads separate from ClamAV's `status`; declining or lacking a
+terminal blocks the transaction. Incomplete scans, errors, and unavailable
+scanners cannot be approved through this hook.
 
 This workflow scans only the explicitly supplied `.deb` snapshot. APT may
 resolve and install additional dependencies from configured sources; those
@@ -262,8 +363,9 @@ archive, not a gate for every package in an APT transaction.
 
 With `--json`, the final JSON report is written to stdout or to `--output`.
 The pre-install scan summary, confirmation prompt, and APT output go to stderr,
-so they do not contaminate JSON stdout. The JSON contains separate
-`malware_assessment` and `installation` objects. The output path cannot alias
+so they do not contaminate JSON stdout. The JSON contains a
+`malware_assessment` object (including nested `vulnerability_assessment`) and
+an `installation` object. The output path cannot alias
 the `.deb` being scanned. The pre-install mode cannot be combined with
 `--scan-deb` or `--scan-repo`.
 
@@ -504,10 +606,155 @@ EICAR fixture, the cancellation test is inconclusive and must not be replaced
 with an assumption that it was blocked. Scanner error and incomplete-result
 paths remain covered by mocked tests, not this real APT procedure.
 
+#### Maintainer-script marker cancellation check
+
+The EICAR case checks signature detection. This separate test checks whether
+declining a maintainer-script review lead prevents that script from running.
+Use only the same disposable Debian VM/snapshot and temporary hook config.
+If the synthetic postinst runs, it creates a marker and appends a harmless
+`true` cron entry to a unique hidden filename. Run this only in the disposable
+VM; if either file appears, restore the snapshot immediately.
+
+    marker_package=linuxsecmonitor-apt-hook-marker
+    marker_file="$tmp_dir/maintainer-script-ran"
+    disabled_cron_file=/etc/cron.d/.linuxsecmonitor-apt-cancel-disabled
+    test ! -e "$marker_file"
+    test ! -e "$disabled_cron_file"
+    if dpkg-query -s "$marker_package" >/dev/null 2>&1; then
+      echo 'Stop: marker-test package name is already installed.' >&2
+      exit 1
+    fi
+    mkdir -p "$tmp_dir/marker/DEBIAN" \
+      "$tmp_dir/marker/usr/share/doc/$marker_package"
+    cat > "$tmp_dir/marker/DEBIAN/control" <<'EOF'
+    Package: linuxsecmonitor-apt-hook-marker
+    Version: 0.0.1
+    Architecture: all
+    Description: Harmless maintainer-script cancellation fixture
+    EOF
+    cat > "$tmp_dir/marker/DEBIAN/postinst" <<EOF
+    #!/bin/sh
+    printf '%s\n' '*/10 * * * * root true' >> /etc/cron.d/.linuxsecmonitor-apt-cancel-disabled
+    printf '%s\n' 'ran' > '$marker_file'
+    EOF
+    chmod 0755 "$tmp_dir/marker/DEBIAN/postinst"
+    printf '%s\n' 'Harmless cancellation marker fixture.' > \
+      "$tmp_dir/marker/usr/share/doc/$marker_package/README"
+    dpkg-deb --build "$tmp_dir/marker" \
+      "$tmp_dir/linuxsecmonitor-apt-hook-marker_0.0.1_all.deb"
+    sudo install -o root -g root -m 0644 \
+      "$tmp_dir/linuxsecmonitor-apt-hook-marker_0.0.1_all.deb" \
+      "$hook_root/linuxsecmonitor-apt-hook-marker_0.0.1_all.deb"
+
+Before invoking APT, require the scanner to report complete no-detection
+coverage and the startup-persistence-write review lead. This verifies that the
+hook should prompt without depending on ClamAV recognizing a signature:
+
+    set +e
+    python3 -B "$hook_root/main.py" --scan-deb \
+      "$hook_root/linuxsecmonitor-apt-hook-marker_0.0.1_all.deb" \
+      --json --output "$tmp_dir/marker-scan.json"
+    marker_scan_exit=$?
+    set -e
+    python3 - "$tmp_dir/marker-scan.json" <<'PY'
+    import json, sys
+    report = json.load(open(sys.argv[1], encoding="utf-8"))
+    assert report["status"] == "no_detection", report
+    assert report["coverage_complete"] is True, report
+    assert any(item["rule_id"] == "startup-persistence-write"
+               for item in report["maintainer_script_findings"]), report
+    PY
+    test "$marker_scan_exit" -eq 0
+    command -v strace >/dev/null || {
+      echo 'Stop: strace is required; do not install it for this test.' >&2
+      exit 1
+    }
+
+Simulate and inspect the plan. At APT's ordinary confirmation, answer yes only
+after confirming it names this single local package. At LinuxSecMonitor's
+prompt, enter CANCEL. The hook must accept v3, show the heuristic lead, and
+block the transaction:
+
+    sudo apt-get -s -c "$hook_root/apt-hook-order.conf" --no-download --no-remove install \
+      "$hook_root/linuxsecmonitor-apt-hook-marker_0.0.1_all.deb"
+    set +e
+    set -o pipefail
+    sudo strace -f -qq -e trace=execve -o "$tmp_dir/marker-execve.log" \
+      /usr/bin/apt-get -c "$hook_root/apt-hook-order.conf" --no-download --no-remove \
+      install "$hook_root/linuxsecmonitor-apt-hook-marker_0.0.1_all.deb" \
+      2>&1 | tee "$tmp_dir/marker-apt.log"
+    marker_apt_exit=$?
+    set -e
+    test "$marker_apt_exit" -ne 0
+    grep -F 'APT Pre-Install-Pkgs protocol version 3 accepted.' "$tmp_dir/marker-apt.log"
+    grep -F 'startup-persistence-write' "$tmp_dir/marker-apt.log"
+    grep -F 'APT transaction blocked:' "$tmp_dir/marker-apt.log"
+    test ! -e "$marker_file"
+    test ! -e "$disabled_cron_file"
+    marker_package_state="$(dpkg-query -W -f='${db:Status-Abbrev}' linuxsecmonitor-apt-hook-marker 2>/dev/null || true)"
+    test -z "$marker_package_state"
+    if sudo grep -F 'dpkg-preconfigure' "$tmp_dir/marker-execve.log"; then
+      echo 'Failure: dpkg-preconfigure ran; restore the VM snapshot.' >&2
+      exit 1
+    fi
+    if sudo grep -E 'execve\("[^"]*/dpkg", .*"(--unpack|--configure|--install|--remove|--purge)"' \
+      "$tmp_dir/marker-execve.log"; then
+      echo 'Failure: dpkg package processing ran; restore the VM snapshot.' >&2
+      exit 1
+    fi
+
+Count this as evidence only if every check passes: APT exits nonzero; the v3,
+review-lead, and blocked messages appear; no preconfiguration or dpkg package
+processing exec is recorded; the package has no dpkg status entry; and both
+marker paths remain absent. If a marker exists or trace/output is ambiguous,
+restore the snapshot immediately. This evidence applies only to the exact APT
+binary, temporary config, and hook order used in that VM.
+
+#### Separate maintainer-script approval check
+
+Run this only after restoring a clean VM snapshot. In a new interactive
+session, repeat the setup above through building and staging the synthetic
+marker package. It intentionally executes the harmless test
+`postinst` after explicit approval, so it writes the marker and the disabled
+cron fixture. Confirm the simulator lists only this package. At APT's ordinary
+confirmation, review the plan and answer yes; at LinuxSecMonitor's review-lead
+prompt, type exactly `INSTALL`:
+
+    sudo apt-get -s -c "$hook_root/apt-hook-order.conf" --no-download --no-remove install \
+      "$hook_root/linuxsecmonitor-apt-hook-marker_0.0.1_all.deb"
+    set +e
+    set -o pipefail
+    sudo strace -f -qq -e trace=execve -o "$tmp_dir/marker-approval-execve.log" \
+      /usr/bin/apt-get -c "$hook_root/apt-hook-order.conf" --no-download --no-remove \
+      install "$hook_root/linuxsecmonitor-apt-hook-marker_0.0.1_all.deb" \
+      2>&1 | tee "$tmp_dir/marker-approval-apt.log"
+    approval_apt_exit=$?
+    set -e
+    test "$approval_apt_exit" -eq 0
+    grep -F 'APT Pre-Install-Pkgs protocol version 3 accepted.' "$tmp_dir/marker-approval-apt.log"
+    grep -F 'startup-persistence-write' "$tmp_dir/marker-approval-apt.log"
+    grep -F 'Explicit INSTALL approval received; APT may continue.' "$tmp_dir/marker-approval-apt.log"
+    test "$(cat "$marker_file")" = ran
+    sudo dpkg-query -s "$marker_package" | grep -F 'Status: install ok installed'
+    sudo grep -F "/var/lib/dpkg/info/$marker_package.postinst" \
+      "$tmp_dir/marker-approval-execve.log"
+    test -e "$disabled_cron_file"
+
+Count this only if APT exits zero, the exact approval message appears, the
+marker content is `ran`, the package status is `install ok installed`, and the
+trace shows its postinst was executed. This proves approval continued into
+configuration for this exact VM setup; it does not establish safety of any
+other package. Revert the VM snapshot immediately afterward to remove the
+installed fixture and its cron file. Do not retain the VM state or treat this
+as a normal-host installation procedure.
+
 After testing, the safest rollback is to revert the disposable VM snapshot.
 That restores the package database and removes the temporary hook code and
-staged fixtures together. If retaining the VM, first simulate package removal
-and inspect the full plan:
+staged fixtures together. The manual cleanup below applies only if the smoke
+package was installed and the marker approval check was not run. If the marker
+approval check was run, restore the VM snapshot as instructed above; the
+smoke-only cleanup below is not sufficient. If retaining a VM after only the
+smoke test, first simulate package removal and inspect the full plan:
 
 ```bash
 sudo apt-get -s remove linuxsecmonitor-apt-hook-smoke
@@ -534,6 +781,7 @@ expected_entries="$(printf '%s\n' \
   'f main.py' \
   'f linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb' \
   'f linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb' \
+  'f linuxsecmonitor-apt-hook-marker_0.0.1_all.deb' \
   'f scanner/__init__.py' \
   'f scanner/apt_hook.py' \
   'f scanner/malware_scanner.py' \
@@ -561,7 +809,8 @@ if ! sudo rm -- "$hook_root/main.py" \
   "$hook_root/scanner/system_info.py" \
   "$hook_root/scanner/vulnerability_assessment.py" \
   "$hook_root/linuxsecmonitor-apt-hook-smoke_0.0.1_all.deb" \
-  "$hook_root/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb"; then
+  "$hook_root/linuxsecmonitor-apt-hook-eicar_0.0.1_all.deb" \
+  "$hook_root/linuxsecmonitor-apt-hook-marker_0.0.1_all.deb"; then
   echo 'Cleanup failed while removing known test files; restore the VM snapshot.' >&2
   exit 1
 fi
@@ -591,9 +840,13 @@ command above performs a real installation if APT and the hook both allow it.
 The hook reads the complete v3 protocol from standard input, validates the
 configuration and package-action records, and scans every scheduled `.deb`
 archive with the existing package scanner. `**CONFIGURE**` and `**REMOVE**`
-records do not refer to package archives and are not scanned. For each archive,
-it compares package name, target version, architecture, and Multi-Arch identity
-with APT's corresponding transaction record. Archive paths
+records do not refer to package archives. A configure action is accepted only
+when a matching package name, target version, architecture, and Multi-Arch
+archive action is present in the same transaction; otherwise the transaction
+is blocked. Removal actions are blocked because their maintainer scripts cannot
+be reviewed from the transaction archives. For each archive, the hook compares
+package name, target version, architecture, and Multi-Arch identity with APT's
+corresponding transaction record. Archive paths
 must be absolute, regular, non-symlink files within configured size limits.
 When the hook runs as root, it validates archive paths and ownership first,
 then permanently drops its real, effective, and saved user/group IDs to APT's
@@ -609,18 +862,30 @@ requires root-protected paths when running as root. It cannot hold an open
 handle for APT's later installation step, so a concurrent privileged process
 could still replace an archive after the final check and before APT opens it.
 
-APT proceeds automatically only when every archive has a complete
-`no_detection` result and no maintainer-script review leads. `no_detection`
-means ClamAV found no known signature; it does not prove that a package is
-safe. A complete ClamAV scan can still report heuristic maintainer-script
+APT may continue only after every archive has a complete assessment, every
+configure action has a matching scanned archive, no removal action is present,
+and the user types exact `INSTALL` at the terminal. `no_detection` means
+ClamAV found no known signature; it does not prove that a package is safe. A
+complete ClamAV scan can still report heuristic maintainer-script
 review leads while retaining ClamAV status `no_detection`; those leads are not
-confirmed malware. If any complete scan reports a malware detection or a
-maintainer-script review lead, the hook displays the evidence and asks on
-`/dev/tty` for the exact token `INSTALL`. Declining, any other input,
-interruption, or no terminal aborts the transaction. Approval never bypasses
+confirmed malware. After every complete review, the hook displays the report
+and asks on `/dev/tty` for the exact token `INSTALL`, including when there are
+no findings. Declining, any other input, interruption, or no terminal aborts
+the transaction. Approval never bypasses
 incomplete scans, errors, unavailable scanners, invalid transactions, or
 package-identity mismatches. The hook does not execute package maintainer
 scripts; APT/dpkg may run them later if installation is approved.
+
+The hook also runs one transaction-level OSV assessment using the package
+source identities from the inspected archives. On supported Debian/Ubuntu
+systems, assessment errors or `requires_review` block the transaction. An
+unsupported distribution is reported explicitly; exact `INSTALL` approval can
+still continue after the malware checks pass. A vulnerability finding is
+reported for the user's decision and does not itself prevent an explicit
+approval. OSV coverage is limited to the configured data sources and package
+mappings; this is not a comprehensive vulnerability guarantee. Real APT
+cancellation and approval remain unverified until the documented disposable
+Debian transaction tests pass.
 
 This is an experimental hook integration, not a permanent APT policy and not
 an automatic APT configuration change. APT's v3 stream has no transaction
@@ -630,11 +895,91 @@ and behavior in a disposable Debian VM before considering any broader use.
 
 The documented command supplies temporary `-o` settings for one APT process;
 it does not install or alter a permanent hook configuration. There is therefore
-no persistent LinuxSecMonitor hook entry to remove after this procedure. If
-you separately choose to create a permanent configuration file, back up that
-specific file first and remove only the exact LinuxSecMonitor entry/file during
-recovery; do not delete unrelated APT hook configuration. To stop a blocked
-transaction, let the hook fail closed and inspect its report and APT error.
+no persistent LinuxSecMonitor hook entry created by that test procedure.
+
+### APT hook lifecycle
+
+After installing LinuxSecMonitor into a system Python environment and checking
+`linuxsecmonitor --doctor`, inspect the integration state:
+
+```bash
+linuxsecmonitor --apt-integration status
+```
+
+The following commands change persistent system configuration and require
+root. `install` creates only `/etc/apt/apt.conf.d/00linuxsecmonitor` and a
+receipt at `/var/lib/linuxsecmonitor/apt-integration.json`. It refuses to
+overwrite an existing hook or receipt. Review the exact paths and retain a
+system backup before running it. The interpreter and imported hook modules
+must be root-owned and not writable by group or other users; a checkout or
+virtual environment in a user's home directory is rejected. The candidate
+configuration is checked with APT's own `apt-config` parser before activation.
+To create a root-owned runtime, build a wheel as an ordinary user, then install
+that wheel into an isolated system-owned virtual environment (ensure the
+distribution's `python3-venv` prerequisite is available):
+
+```bash
+python3 -m pip wheel --no-deps --no-build-isolation --wheel-dir ./wheelhouse .
+sudo python3 -m venv /opt/linuxsecmonitor
+sudo /opt/linuxsecmonitor/bin/pip install --no-deps ./wheelhouse/linuxsecmonitor-0.1.0-py3-none-any.whl
+sudo /opt/linuxsecmonitor/bin/linuxsecmonitor --doctor
+sudo /opt/linuxsecmonitor/bin/linuxsecmonitor --apt-integration install
+```
+
+These commands create persistent files under `/opt`, `/etc/apt`, and
+`/var/lib`; review them before running. The prebuilt wheel should be verified
+and stored where only administrators can replace it before the privileged pip
+install. A virtual environment used for ordinary development should not be
+used as the privileged hook runtime:
+
+```bash
+sudo /opt/linuxsecmonitor/bin/linuxsecmonitor --apt-integration status
+sudo /opt/linuxsecmonitor/bin/linuxsecmonitor --apt-integration disable
+sudo /opt/linuxsecmonitor/bin/linuxsecmonitor --apt-integration enable
+sudo /opt/linuxsecmonitor/bin/linuxsecmonitor --apt-integration uninstall
+```
+
+`disable` removes the unchanged managed hook but retains its receipt so
+`enable` can reconstruct it. `uninstall` removes only the unchanged managed
+hook and that receipt; it does not remove ClamAV, Python packages, reports, or
+other APT configuration. If the hook was edited, replaced, or became a
+symlink, removal stops and preserves it for manual review. If installation is
+interrupted, its own partial receipt/hook writes are rolled back when possible;
+inspect `--apt-integration status` and the two paths before recovery. Status
+`conflict` requires manual investigation. These commands have unit coverage
+against temporary directory roots; persistent system installation and the APT
+transaction behavior have not been verified in the current environment.
+
+To stop a blocked transaction, let the hook fail closed and inspect its report
+and APT error. Do not remove unrelated APT hook configuration during recovery.
+
+### Threat model and coverage limits
+
+The APT hook is intended to provide a user-visible review point for supported
+APT `Pre-Install-Pkgs` v3 archive transactions, with failure on incomplete
+inspection and exact interactive approval before APT proceeds. The managed
+`00linuxsecmonitor` filename puts it first among ordinary `apt.conf.d` drop-ins;
+Debian documents that these files load in alphanumeric order and that
+`Pre-Install-Pkgs` commands run in order before dpkg, aborting when one fails.
+This ordering is necessary because `dpkg-preconfigure --apt` may execute
+package `config` scripts. A `Pre-Install-Pkgs` hook supplied earlier through
+the `APT_CONFIG` environment variable, an explicit `-c` file, or command-line
+configuration can still run first or replace the list. Direct `dpkg`, other
+package managers, APT invocations that bypass or override the hook, and
+commands run before this hook are outside coverage. Removing or editing the
+hook, replacing its executable or interpreter, or changing root-owned APT
+configuration defeats it. A malicious privileged user can bypass or disable
+the tool.
+
+Repository scanning is opt-in and advisory. `--safe-run` gates only the one
+command explicitly passed through that wrapper. It does not intercept cloned
+repositories or act as a sandbox; direct shells, editors, build tools,
+dependency managers, subprocesses launched elsewhere, and concurrent repository
+changes are outside its enforcement. Vulnerability matching is limited to
+supported Debian/Ubuntu OSV data and package mappings. ClamAV detects known
+signatures and selected limits; heuristic script checks are review leads.
+Neither no-match nor no-detection proves a package or repository safe, and the
+tool does not provide comprehensive malware detection or system protection.
 
 ### Example report shape
 
@@ -722,6 +1067,23 @@ Add `--diagnostics` to report stage progress and elapsed time to standard error.
 python main.py --diagnostics --json --output scan.json
 ```
 
+Use `--doctor` for a read-only prerequisite check:
+
+```bash
+python main.py --doctor
+python main.py --doctor --json
+```
+
+It reports the detected distro, Python support, package/deb scanning
+prerequisites, tool version lines, and counts of effective `DPkg::Pre-Install-Pkgs`
+and `DPkg::Pre-Invoke` entries. It intentionally omits hook command contents
+because APT settings can contain credentials. It makes no configuration
+changes. Exit status 0 means the host is recognized and inventory, `.deb`
+inspection, and ClamAV executables are available; status 1 means unsupported
+host or missing prerequisite. A ClamAV version line does not prove that a real
+scan succeeds or that signatures are current. Hook counts do not prove v3
+protocol compatibility, safe hook order, or cancellation timing.
+
 ## Tests
 
 Install the project requirements, then run the deterministic offline suite:
@@ -730,6 +1092,11 @@ Install the project requirements, then run the deterministic offline suite:
 python -m pytest -v
 ```
 
+GitHub Actions runs the offline suite and compile check on Python 3.11 through
+3.14 for pushes and pull requests. Python 3.10 is excluded because it reached
+end of life on 2026-10-01. The live OSV tests remain opt-in and are not part of
+that workflow.
+
 The unit tests mock operating-system commands and OSV responses, so they do not require `dpkg-query` or a live network. On Windows, the project's virtual environment can be used with:
 
 ```powershell
@@ -737,6 +1104,68 @@ The unit tests mock operating-system commands and OSV responses, so they do not 
 ```
 
 ## Manual Debian and Ubuntu Validation
+
+### Automated real APT transaction tests (disposable guest only)
+
+`tests/integration/test_apt_preinstall_guest.py` provides opt-in tests for a
+clean package approval, a maintainer-script review lead that is canceled, the
+same kind of review lead that is approved, incomplete-coverage denial, and
+lifecycle recovery/preservation. The transaction scenarios use ordinary
+`apt-get install`, the installed LinuxSecMonitor lifecycle, a real ClamAV scan,
+OSV assessment, a PTY-backed terminal prompt, `strace`, package database
+snapshots, and per-scenario evidence files. It refuses to run unless the guest
+is Debian/Ubuntu, root, has the root-owned disposable marker below, has the
+trusted system CLI installed, has no pre-invoke hooks, and has a private
+evidence directory. The test installs, disables, re-enables, and uninstalls
+only its own APT integration; it removes only the unique fixture package and
+markers it creates.
+
+Do not run this on the main Kali host. Use a fresh Debian/Ubuntu VM snapshot for
+each scenario. The approved scenario installs its purpose-built test package
+briefly and the harness purges only that unique package after it records the
+installed state and maintainer-script trace. The APT package scan must complete
+with real ClamAV and a usable OSV provider; scan or provider failure is recorded
+as a failed test, never converted to a simulated success.
+
+In the disposable guest, install the project into a root-owned runtime and
+install pytest in that runtime. Then create the explicit guest marker and a
+private evidence directory:
+
+```bash
+sudo install -d -o root -g root -m 0700 /var/tmp/linuxsecmonitor-apt-evidence
+printf '%s\n' linuxsecmonitor-disposable-apt-guest-v1 \
+  | sudo tee /run/linuxsecmonitor-disposable-apt-test >/dev/null
+sudo chown root:root /run/linuxsecmonitor-disposable-apt-test
+sudo chmod 0644 /run/linuxsecmonitor-disposable-apt-test
+```
+
+Run exactly one transaction command on a fresh snapshot, choosing one scenario:
+
+```bash
+sudo env \
+  LINUXSECMONITOR_RUN_REAL_APT=1 \
+  LINUXSECMONITOR_REAL_APT_SCENARIO=finding-cancel \
+  LINUXSECMONITOR_SYSTEM_CLI=/opt/linuxsecmonitor/bin/linuxsecmonitor \
+  LINUXSECMONITOR_APT_EVIDENCE_DIR=/var/tmp/linuxsecmonitor-apt-evidence \
+  /opt/linuxsecmonitor/bin/python -m pytest -q \
+  /opt/linuxsecmonitor-source/tests/integration/test_apt_preinstall_guest.py \
+  -k cancellation
+```
+
+Use `safe-approve` with `-k safe_package_approval`, `finding-approve` with
+`-k finding_approval`, or `incomplete-block` with
+`-k incomplete_coverage_blocks` on separate fresh snapshots. The incomplete
+fixture contains an in-package symlink and must be rejected before dpkg. Run
+the lifecycle case on a separate fresh snapshot with scenario `lifecycle` and
+`-k lifecycle_recovery`; it covers install, repeated install, disable, recovery
+by enable, repeated enable, uninstall, and preservation of unrelated config.
+Review the JSON summary,
+`.apt.log`, and `.execve.log` files in the evidence directory. The integration
+tests remain unverified until each command is run successfully on its target
+OS. Without `LINUXSECMONITOR_RUN_REAL_APT=1` and the exact scenario name, all
+five tests are skipped in the ordinary suite. Lifecycle recovery models the
+owned-receipt/missing-hook state; it does not inject a process kill between
+individual installer writes.
 
 Use separate disposable Debian and Ubuntu VMs for real-host validation. Take a VM snapshot first and run the scanner as a normal, non-root user. The scanner is read-only, but the JSON command writes `scan.json` in the project directory. Debian 12 validation is complete as recorded below; Ubuntu validation is still pending.
 
@@ -1132,10 +1561,12 @@ been compromised. It is not a sandbox against a kernel flaw, a privileged local
 attacker, a malicious/compromised ClamAV or `dpkg-deb`, or every parser/resource
 exhaustion attack. The APT hook drops to `_apt` before package parsing/scanning,
 but it must import and run its own Python code as root first; that installation
-path and its parents must therefore be root-controlled. Earlier APT hooks may
-run before this hook, so it cannot promise that package-controlled scripts have
-not already run. Repository scanning is an advisory manual workflow and does
-not intercept future execution or dependency installation.
+path and its parents must therefore be root-controlled. The managed `00`
+drop-in precedes ordinary later `apt.conf.d` pre-install hooks, but an earlier
+`APT_CONFIG` file or explicit APT configuration override can change that order
+or bypass the hook. The system configuration must be reviewed before enabling
+it. Repository scanning is an advisory manual workflow and does not intercept
+future execution or dependency installation.
 
 - Host collection, package inventory, OSV assessment, `--scan-deb`, and repository
   inventory/scanning are read-only. The explicitly selected
@@ -1184,6 +1615,10 @@ LinuxSecMonitor/
 |-- README.md
 |-- scanner/
 |   |-- __init__.py
+|   |-- diagnostics.py
+|   |-- execution_guard.py
+|   |-- apt_hook.py
+|   |-- apt_lifecycle.py
 |   |-- system_info.py
 |   |-- package_scanner.py
 |   |-- repository_scanner.py
@@ -1192,6 +1627,10 @@ LinuxSecMonitor/
 |   `-- vulnerability_assessment.py
 `-- tests/
     |-- test_system_info.py
+    |-- test_diagnostics.py
+    |-- test_execution_guard.py
+    |-- test_apt_lifecycle.py
+    |-- integration/test_apt_preinstall_guest.py
     |-- test_package_scanner.py
     |-- test_repository_scanner.py
     |-- test_repository_malware_scanner.py

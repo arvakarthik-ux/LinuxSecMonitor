@@ -12,6 +12,9 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Callable, TextIO
 
 from scanner.malware_scanner import MAX_PACKAGE_BYTES, MalwareAssessment, scan_deb
+from scanner.package_scanner import Package
+from scanner.system_info import collect_system_info
+from scanner.vulnerability_assessment import assess_packages
 
 MAX_PROTOCOL_BYTES = 8 * 1024 * 1024
 MAX_PROTOCOL_LINE_BYTES = 64 * 1024
@@ -21,6 +24,10 @@ _CONFIG_KEY = re.compile(r"^(?:[A-Za-z0-9_.:+/-]|%[0-9A-Fa-f]{2})+$")
 _MULTIARCH = {"same", "foreign", "allowed", "none", "no"}
 _SPECIAL_ACTIONS = {"**CONFIGURE**", "**REMOVE**"}
 _ASSESSMENT_STATUSES = {"detected", "no_detection", "unavailable", "incomplete", "error"}
+_VULNERABILITY_STATUSES = {
+    "vulnerable", "fixed", "not_affected", "mixed", "no_known_match",
+    "requires_review", "unsupported", "error",
+}
 _TRUSTED_SCANNER_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 
 
@@ -307,6 +314,7 @@ def _render_assessment(package_path: str, result: dict[str, object]) -> str:
     lines.extend((
         f"Status: {_terminal_safe(result.get('status', 'error'))}",
         f"Scanner: {_terminal_safe(result.get('scanner', 'unknown'))}",
+        f"Coverage complete: {'yes' if result.get('coverage_complete') is True else 'no'}",
     ))
     detections = result.get("detections", [])
     if isinstance(detections, list):
@@ -341,6 +349,126 @@ def _render_assessment(package_path: str, result: dict[str, object]) -> str:
             if finding.get("explanation"):
                 lines.append(f"Explanation: {_terminal_safe(finding['explanation'])}")
         lines.append("Review leads are heuristic and are not confirmed malware detections.")
+    return "\n".join(lines)
+
+
+def _assess_transaction_vulnerabilities(
+    results: list[tuple[str, dict[str, object], bool]],
+) -> dict[str, object]:
+    """Query the supported distro advisory source once for all transaction archives."""
+    packages: list[Package] = []
+    for _, result, _ in results:
+        package_data = result.get("package")
+        if not isinstance(package_data, dict):
+            return {
+                "assessment_status": "requires_review",
+                "distribution": None,
+                "release": None,
+                "source": None,
+                "error": "A scanned archive did not provide package identity for vulnerability assessment.",
+                "packages": [],
+                "advisory_context": {},
+            }
+        name, version = package_data.get("name"), package_data.get("version")
+        if not isinstance(name, str) or not name.strip() or not isinstance(version, str) or not version.strip():
+            return {
+                "assessment_status": "requires_review",
+                "distribution": None,
+                "release": None,
+                "source": None,
+                "error": "A scanned archive has incomplete package identity for vulnerability assessment.",
+                "packages": [],
+                "advisory_context": {},
+            }
+        source_name = package_data.get("source_name")
+        source_version = package_data.get("source_version")
+        packages.append(Package(
+            name,
+            version,
+            source_name if isinstance(source_name, str) and source_name.strip() else None,
+            source_version if isinstance(source_version, str) and source_version.strip() else None,
+        ))
+
+    try:
+        system = collect_system_info().to_dict()
+        report = assess_packages(
+            packages,
+            system.get("distribution") if isinstance(system.get("distribution"), str) else None,
+            system.get("distribution_version")
+            if isinstance(system.get("distribution_version"), str) else None,
+        )
+        serializer = getattr(report, "to_dict", None)
+        if not callable(serializer):
+            raise ValueError("vulnerability assessor returned no report serializer")
+        result = serializer()
+        if not isinstance(result, dict):
+            raise ValueError("vulnerability assessor returned a non-object report")
+    except Exception as exc:
+        return {
+            "assessment_status": "error",
+            "distribution": None,
+            "release": None,
+            "source": None,
+            "error": f"Transaction vulnerability assessment failed ({type(exc).__name__}).",
+            "packages": [],
+            "advisory_context": {},
+        }
+
+    status = result.get("assessment_status")
+    if status not in _VULNERABILITY_STATUSES:
+        return {
+            "assessment_status": "error",
+            "distribution": result.get("distribution"),
+            "release": result.get("release"),
+            "source": result.get("source"),
+            "error": "Vulnerability assessor returned an unknown assessment status.",
+            "packages": [],
+            "advisory_context": {},
+        }
+    return result
+
+
+def _render_vulnerability_assessment(result: dict[str, object]) -> str:
+    """Render bounded package/advisory details for the APT transaction prompt."""
+    lines = [
+        "Transaction vulnerability assessment:",
+        f"Status: {_terminal_safe(result.get('assessment_status', 'error'))}",
+        f"Distribution: {_terminal_safe(result.get('distribution') or 'unknown')}",
+        f"Release: {_terminal_safe(result.get('release') or 'unknown')}",
+        f"Advisory source: {_terminal_safe(result.get('source') or 'unavailable')}",
+    ]
+    error = result.get("error")
+    if isinstance(error, str) and error:
+        lines.append(f"Assessment detail: {_terminal_safe(error)}")
+    packages = result.get("packages")
+    if isinstance(packages, list):
+        for package in packages[:20]:
+            if not isinstance(package, dict):
+                continue
+            lines.append(
+                "Package: "
+                f"{_terminal_safe(package.get('package_name', 'unknown'))} "
+                f"{_terminal_safe(package.get('installed_version', 'unknown'))} — "
+                f"{_terminal_safe(package.get('assessment_status', 'requires_review'))}"
+            )
+            explanation = package.get("explanation")
+            if isinstance(explanation, str) and explanation:
+                lines.append(f"Assessment: {_terminal_safe(explanation)}")
+            findings = package.get("findings")
+            if isinstance(findings, list):
+                for finding in findings[:20]:
+                    if not isinstance(finding, dict):
+                        continue
+                    severity = finding.get("severity")
+                    severity_text = f" [{_terminal_safe(severity)}]" if severity else ""
+                    lines.append(
+                        f"Advisory: {_terminal_safe(finding.get('advisory_id', 'unknown'))}"
+                        f"{severity_text} — {_terminal_safe(finding.get('assessment_status', 'unknown'))}"
+                    )
+                    reference = finding.get("source_reference")
+                    if isinstance(reference, str) and reference:
+                        lines.append(f"Reference: {_terminal_safe(reference)}")
+    lines.append("No matching advisory does not establish that a package is safe.")
     return "\n".join(lines)
 
 
@@ -458,14 +586,14 @@ def _scan_with_trusted_path(
 
 
 def _prompt_for_detection(terminal: TextIO | None = None) -> bool:
-    """Require exact interactive approval for a complete scan with review leads."""
+    """Require exact interactive approval before APT may continue."""
     opened = None
     try:
         if terminal is None:
             opened = open("/dev/tty", "r+", encoding="utf-8", errors="replace")
             terminal = opened
         terminal.write(
-            "Security review finding(s) were reported. Type exactly INSTALL to "
+            "APT transaction review is complete. Type exactly INSTALL to "
             "continue; anything else aborts: "
         )
         terminal.flush()
@@ -504,9 +632,47 @@ def run_apt_preinstall_hook(
     print("APT Pre-Install-Pkgs protocol version 3 accepted.", file=output_stream)
 
     archive_actions = [action for action in transaction.actions if action.archive_path is not None]
+    archive_targets = {
+        (
+            action.package_name,
+            action.target_version,
+            action.target_architecture,
+            "no" if action.target_multiarch == "none" else action.target_multiarch,
+        )
+        for action in archive_actions
+    }
+    unscannable_actions = [
+        action for action in transaction.actions
+        if (
+            action.action == "**REMOVE**"
+            or (
+                action.action == "**CONFIGURE**"
+                and (
+                    action.package_name,
+                    action.target_version,
+                    action.target_architecture,
+                    "no" if action.target_multiarch == "none" else action.target_multiarch,
+                ) not in archive_targets
+            )
+        )
+    ]
+    if unscannable_actions:
+        descriptions = ", ".join(
+            f"{_terminal_safe(action.package_name)} {action.action}"
+            for action in unscannable_actions
+        )
+        print(
+            "APT transaction blocked: maintainer-script-capable action(s) have no "
+            f"matching archive to scan ({descriptions}).",
+            file=output_stream,
+        )
+        return 1
     if not archive_actions:
-        print("APT transaction contains no package archives; no malware scan was needed.", file=output_stream)
-        return 0
+        print(
+            "APT transaction blocked: it contains no package archives to scan.",
+            file=output_stream,
+        )
+        return 1
 
     # Validate every path while root-protection checks are still available.
     # Only after this pass does a root-run hook permanently become _apt.
@@ -620,21 +786,6 @@ def run_apt_preinstall_hook(
     for raw_path, result, _ in results:
         print(_render_assessment(raw_path, result), file=output_stream)
 
-    complete_no_detection = all(
-        result.get("status") == "no_detection"
-        and result.get("coverage_complete") is True
-        and unchanged
-        and not result.get("maintainer_script_findings", [])
-        for _, result, unchanged in results
-    )
-    if complete_no_detection:
-        print(
-            "All transaction archives completed with no known detection. "
-            "This does not guarantee that the packages are safe.",
-            file=output_stream,
-        )
-        return 0
-
     if any(
         not unchanged
         or result.get("status") not in {"detected", "no_detection"}
@@ -648,7 +799,43 @@ def run_apt_preinstall_hook(
         )
         return 1
 
-    if any(result.get("status") == "detected" for _, result, _ in results):
+    vulnerability = _assess_transaction_vulnerabilities(results)
+    print(_render_vulnerability_assessment(vulnerability), file=output_stream)
+    vulnerability_status = vulnerability.get("assessment_status")
+    if vulnerability_status in {"error", "requires_review"}:
+        print(
+            "APT transaction blocked: vulnerability assessment failed or requires review.",
+            file=output_stream,
+        )
+        return 1
+
+    if vulnerability_status == "unsupported":
+        print(
+            "No authoritative vulnerability source supports this distribution; "
+            "review the limitation before deciding.",
+            file=output_stream,
+        )
+    elif vulnerability_status == "vulnerable":
+        print(
+            "One or more transaction packages match affected-version evidence. "
+            "Exact INSTALL approval will allow APT to continue.",
+            file=output_stream,
+        )
+
+    complete_no_detection = all(
+        result.get("status") == "no_detection"
+        and result.get("coverage_complete") is True
+        and unchanged
+        and not result.get("maintainer_script_findings", [])
+        for _, result, unchanged in results
+    )
+    if complete_no_detection:
+        print(
+            "All transaction archives completed with no known detection. "
+            "This does not guarantee that the packages are safe.",
+            file=output_stream,
+        )
+    elif any(result.get("status") == "detected" for _, result, _ in results):
         print(
             "Malware detection found. Approval will allow APT to continue despite the "
             "reported finding(s).",

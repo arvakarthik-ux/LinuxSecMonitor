@@ -15,7 +15,20 @@ from typing import Callable, TextIO, TypeVar
 
 from scanner import collect_system_info, scan_installed_packages
 from scanner.apt_hook import run_apt_preinstall_hook
+from scanner.apt_lifecycle import (
+    LifecycleError,
+    disable_apt_hook,
+    enable_apt_hook,
+    install_apt_hook,
+    integration_status,
+    uninstall_apt_hook,
+    validate_effective_hook_order,
+    validate_trusted_runtime,
+)
+from scanner.diagnostics import collect_diagnostics
+from scanner.execution_guard import review_repository_for_execution, run_reviewed_command
 from scanner.malware_scanner import MAX_PACKAGE_BYTES, MalwareAssessment, scan_deb
+from scanner.package_scanner import Package
 from scanner.repository_scanner import scan_repository
 from scanner.repository_malware_scanner import scan_repository_malware
 from scanner.repository_security_scanner import scan_repository_security
@@ -336,6 +349,153 @@ def _render_malware_text(assessment: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _assess_deb_vulnerability(malware_assessment: dict[str, object]) -> dict[str, object]:
+    """Assess a package against the advisory source for the current host distro."""
+    try:
+        system = collect_system_info().to_dict()
+    except Exception as exc:
+        return _deb_vulnerability_error(
+            None, None,
+            f"System distribution metadata could not be collected ({type(exc).__name__}).",
+        )
+
+    distribution = system.get("distribution")
+    release = system.get("distribution_version")
+    package_data = malware_assessment.get("package")
+    if not isinstance(package_data, dict):
+        package_data = {}
+    name = package_data.get("name")
+    version = package_data.get("version")
+    if not isinstance(name, str) or not name.strip() or not isinstance(version, str) or not version.strip():
+        return _deb_vulnerability_error(
+            distribution if isinstance(distribution, str) else None,
+            release if isinstance(release, str) else None,
+            "Package name or version metadata is unavailable; no vulnerability conclusion was made.",
+            status="requires_review",
+        )
+
+    source_name = package_data.get("source_name")
+    source_version = package_data.get("source_version")
+    package = Package(
+        name,
+        version,
+        source_name if isinstance(source_name, str) and source_name.strip() else None,
+        source_version if isinstance(source_version, str) and source_version.strip() else None,
+    )
+    try:
+        return assess_packages(
+            [package],
+            distribution if isinstance(distribution, str) else None,
+            release if isinstance(release, str) else None,
+        ).to_dict()
+    except Exception as exc:
+        return _deb_vulnerability_error(
+            distribution if isinstance(distribution, str) else None,
+            release if isinstance(release, str) else None,
+            f"Vulnerability assessment failed ({type(exc).__name__}); no conclusion was made.",
+        )
+
+
+def _deb_vulnerability_error(
+    distribution: str | None,
+    release: str | None,
+    error: str,
+    *,
+    status: str = "error",
+) -> dict[str, object]:
+    """Keep failed or unassessable package metadata explicit in JSON reports."""
+    return {
+        "assessment_status": status,
+        "distribution": distribution,
+        "release": release,
+        "source": None,
+        "error": error,
+        "summary": {
+            "total_assessed_packages": 0,
+            "status_counts": {},
+            "no_known_match_is_safe": False,
+            "no_known_match_note": (
+                "no_known_match means no matching record was found in the queried data; "
+                "it is not proof that a package is safe."
+            ),
+        },
+        "packages": [],
+        "advisory_context": {},
+    }
+
+
+def _render_deb_vulnerability_text(report: dict[str, object]) -> str:
+    """Render bounded vulnerability evidence without trusting archive metadata."""
+    def terminal_text(value: object, fallback: str = "Unavailable") -> str:
+        if not isinstance(value, str):
+            return fallback
+        return "".join(
+            character if character.isprintable()
+            else character.encode("unicode_escape").decode("ascii")
+            for character in value
+        )
+
+    lines = [
+        "Vulnerability assessment:",
+        f"  Status: {terminal_text(report.get('assessment_status'), 'error')}",
+        f"  Distribution: {terminal_text(report.get('distribution'))}",
+        f"  Release: {terminal_text(report.get('release'))}",
+        f"  Advisory source: {terminal_text(report.get('source'))}",
+    ]
+    if isinstance(report.get("error"), str) and report["error"]:
+        lines.append(f"  Error: {terminal_text(report['error'])}")
+    packages = report.get("packages")
+    if isinstance(packages, list):
+        for package in packages[:20]:
+            if not isinstance(package, dict):
+                continue
+            lines.append(
+                f"  Package: {terminal_text(package.get('package_name'))} "
+                f"{terminal_text(package.get('installed_version'))} — "
+                f"{terminal_text(package.get('assessment_status'), 'requires_review')}"
+            )
+            explanation = package.get("explanation")
+            if isinstance(explanation, str) and explanation.strip():
+                lines.append(f"    {terminal_text(explanation)}")
+            findings = package.get("findings")
+            if isinstance(findings, list):
+                for finding in findings[:20]:
+                    if not isinstance(finding, dict):
+                        continue
+                    severity = finding.get("severity")
+                    detail = f"    Advisory {terminal_text(finding.get('advisory_id'))}"
+                    if isinstance(severity, str) and severity.strip():
+                        detail += f" [{terminal_text(severity)}]"
+                    detail += f": {terminal_text(finding.get('assessment_status'))}"
+                    lines.append(detail)
+                    reference = finding.get("source_reference")
+                    if isinstance(reference, str) and reference.strip():
+                        lines.append(f"      Reference: {terminal_text(reference)}")
+    lines.append("No matching advisory is not proof that the package is safe.")
+    return "\n".join(lines)
+
+
+def _render_deb_text(assessment: dict[str, object]) -> str:
+    """Render both the malware inspection and distro-aware advisory result."""
+    rendered = _render_malware_text(assessment)
+    vulnerability = assessment.get("vulnerability_assessment")
+    if isinstance(vulnerability, dict):
+        rendered += "\n\n" + _render_deb_vulnerability_text(vulnerability)
+    return rendered
+
+
+def _deb_scan_success(assessment: dict[str, object]) -> bool:
+    """Return success only when malware and vulnerability checks are conclusive."""
+    if assessment.get("status") != "no_detection" or assessment.get("coverage_complete") is not True:
+        return False
+    vulnerability = assessment.get("vulnerability_assessment")
+    if not isinstance(vulnerability, dict):
+        return False
+    return vulnerability.get("assessment_status") in {
+        "no_known_match", "fixed", "not_affected", "mixed",
+    }
+
+
 def _render_repository_text(result: dict[str, object]) -> str:
     """Render the read-only repository inventory without trusting filenames."""
     def terminal_text(value: object, fallback: str = "Unavailable") -> str:
@@ -563,6 +723,116 @@ def _output_is_inside_repository(output_path: Path, repository_path: Path) -> bo
         return True
 
 
+def _render_safe_run_text(report: dict[str, object]) -> str:
+    """Render the repository assessments and guarded-command outcome."""
+    inventory = report.get("inventory")
+    malware = report.get("malware_assessment")
+    security = report.get("repository_security_assessment")
+    sections = []
+    if isinstance(inventory, dict):
+        sections.append(_render_repository_text(inventory))
+    if isinstance(malware, dict):
+        sections.append(_render_repository_malware_text(malware))
+    if isinstance(security, dict):
+        sections.append(_render_repository_security_text(security))
+    sections.append(f"Execution review: {report.get('review_status', 'error')}")
+    sections.append(f"Command outcome: {report.get('command_status', 'not_started')}")
+    if report.get("command_returncode") is not None:
+        sections.append(f"Command exit code: {report['command_returncode']}")
+    if report.get("command_error_type"):
+        sections.append(f"Command launch error: {report['command_error_type']}")
+    limitations = report.get("limitations")
+    if isinstance(limitations, list):
+        sections.extend(f"Execution limitation: {item}" for item in limitations)
+    return "\n\n".join(sections)
+
+
+def _render_diagnostics_text(report: dict[str, object]) -> str:
+    """Render prerequisite status without exposing APT hook contents."""
+    lines = [
+        "LinuxSecMonitor read-only diagnostics",
+        f"Host status: {report.get('status', 'error')}",
+        f"Operating system: {report.get('operating_system') or 'Unavailable'}",
+        f"Distribution: {report.get('distribution') or report.get('distribution_id') or 'Unavailable'}",
+        f"Distribution version: {report.get('distribution_version') or 'Unavailable'}",
+        f"Python: {report.get('python_version', 'Unavailable')} "
+        f"({'supported' if report.get('python_supported') is True else 'unsupported'})",
+        f"Package inventory prerequisites: "
+        f"{'available' if report.get('package_inventory_ready') is True else 'incomplete'}",
+        f".deb scan prerequisites: "
+        f"{'available' if report.get('deb_scan_prerequisites_available') is True else 'incomplete'}",
+        f"APT hook prerequisites: "
+        f"{'available' if report.get('apt_hook_prerequisites_available') is True else 'incomplete'}",
+        "System tools:",
+    ]
+    commands = report.get("commands")
+    if isinstance(commands, dict):
+        for name, result in sorted(commands.items()):
+            if not isinstance(result, dict):
+                continue
+            if result.get("available") is not True:
+                status = "missing"
+            elif result.get("version"):
+                status = str(result["version"])
+            else:
+                status = f"check {result.get('check', 'unavailable')}"
+            lines.append(f"  {name}: {status}")
+    pre_install = report.get("apt_pre_install_hook_count")
+    pre_invoke = report.get("apt_pre_invoke_hook_count")
+    if pre_install is None or pre_invoke is None:
+        lines.append("Configured APT hook counts: unavailable")
+    else:
+        lines.append(f"Configured APT Pre-Install-Pkgs hooks: {pre_install}")
+        lines.append(f"Configured APT Pre-Invoke hooks: {pre_invoke}")
+    limitations = report.get("limitations")
+    if isinstance(limitations, list):
+        lines.extend(f"Limitation: {item}" for item in limitations)
+    lines.append("No configuration was changed.")
+    return "\n".join(lines)
+
+
+def _run_safe_repository_command(
+    repository: Path,
+    command: list[str],
+    *,
+    json_output: bool,
+    output_path: Path | None,
+    include_generated: bool,
+    stdout: TextIO,
+) -> int:
+    """Review a repository, require a TTY decision, then run a command."""
+    report = review_repository_for_execution(
+        repository, include_generated=include_generated,
+    )
+    preview = _render_safe_run_text(report) + "\n"
+    # The user must see the complete assessments before the prompt. Keep JSON
+    # output parseable by sending that human preview to stderr.
+    preview_stream = sys.stderr if json_output else stdout
+    preview_stream.write(preview)
+    preview_stream.flush()
+
+    if report.get("coverage_complete") is True:
+        command_exit = run_reviewed_command(
+            report, repository, command, json_output=json_output,
+        )
+    else:
+        command_exit = 1
+
+    if json_output:
+        rendered = json.dumps(report, indent=2) + "\n"
+        if output_path is not None:
+            try:
+                output_path.write_text(rendered, encoding="utf-8")
+            except OSError as exc:
+                print(f"Could not write JSON output: {exc}", file=sys.stderr)
+                return 2
+        else:
+            stdout.write(rendered)
+    else:
+        stdout.write(f"Final command outcome: {report.get('command_status')}\n")
+    return command_exit
+
+
 def _validated_deb_path(package_path: Path) -> tuple[Path | None, str | None]:
     """Resolve a readable regular .deb file without accepting a symlink."""
     try:
@@ -658,7 +928,7 @@ def _preinstall_temp_parent() -> str | None:
 
 def _render_preinstall_report(assessment: dict[str, object]) -> str:
     """Render the scan result shown before the installation confirmation."""
-    rendered = _render_malware_text(assessment)
+    rendered = _render_deb_text(assessment)
     if assessment.get("status") == "no_detection":
         rendered += (
             "\nNo known malware detection was found. This does not guarantee safety."
@@ -831,6 +1101,7 @@ def _run_preinstall_snapshot(
 ) -> tuple[dict[str, object], dict[str, object], int]:
     """Assess and, after approval, install the same private package snapshot."""
     assessment = scan_deb(package_path).to_dict()
+    assessment["vulnerability_assessment"] = _assess_deb_vulnerability(assessment)
     preview = _render_preinstall_report(assessment) + "\n"
     # In JSON mode, keep stdout reserved for the final machine-readable result.
     report_stream = sys.stderr if json_output else stdout
@@ -1041,7 +1312,7 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
     )
     parser.add_argument(
         "--scan-deb", type=Path, metavar="PACKAGE.deb",
-        help="Inspect and scan a downloaded Debian package without installing it.",
+        help="Inspect a downloaded Debian package for malware and supported OSV advisories without installing it.",
     )
     parser.add_argument(
         "--preinstall-deb", type=Path, metavar="PACKAGE.deb",
@@ -1056,20 +1327,47 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
         help="Inventory a repository, scan staged files with ClamAV, and run bounded static checks.",
     )
     parser.add_argument(
+        "--safe-run", type=Path, metavar="REPOSITORY",
+        help="Review a repository and require interactive approval before a command after --.",
+    )
+    parser.add_argument(
+        "--doctor", action="store_true",
+        help="Check platform and tool prerequisites without changing configuration.",
+    )
+    parser.add_argument(
+        "--apt-integration",
+        choices=("status", "install", "enable", "disable", "uninstall"),
+        metavar="ACTION",
+        help=("Show or manage LinuxSecMonitor's dedicated APT hook. System-changing "
+              "actions require root; inspect the target paths before use."),
+    )
+    parser.add_argument(
+        "command_args", nargs=argparse.REMAINDER,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--include-generated", action="store_true",
         help="Include Python bytecode and common cache directories in repository static review.",
     )
     args = parser.parse_args(argv)
     if args.output and not args.json:
         parser.error("--output requires --json")
-    if args.include_generated and not args.scan_repo:
-        parser.error("--include-generated requires --scan-repo")
+    if args.apt_integration and (args.output or args.diagnostics):
+        parser.error("--apt-integration supports standard output only; --output and --diagnostics are not applicable")
+    if args.include_generated and not (args.scan_repo or args.safe_run):
+        parser.error("--include-generated requires --scan-repo or --safe-run")
+    if args.command_args and not args.safe_run:
+        parser.error("a command after -- requires --safe-run")
+    safe_command = args.command_args
+    if safe_command and safe_command[0] == "--":
+        safe_command = safe_command[1:]
     selected_modes = sum(bool(mode) for mode in (
-        args.scan_deb, args.preinstall_deb, args.apt_preinstall_hook, args.scan_repo,
+        args.scan_deb, args.preinstall_deb, args.apt_preinstall_hook,
+        args.scan_repo, args.safe_run, args.doctor, args.apt_integration,
     ))
     if selected_modes > 1:
         parser.error(
-            "--scan-deb, --preinstall-deb, --apt-preinstall-hook, and --scan-repo "
+            "--scan-deb, --preinstall-deb, --apt-preinstall-hook, --scan-repo, --safe-run, --doctor, and --apt-integration "
             "cannot be used together"
         )
     if args.apt_preinstall_hook and (args.json or args.output or args.diagnostics):
@@ -1077,9 +1375,97 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
 
     if args.apt_preinstall_hook:
         return run_apt_preinstall_hook()
+    if args.apt_integration:
+        try:
+            paths = {"apt_conf_dir": Path("/etc/apt/apt.conf.d"),
+                     "state_dir": Path("/var/lib/linuxsecmonitor")}
+            if args.apt_integration == "status":
+                result = integration_status(**paths)
+                if result.get("status") == "enabled":
+                    runtime = result.get("python")
+                    try:
+                        if not isinstance(runtime, str):
+                            raise LifecycleError("Lifecycle receipt has no interpreter path")
+                        validate_effective_hook_order(runtime)
+                    except LifecycleError as exc:
+                        result["status"] = "conflict"
+                        result["effective_order_error"] = str(exc)
+            else:
+                if not _is_effective_root():
+                    raise LifecycleError(
+                        f"{args.apt_integration} requires effective root privileges; "
+                        "no system configuration was changed"
+                    )
+                if args.apt_integration == "install":
+                    trusted_modules = (
+                        Path(__file__),
+                        Path(__file__).parent / "scanner" / "apt_hook.py",
+                        Path(__file__).parent / "scanner" / "malware_scanner.py",
+                    )
+                    validate_trusted_runtime(sys.executable, trusted_modules)
+                    result = install_apt_hook(
+                        **paths, python=sys.executable, module_paths=trusted_modules,
+                        effective_order_check=validate_effective_hook_order,
+                    )
+                elif args.apt_integration == "enable":
+                    trusted_modules = (
+                        Path(__file__),
+                        Path(__file__).parent / "scanner" / "apt_hook.py",
+                        Path(__file__).parent / "scanner" / "malware_scanner.py",
+                    )
+                    result = enable_apt_hook(
+                        **paths, module_paths=trusted_modules,
+                        effective_order_check=validate_effective_hook_order,
+                    )
+                elif args.apt_integration == "disable":
+                    result = disable_apt_hook(**paths)
+                else:
+                    result = uninstall_apt_hook(**paths)
+        except (LifecycleError, OSError) as exc:
+            print(f"APT integration {args.apt_integration} failed: {exc}", file=sys.stderr)
+            return 1
+        stdout.write(json.dumps(result, indent=2) + "\n" if args.json
+                     else f"APT integration: {result['status']}\n"
+                          f"Hook: {result['hook_path']}\n"
+                          f"State: {result['state_path']}\n")
+        return 0 if result["status"] in {"enabled", "disabled", "not_installed"} else 1
+    if args.doctor:
+        result = collect_diagnostics()
+        rendered = (
+            json.dumps(result, indent=2) + "\n"
+            if args.json else _render_diagnostics_text(result) + "\n"
+        )
+        if args.output:
+            try:
+                args.output.write_text(rendered, encoding="utf-8")
+            except OSError as exc:
+                print(f"Could not write JSON output: {exc}", file=sys.stderr)
+                return 2
+        else:
+            stdout.write(rendered)
+        return 0 if (
+            result.get("status") == "supported_host"
+            and result.get("python_supported") is True
+            and result.get("package_inventory_ready") is True
+            and result.get("deb_scan_prerequisites_available") is True
+        ) else 1
     if args.scan_repo and args.output and _output_is_inside_repository(args.output, args.scan_repo):
         print("Could not write JSON output inside the repository being scanned.", file=sys.stderr)
         return 2
+    if args.safe_run:
+        if not safe_command:
+            parser.error("--safe-run requires a command after --")
+        if args.output and _output_is_inside_repository(args.output, args.safe_run):
+            print("Could not write JSON output inside the repository being scanned.", file=sys.stderr)
+            return 2
+        return _run_safe_repository_command(
+            args.safe_run,
+            safe_command,
+            json_output=args.json,
+            output_path=args.output,
+            include_generated=args.include_generated,
+            stdout=stdout,
+        )
 
     if args.preinstall_deb:
         return _run_preinstall_deb(
@@ -1124,10 +1510,11 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
 
     if args.scan_deb:
         assessment = scan_deb(args.scan_deb).to_dict()
+        assessment["vulnerability_assessment"] = _assess_deb_vulnerability(assessment)
         if args.json:
             rendered = json.dumps(assessment, indent=2) + "\n"
         else:
-            rendered = _render_malware_text(assessment) + "\n"
+            rendered = _render_deb_text(assessment) + "\n"
         if args.output:
             try:
                 args.output.write_text(rendered, encoding="utf-8")
@@ -1136,7 +1523,7 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
                 return 2
         else:
             stdout.write(rendered)
-        return 0 if assessment["status"] == "no_detection" else 1
+        return 0 if _deb_scan_success(assessment) else 1
 
     diagnostic = None
     if args.diagnostics:

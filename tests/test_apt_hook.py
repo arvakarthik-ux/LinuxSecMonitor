@@ -36,7 +36,7 @@ def _assessment(
         scanner="mock ClamAV",
         package={
             "name": "demo", "version": "1", "architecture": "amd64",
-            "multi_arch": "no",
+            "multi_arch": "no", "source_name": "demo", "source_version": "1",
         },
         detections=(
             [MalwareDetection("Test.Signature", "payload/bin/demo")]
@@ -47,6 +47,23 @@ def _assessment(
         coverage_complete=complete,
         maintainer_script_findings=script_findings or [],
     )
+
+
+@pytest.fixture(autouse=True)
+def _avoid_live_apt_vulnerability_queries(monkeypatch):
+    """Keep hook unit tests offline and leave provider behavior to explicit cases."""
+    def unsupported(packages, distribution, release):
+        return SimpleNamespace(to_dict=lambda: {
+            "assessment_status": "unsupported",
+            "distribution": distribution,
+            "release": release,
+            "source": None,
+            "error": "Synthetic unit-test provider reports unsupported.",
+            "packages": [],
+            "advisory_context": {},
+        })
+
+    monkeypatch.setattr(apt_hook, "assess_packages", unsupported)
 
 
 class _Terminal:
@@ -111,6 +128,8 @@ def _run(
             "version": action.target_version or "1",
             "architecture": action.target_architecture or "amd64",
             "multi_arch": "no" if action.target_multiarch == "none" else action.target_multiarch,
+            "source_name": action.package_name,
+            "source_version": action.target_version or "1",
         }
         return result
 
@@ -189,16 +208,107 @@ def test_parse_accepts_configuration_and_removal_records_but_no_install_archives
     assert [item.action for item in transaction.actions] == ["**CONFIGURE**", "**REMOVE**"]
 
 
-def test_clean_transaction_scans_every_archive_and_continues_without_prompt(monkeypatch):
+def test_clean_transaction_scans_every_archive_but_cancels_without_terminal(monkeypatch):
     code, output, scanned = _run(
         monkeypatch,
         [_install_record("/cache/first package.deb"), _install_record("/cache/second.deb", "other")],
     )
-    assert code == 0
+    assert code == 1
     assert [path.name for path in scanned] == ["first package.deb", "second.deb"]
     assert output.count("Status: no_detection") == 2
     assert "protocol version 3 accepted" in output
     assert "does not guarantee" in output
+    assert "explicit terminal approval was not received" in output
+
+
+def test_clean_transaction_requires_exact_terminal_approval(monkeypatch):
+    code, output, scanned = _run(
+        monkeypatch,
+        [_install_record("/cache/clean.deb")],
+        answer="INSTALL\n",
+    )
+    assert code == 0
+    assert [path.name for path in scanned] == ["clean.deb"]
+    assert "no known detection" in output
+    assert "Explicit INSTALL approval received" in output
+
+
+def test_vulnerability_assessment_aggregates_all_archives_before_approval(monkeypatch):
+    queries = []
+
+    def assess(packages, distribution, release):
+        queries.append((packages, distribution, release))
+        return SimpleNamespace(to_dict=lambda: {
+            "assessment_status": "no_known_match",
+            "distribution": distribution,
+            "release": release,
+            "source": "test assessor",
+            "error": None,
+            "packages": [
+                {
+                    "package_name": item.name,
+                    "installed_version": item.version,
+                    "assessment_status": "no_known_match",
+                    "explanation": "Synthetic no-match test result.",
+                    "findings": [],
+                }
+                for item in packages
+            ],
+            "advisory_context": {},
+        })
+
+    monkeypatch.setattr(apt_hook, "assess_packages", assess)
+    code, output, scanned = _run(
+        monkeypatch,
+        [
+            _install_record("/cache/first.deb", "first"),
+            _install_record("/cache/second.deb", "second"),
+        ],
+        answer="INSTALL\n",
+    )
+
+    assert code == 0
+    assert [path.name for path in scanned] == ["first.deb", "second.deb"]
+    assert len(queries) == 1
+    packages, _, _ = queries[0]
+    assert [(item.name, item.version, item.source_name, item.source_version)
+            for item in packages] == [
+        ("first", "1", "first", "1"),
+        ("second", "1", "second", "1"),
+    ]
+    assert "Transaction vulnerability assessment:" in output
+    assert output.count("Assessment: Synthetic no-match test result.") == 2
+    assert "Explicit INSTALL approval received" in output
+
+
+@pytest.mark.parametrize("status", ["error", "requires_review"])
+def test_vulnerability_assessment_gap_blocks_before_prompt(monkeypatch, status):
+    monkeypatch.setattr(
+        apt_hook,
+        "assess_packages",
+        lambda packages, distribution, release: SimpleNamespace(to_dict=lambda: {
+            "assessment_status": status,
+            "distribution": distribution,
+            "release": release,
+            "source": None,
+            "error": f"Synthetic {status} state.",
+            "packages": [],
+            "advisory_context": {},
+        }),
+    )
+    monkeypatch.setattr(
+        apt_hook,
+        "_prompt_for_detection",
+        lambda terminal=None: pytest.fail("incomplete vulnerability evidence must block before prompt"),
+    )
+
+    code, output, _ = _run(
+        monkeypatch, [_install_record("/cache/review.deb")], answer="INSTALL\n",
+    )
+
+    assert code == 1
+    assert f"Status: {status}" in output
+    assert "vulnerability assessment failed or requires review" in output
 
 
 @pytest.mark.parametrize(
@@ -226,6 +336,8 @@ def test_maintainer_script_review_lead_requires_exact_approval(
     assert code == expected_code
     assert [path.name for path in scanned] == ["review.deb"]
     assert "Status: no_detection" in output
+    assert "Coverage complete: yes" in output
+    assert "Coverage complete: yes" in output
     assert "Maintainer-script static review (heuristic" in output
     assert "download-piped-to-shell" in output
     assert "not confirmed malware detections" in output
@@ -233,6 +345,28 @@ def test_maintainer_script_review_lead_requires_exact_approval(
         assert "transaction blocked" in output
     else:
         assert "Explicit INSTALL approval" in output
+
+
+def test_apt_report_explicitly_shows_incomplete_coverage():
+    rendered = apt_hook._render_assessment("/cache/package.deb", {
+        "status": "incomplete", "scanner": "ClamAV clamscan",
+        "coverage_complete": False, "package": {}, "detections": [],
+        "limitations": ["timed out"],
+    })
+    assert "Status: incomplete" in rendered
+    assert "Coverage complete: no" in rendered
+    assert "Coverage limitation: timed out" in rendered
+
+
+def test_apt_report_explicitly_shows_incomplete_coverage():
+    rendered = apt_hook._render_assessment("/cache/package.deb", {
+        "status": "incomplete", "scanner": "ClamAV clamscan",
+        "coverage_complete": False, "package": {}, "detections": [],
+        "limitations": ["timed out"],
+    })
+    assert "Status: incomplete" in rendered
+    assert "Coverage complete: no" in rendered
+    assert "Coverage limitation: timed out" in rendered
 
 
 def test_detection_requires_exact_terminal_approval(monkeypatch):
@@ -255,7 +389,8 @@ def test_mixed_clean_and_detected_archives_are_all_scanned_before_approval(monke
     )
     assert code == 0
     assert [path.name for path in scanned] == ["clean.deb", "detected.deb"]
-    assert output.count("Status:") == 2
+    assert output.count("Status:") == 3
+    assert "Transaction vulnerability assessment:" in output
     assert "Test.Signature" in output
     assert "Explicit INSTALL approval" in output
 
@@ -423,6 +558,7 @@ def test_scanner_uses_trusted_system_path_and_restores_caller_environment(monkey
 
     code = apt_hook.run_apt_preinstall_hook(
         stream=BytesIO(_protocol(_install_record("/cache/demo.deb"))),
+        terminal=_Terminal("INSTALL\n"),
         scanner=scanner,
         output=StringIO(),
     )
@@ -432,20 +568,50 @@ def test_scanner_uses_trusted_system_path_and_restores_caller_environment(monkey
     assert os.environ["PATH"] == "untrusted-bin"
 
 
-def test_configuration_and_removal_only_transaction_needs_no_scanner(monkeypatch):
-    actions = [
+@pytest.mark.parametrize(
+    "action",
+    [
         "configpkg - - none < 1 amd64 none **CONFIGURE**",
         "oldpkg 1 amd64 none > - - none **REMOVE**",
+    ],
+)
+def test_archive_less_maintainer_script_actions_block_transaction(monkeypatch, action):
+    monkeypatch.delenv("APT_HOOK_INFO_FD", raising=False)
+    output = StringIO()
+    code = apt_hook.run_apt_preinstall_hook(
+        stream=BytesIO(_protocol(action)),
+        scanner=lambda path: pytest.fail("no archive is scheduled"),
+        output=output,
+    )
+    assert code == 1
+    assert "maintainer-script-capable action(s) have no matching archive" in output.getvalue()
+
+
+def test_configure_action_without_matching_archive_blocks_scanned_transaction(monkeypatch):
+    actions = [
+        _install_record("/cache/other.deb", "otherpkg"),
+        "configpkg - - none < 1 amd64 none **CONFIGURE**",
     ]
     monkeypatch.delenv("APT_HOOK_INFO_FD", raising=False)
     output = StringIO()
     code = apt_hook.run_apt_preinstall_hook(
         stream=BytesIO(_protocol(*actions)),
-        scanner=lambda path: pytest.fail("no archive is scheduled"),
+        scanner=lambda path: pytest.fail("transaction must fail before scanning"),
         output=output,
     )
+    assert code == 1
+    assert "configpkg **CONFIGURE**" in output.getvalue()
+
+
+def test_configure_action_with_matching_archive_is_scanned(monkeypatch):
+    actions = [
+        _install_record("/cache/configpkg.deb", "configpkg"),
+        "configpkg - - none < 1 amd64 none **CONFIGURE**",
+    ]
+    code, output, scanned = _run(monkeypatch, actions, answer="INSTALL\n")
     assert code == 0
-    assert "no package archives" in output.getvalue()
+    assert [path.name for path in scanned] == ["configpkg.deb"]
+    assert "does not guarantee" in output
 
 
 def test_unexpected_info_fd_and_oversized_protocol_fail_closed(monkeypatch):
