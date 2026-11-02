@@ -1,10 +1,11 @@
 # LinuxSecMonitor
 
-LinuxSecMonitor is a command-line tool for collecting Linux host details, inventorying Debian-family packages, and comparing installed package versions with supported OSV vulnerability data. Host scans and assessment are read-only. Separate opt-in modes can scan a downloaded `.deb` without installing it, inventory and statically review a repository, or request an explicitly confirmed local-package installation after scanning. It does not claim complete vulnerability coverage or package safety.
+Kali Linux is LinuxSecMonitor's primary supported target; Debian and Ubuntu are secondary compatibility targets. LinuxSecMonitor collects Linux host details, inventories Debian-family packages, and compares package versions only with vulnerability data validated for the detected distribution. Host scans and assessment are read-only. Separate opt-in modes can scan a downloaded `.deb` without installing it, inventory and statically review a repository, or request an explicitly confirmed local-package installation after scanning. It does not claim complete vulnerability coverage or package safety.
 
 ## Key features
 
 - Collects operating system, distribution and version when available, kernel version, CPU architecture, Python version, and hostname.
+- Primary target: Kali Linux package inventory with `dpkg-query`, local `.deb` inspection, ClamAV coverage reporting, and the opt-in APT hook/lifecycle. Real disposable Kali guest verification is still pending.
 - Inventories installed Debian, Ubuntu, and Kali packages with `dpkg-query` where supported. Source package metadata is retained internally for Debian assessment.
 - Performs conservative, distribution-aware vulnerability assessment using Ubuntu and Debian OSV records. Kali vulnerability matching is explicitly unsupported.
 - Adds available OSV summaries, details, references, and Debian urgency as advisory context. Urgency is kept separate from severity.
@@ -85,7 +86,8 @@ Repository malware assessment additionally requires the `clamscan` executable
 and an available ClamAV signature database. Safe repository scanning requires
 POSIX no-follow directory-descriptor support; Windows can run the mocked tests,
 but repository malware assessment and static repository review report
-`unavailable` there. Linux is the validated target. LinuxSecMonitor does not
+`unavailable` there. Kali Linux is the primary implementation target; its
+disposable-guest APT behavior remains unverified. LinuxSecMonitor does not
 install ClamAV or download/update signatures.
 
 The WSL instructions apply when WSL is running a supported Debian, Ubuntu, or Kali Linux distribution; WSL itself is not a separate package-inventory target.
@@ -610,7 +612,8 @@ paths remain covered by mocked tests, not this real APT procedure.
 
 The EICAR case checks signature detection. This separate test checks whether
 declining a maintainer-script review lead prevents that script from running.
-Use only the same disposable Debian VM/snapshot and temporary hook config.
+Use only a disposable Kali VM/snapshot and temporary hook config for the
+primary-target procedure. Debian results are secondary compatibility evidence.
 If the synthetic postinst runs, it creates a marker and appends a harmless
 `true` cron entry to a unique hidden filename. Run this only in the disposable
 VM; if either file appears, restore the snapshot immediately.
@@ -885,13 +888,13 @@ reported for the user's decision and does not itself prevent an explicit
 approval. OSV coverage is limited to the configured data sources and package
 mappings; this is not a comprehensive vulnerability guarantee. Real APT
 cancellation and approval remain unverified until the documented disposable
-Debian transaction tests pass.
+Kali transaction tests pass.
 
 This is an experimental hook integration, not a permanent APT policy and not
 an automatic APT configuration change. APT's v3 stream has no transaction
 record count or checksum, so a stream truncated exactly at a valid record
 boundary cannot be detected from the protocol alone. Validate hook invocation
-and behavior in a disposable Debian VM before considering any broader use.
+and behavior in a disposable Kali VM before considering any broader use.
 
 The documented command supplies temporary `-o` settings for one APT process;
 it does not install or alter a permanent hook configuration. There is therefore
@@ -986,7 +989,7 @@ tool does not provide comprehensive malware detection or system protection.
 This is a format template, not a recorded scan result. Values in angle brackets are filled from the current host and data sources.
 
 ```text
-LinuxSecMonitor — Sprint 1
+LinuxSecMonitor
 System information:
   Operating system: <detected operating system>
   Distribution: <distribution or Unavailable>
@@ -1040,11 +1043,20 @@ other.
 | --- | --- | --- |
 | Debian | Supported with `dpkg-query` | Debian OSV records, with numeric release and provable source package/version evidence; matching findings require traceable Debian Security Tracker references. |
 | Ubuntu | Supported with `dpkg-query` | Ubuntu OSV data for releases with suitable metadata and package/version evidence. |
-| Kali | Supported with `dpkg-query` | Explicitly unsupported. Debian or Ubuntu records are not treated as authoritative for Kali. |
+| Kali (primary target) | Supported with `dpkg-query` | Explicitly unsupported. No Kali-specific advisory provider or validated package/version mapping exists; Debian or Ubuntu records are not treated as authoritative for Kali. |
 | Other distributions | Unsupported | Requires review; no distribution-specific provider is configured. |
 | Windows | Unsupported | System information and tests can run, but package inventory and Linux vulnerability assessment are not supported. |
 
 Distribution detection reads `/etc/os-release` on Linux. The package scanner checks the primary distribution ID and invokes `dpkg-query` without a shell. The scanner does not detect Ubuntu Pro/ESM entitlement. Some advisories lack severity or complete version evidence, and Debian OSV coverage can be incomplete. Debian Security Tracker references are retained, but Tracker page notes are not fetched during normal scans. `no_known_match` only describes queried data and never proves safety.
+
+Kali is the primary implementation target for system information, `dpkg-query`
+inventory, Debian archive parsing, ClamAV scanning, diagnostics, and the
+optional APT integration. These code paths have unit coverage, but the APT
+hook and privileged lifecycle have not yet been verified in a disposable Kali
+guest. Vulnerability assessment on Kali deliberately reports `unsupported`;
+`--scan-deb` therefore does not return a conclusive vulnerability result, and
+APT displays the unsupported limitation before any explicit approval. This is
+not Kali vulnerability coverage and is not a `no_known_match` result.
 
 ## Persistent Debian OSV cache
 
@@ -1061,11 +1073,34 @@ In one observed Debian scan, the first scan took approximately **127.6 seconds**
 
 ## Diagnostics
 
-Add `--diagnostics` to report stage progress and elapsed time to standard error. Diagnostics include OSV batch and hydration progress, persistent cache hit/miss/expiry/write/failure counts, matching progress, and report-writing times. They avoid printing advisory descriptions.
+Add `--diagnostics` to report stage progress and elapsed time to standard error. Diagnostics include OSV batch and hydration progress, persistent cache hit/miss/expiry/write/failure counts, matching progress, and report-writing times. For `--scan-deb`, they also report metadata and extraction timings, ClamAV wall and child CPU time, the Python process's completed-child RSS high-water mark, exit status, timeout, and a bounded stderr excerpt on scanner failure. The RSS figure is a high-water mark, not a per-process memory trace. Diagnostic output is opt-in and does not change scan decisions. It avoids printing advisory descriptions.
 
 ```bash
 python main.py --diagnostics --json --output scan.json
+python main.py --diagnostics --scan-deb /path/to/package.deb --json
 ```
+
+The APT hook opens the controlling terminal before dropping its archive-scanning
+process to the `_apt` user, then reuses that already-open terminal for the
+approval decision. A real terminal prompt waits at most 300 seconds. No
+terminal, EOF, invalid input, an interrupted read, or timeout is a denial; the
+hook never infers approval from missing input. This behavior has unit coverage,
+but the terminal/privilege sequence and cancellation timing still require
+verification inside an actual disposable Kali APT transaction.
+
+Kali's [relationship documentation](https://www.kali.org/docs/policy/kali-linux-relationship-with-debian/)
+says most packages are imported as-is from Debian Testing, with some packages
+forked or imported from other Debian suites. The installed `dpkg-query`
+inventory provides source package/version but not authoritative repository
+provenance. The official [Kali Package Tracker](https://pkg.kali.org/) tracks
+package evolution rather than vulnerability status, and its
+[rolling-versus-Debian comparison](https://pkg.kali.org/derivative/kali-roll/)
+shows substantial per-package divergence. The [Debian Security Tracker](https://security-tracker.debian.org/tracker/)
+records Debian suite status; it does not establish that a given installed
+Kali package has the same source and patches. The current providers also
+require a numeric Debian release for OSV ecosystem matching. Without a
+validated per-package provenance and advisory mapping, Kali reports use
+`unsupported` rather than `no_known_match`.
 
 Use `--doctor` for a read-only prerequisite check:
 
@@ -1103,7 +1138,11 @@ The unit tests mock operating-system commands and OSV responses, so they do not 
 .\.venv\Scripts\python.exe -m pytest -v
 ```
 
-## Manual Debian and Ubuntu Validation
+## Disposable guest validation
+
+Kali is the primary integration-test target. Debian and Ubuntu validation
+remains secondary compatibility coverage and does not substitute for Kali
+guest results.
 
 ### Automated real APT transaction tests (disposable guest only)
 
@@ -1114,18 +1153,22 @@ lifecycle recovery/preservation. The transaction scenarios use ordinary
 `apt-get install`, the installed LinuxSecMonitor lifecycle, a real ClamAV scan,
 OSV assessment, a PTY-backed terminal prompt, `strace`, package database
 snapshots, and per-scenario evidence files. It refuses to run unless the guest
-is Debian/Ubuntu, root, has the root-owned disposable marker below, has the
+is Kali, Debian, or Ubuntu, root, has the root-owned disposable marker below, has the
 trusted system CLI installed, has no pre-invoke hooks, and has a private
 evidence directory. The test installs, disables, re-enables, and uninstalls
 only its own APT integration; it removes only the unique fixture package and
 markers it creates.
 
-Do not run this on the main Kali host. Use a fresh Debian/Ubuntu VM snapshot for
-each scenario. The approved scenario installs its purpose-built test package
+Do not run this on the main Kali host. Use a fresh disposable Kali VM snapshot
+for each primary-target scenario. Kali's vulnerability status must be shown as
+`unsupported`; the Kali transaction tests must not present it as a clean
+assessment. The Kali provider path makes no OSV request. The approved scenario installs its purpose-built test package
 briefly and the harness purges only that unique package after it records the
 installed state and maintainer-script trace. The APT package scan must complete
-with real ClamAV and a usable OSV provider; scan or provider failure is recorded
-as a failed test, never converted to a simulated success.
+with real ClamAV and usable signatures. Debian/Ubuntu scenarios additionally
+need their live OSV provider; on Kali, the expected vulnerability result is
+explicitly `unsupported`, not a simulated provider success. Scanner failure or
+incomplete coverage is always a failed transaction test.
 
 In the disposable guest, install the project into a root-owned runtime and
 install pytest in that runtime. Then create the explicit guest marker and a
@@ -1213,13 +1256,15 @@ These results are observations from that Debian VM, not guarantees for other hos
 
 The CLI exit code reflects package inventory and report writing. OSV retrieval can fail after a successful inventory; in that case the report should still show the inventory result and identify the assessment error. `no_known_match` only means no matching record was found in the queried data; it does not mean the system or package is safe. Kali package inventory is supported, but Kali vulnerability assessment remains explicitly unsupported; Debian or Ubuntu records are not authoritative for Kali.
 
-### Controlled Kali validation (pending)
+### Controlled Kali validation (guest verification pending)
 
-Kali is supported for `dpkg-query` package inventory, but its vulnerability
-assessment is explicitly unsupported. The Windows test results do not validate
-Kali filesystem behavior, ClamAV behavior, or APT protocol compatibility. Use a
-disposable Kali VM or snapshot, run as a normal user, and first record the
-installed tool versions and existing hook configuration:
+Kali is the primary supported platform for system information, `dpkg-query`
+inventory, local `.deb` scanning, and the planned APT integration. Kali
+vulnerability assessment remains explicitly unsupported; tests must preserve
+that status. Unit tests and host-side checks do not validate APT protocol
+behavior in a guest. Use a disposable Kali VM or snapshot, run scan commands as
+a normal user, and first record the installed tool versions and existing hook
+configuration:
 
 ```bash
 python3 --version
@@ -1590,7 +1635,7 @@ future execution or dependency installation.
 ### Optional Debian EICAR check
 
 The EICAR test string is a harmless antivirus test signature, not actual
-malware. On a disposable Debian VM with `clamscan` and its signature database
+malware. On a disposable Kali VM with `clamscan` and its signature database
 already available, this creates a temporary test directory and scans it. It
 does not download malware, install a package, or execute the test file:
 
@@ -1649,3 +1694,64 @@ LinuxSecMonitor/
 - Add security-configuration auditing and change monitoring.
 - Add a web dashboard and background monitoring in a later project sprint.
 - Improve historical reporting and alert workflows without automatic remediation.
+
+## Local verification status (2026-10-29)
+
+The offline test suite was rerun with Python 3.14.7: **453 passed, 7 skipped
+in 18.13s**. Kali-related package inventory, diagnostics, assessment, and CLI
+tests passed: **227 passed in 19.75s**. The five opt-in guest tests were
+separately collected and skipped; no APT transaction or guest lifecycle
+operation ran. Live OSV tests were not run because they require external
+requests. A wheel built from the current tracked tree, installed into a fresh
+temporary virtual environment, and passed CLI help and `pip check`. Local
+Actions YAML parsing succeeded; GitHub Actions was not run.
+
+Real Kali guest verification remains blocked here: QEMU and `qemu-img` are
+installed, but `/dev/kvm` and a local Kali disk image are absent. No existing
+VirtualBox, libvirt, VMware, or container guest frontend was found. Docker is
+present, but this account cannot access its daemon socket. No guest was started
+and no image was downloaded. Provide a disposable Kali guest with hardware
+acceleration (or equivalent scan throughput), root access, ClamAV with usable
+signatures, `strace`, and the documented evidence/runtime paths; restore a
+clean snapshot for each scenario before claiming end-to-end verification.
+
+The real-APT harness accepts Kali, Debian, and Ubuntu. On Kali, it verifies
+that the transaction report states vulnerability assessment is `unsupported`
+and displays that no authoritative provider is configured before prompting.
+This behavior is implemented but remains unverified in a Kali guest.
+
+### Final focused verification update (2026-10-29)
+
+The current local offline run passed **459 tests with 7 skipped in 24.45s**;
+the five disposable-guest scenarios and two opt-in live OSV tests did not run.
+Focused vulnerability, APT hook/CLI, lifecycle and malware scanner tests passed
+**249 in 2.01s**.
+Compilation, dependency checks, local workflow YAML parsing, wheel build,
+fresh-venv wheel installation and installed CLI help passed. GitHub Actions was
+not run. The wheel was built in a temporary copy of tracked files and existing
+working edits; no build artifact was left in the project.
+
+The latest harmless package scan on this Kali host completed ClamAV inspection
+in **12.191s wall / 12.161s child CPU**, with a completed-child RSS high-water
+mark of **989632 KiB** and ClamAV exit 0. Malware status was `no_detection` and
+coverage was complete; the overall CLI exited 1 because vulnerability
+assessment is unsupported for Kali. An empty-directory ClamAV scan still used
+**11.892s wall / 11.875s CPU** and **989064 KiB** RSS high-water. Debug output
+showed engine/signature database initialization before inspection. This
+establishes substantial local process startup/database cost but does not
+quantify or resolve the earlier QEMU TCG timeout. The 120-second scan limit is
+unchanged, and timeouts remain `incomplete`.
+
+This host has no `clamd` or `clamdscan`; the implementation therefore retains
+one bounded `clamscan` process per `.deb`. A multi-package APT transaction can
+pay the signature initialization cost once per archive. No daemon-based reuse
+or performance improvement is claimed.
+
+The APT hook prints planned transaction package names and target versions
+before scanning, so an unavailable archive can still be identified in the
+failure report. The APT approval terminal is captured before dropping the scanner process to
+`_apt`; the actual retained-terminal prompt has a 300-second bound. This fixes
+the identified privilege-order risk in the implementation and is covered by
+unit tests, but approval, cancellation, maintainer-script ordering, and
+lifecycle behavior still require a disposable Kali transaction to be
+**VERIFIED END TO END**.

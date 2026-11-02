@@ -1,4 +1,4 @@
-"""Command-line entry point for LinuxSecMonitor Sprint 1."""
+"""Command-line entry point for LinuxSecMonitor."""
 
 from __future__ import annotations
 
@@ -151,7 +151,7 @@ def _render_text(result: dict[str, object]) -> str:
     assert isinstance(system, dict) and isinstance(package_scan, dict)
     packages = package_scan["packages"]
     assert isinstance(packages, list)
-    lines = ["LinuxSecMonitor — Sprint 1", "System information:"]
+    lines = ["LinuxSecMonitor", "System information:"]
     labels = {
         "operating_system": "Operating system", "distribution": "Distribution",
         "distribution_version": "Distribution version", "kernel_version": "Kernel",
@@ -1509,7 +1509,13 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
         ) else 1
 
     if args.scan_deb:
-        assessment = scan_deb(args.scan_deb).to_dict()
+        diagnostic = None
+        if args.diagnostics:
+            diagnostic = lambda message: print(f"[diagnostic] {message}", file=sys.stderr)
+        assessment = (
+            scan_deb(args.scan_deb, diagnostic=diagnostic)
+            if diagnostic is not None else scan_deb(args.scan_deb)
+        ).to_dict()
         assessment["vulnerability_assessment"] = _assess_deb_vulnerability(assessment)
         if args.json:
             rendered = json.dumps(assessment, indent=2) + "\n"

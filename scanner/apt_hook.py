@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import select
 import stat
 import sys
 import unicodedata
@@ -29,6 +30,8 @@ _VULNERABILITY_STATUSES = {
     "requires_review", "unsupported", "error",
 }
 _TRUSTED_SCANNER_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+APPROVAL_TIMEOUT_SECONDS = 300
+_NO_APPROVAL_TERMINAL = object()
 
 
 class AptProtocolError(ValueError):
@@ -589,6 +592,8 @@ def _prompt_for_detection(terminal: TextIO | None = None) -> bool:
     """Require exact interactive approval before APT may continue."""
     opened = None
     try:
+        if terminal is _NO_APPROVAL_TERMINAL:
+            return False
         if terminal is None:
             opened = open("/dev/tty", "r+", encoding="utf-8", errors="replace")
             terminal = opened
@@ -597,6 +602,22 @@ def _prompt_for_detection(terminal: TextIO | None = None) -> bool:
             "continue; anything else aborts: "
         )
         terminal.flush()
+        # Real terminal input must be bounded: EOF, no controlling terminal,
+        # and an unattended prompt all fail closed. Test doubles without a
+        # selectable file descriptor retain their simple synchronous behavior.
+        try:
+            descriptor = terminal.fileno()
+        except (AttributeError, OSError, ValueError):
+            descriptor = None
+        if descriptor is not None:
+            try:
+                readable, _, _ = select.select(
+                    [descriptor], [], [], APPROVAL_TIMEOUT_SECONDS,
+                )
+            except (OSError, ValueError):
+                return False
+            if not readable:
+                return False
         answer = terminal.readline()
         return answer.removesuffix("\n").removesuffix("\r") == "INSTALL"
     except (OSError, EOFError, KeyboardInterrupt):
@@ -630,6 +651,18 @@ def run_apt_preinstall_hook(
         print(f"Invalid or incomplete APT protocol; transaction blocked: {_terminal_safe(exc)}", file=output_stream)
         return 1
     print("APT Pre-Install-Pkgs protocol version 3 accepted.", file=output_stream)
+    print(f"APT transaction package actions: {len(transaction.actions)}", file=output_stream)
+    for action in transaction.actions:
+        package_name = _terminal_safe(action.package_name)
+        if action.archive_path is not None:
+            version = _terminal_safe(action.target_version or "unknown")
+            architecture = _terminal_safe(action.target_architecture or "unknown")
+            detail = f"target {version} {architecture}; archive inspection required"
+        elif action.action == "**REMOVE**":
+            detail = "remove action (not an install scan; archive-less script actions are blocked)"
+        else:
+            detail = f"configure action for {_terminal_safe(action.target_version or 'unknown')}"
+        print(f"Planned package: {package_name} — {detail}", file=output_stream)
 
     archive_actions = [action for action in transaction.actions if action.archive_path is not None]
     archive_targets = {
@@ -695,6 +728,17 @@ def run_apt_preinstall_hook(
                 action, None, None,
                 f"Archive validation raised {type(exc).__name__}: {exc}",
             ))
+
+    # Open the controlling terminal while the hook still has its original
+    # credentials. The hook later drops permanently to _apt to inspect package
+    # data; opening /dev/tty after that transition may fail for the caller.
+    owns_terminal = False
+    if terminal is None and any(path is not None for _, path, _, _ in pending):
+        try:
+            terminal = open("/dev/tty", "r+", encoding="utf-8", errors="replace")
+            owns_terminal = True
+        except OSError:
+            terminal = _NO_APPROVAL_TERMINAL
 
     if any(path is not None for _, path, _, _ in pending):
         try:
@@ -846,7 +890,13 @@ def run_apt_preinstall_hook(
             "Maintainer-script review lead(s) require explicit approval before APT continues.",
             file=output_stream,
         )
-    if not _prompt_for_detection(terminal):
+    approved = _prompt_for_detection(terminal)
+    if owns_terminal and hasattr(terminal, "close"):
+        try:
+            terminal.close()
+        except OSError:
+            approved = False
+    if not approved:
         print("APT transaction blocked: explicit terminal approval was not received.", file=output_stream)
         return 1
     print("Explicit INSTALL approval received; APT may continue.", file=output_stream)

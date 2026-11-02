@@ -683,3 +683,127 @@ Immediately before preparing this commit, the offline suite again passed
 temporary venv, passed wheel-content inspection and `pip check`, and its
 installed CLI help exited successfully. GitHub Actions and real Debian/Ubuntu
 APT/lifecycle transactions remain unverified.
+
+### Private local verification update (2026-10-29)
+
+- Offline suite: **453 passed, 7 skipped in 22.20s**.
+- Real guest harness: **5 skipped in 0.01s**; no marked Debian/Ubuntu guest
+  was available. No cancellation, approval, incomplete-scan APT transaction,
+  or guest lifecycle operation was performed.
+- Packaging: wheel built from a temporary archive of the tracked tree
+  (SHA-256 `ec630fd1e1acc2b193d85f940b4cb8a7361c93d33d0790b86e69f48370ed7fd4`),
+  installed in a fresh venv; installed CLI help and `pip check` passed. Project
+  venv `pip check`, compilation, workflow YAML parse, and both diff checks
+  passed.
+- Environment: QEMU/qemu-img are present, but `/dev/kvm` and a local disposable
+  Debian/Ubuntu image are absent. Docker daemon access is denied. The prior
+  TCG ClamAV timeout is consistent with CPU-bound software emulation, but this
+  round did not reproduce it and cannot precisely attribute scan versus
+  emulation cost. The 120-second timeout remains unchanged.
+- Live OSV requests were not made to keep this round local. GitHub Actions was
+  not run. No host APT configuration, host package state, or VM state changed;
+  no commit, push, or release occurred.
+
+Final status remains **IMPLEMENTED — INTEGRATION TESTS STILL BLOCKED**. Real
+APT cancellation/approval and lifecycle verification require a disposable
+Kali guest with working hardware acceleration or equivalent scan throughput,
+the README prerequisites, and a clean snapshot for each scenario.
+
+### Kali primary-target update (2026-10-29)
+
+Kali Linux is now identified as the primary supported target. OS detection,
+`dpkg-query` inventory, diagnostics, `.deb` inspection, ClamAV reporting, and
+the APT hook/lifecycle implementation support Kali's Debian package format;
+these paths have unit coverage but have **not** been verified end to end in a
+disposable Kali guest. The real-APT harness now accepts Kali and requires its
+unsupported vulnerability status to be visible before the user decision.
+
+Kali vulnerability matching remains explicitly **unsupported**. There is no
+Kali-specific authoritative provider or validated package/version mapping, so
+Debian and Ubuntu OSV data are not applied to Kali and no complete Kali
+vulnerability coverage is claimed. The hook can show this limitation and
+request exact `INSTALL` approval; incomplete malware scanning or scanner errors
+remain fail-closed.
+
+The host has QEMU and `qemu-img`, but no `/dev/kvm`, Kali guest image, or
+existing VM frontend. Docker daemon access is denied. Thus none of the five
+Kali scenarios ran: clean approval, finding cancellation, finding approval,
+incomplete-scan denial, or lifecycle preservation/recovery. The old ClamAV
+TCG timeout remains unresolved and bounded at 120 seconds. No host APT
+configuration, package state, or virtualization setting changed; no image was
+downloaded. A suitable next environment needs a disposable Kali VM with root,
+APT/dpkg, ClamAV signatures, `strace`, a trusted root-owned runtime, local
+evidence storage, and hardware acceleration or equivalent scan throughput.
+
+After the harness and documentation changes, the offline suite passed **453
+passed, 7 skipped in 18.13s**. Focused Kali-related inventory, diagnostics,
+vulnerability assessment, and CLI tests passed **227 passed in 19.75s**. The
+five real-APT guest tests were collected separately and **5 skipped in 0.03s**;
+none was run in a Kali guest. A fresh wheel built from the current tracked
+tree, installed in a new virtual environment, and passed CLI `--help` and
+`pip check` (SHA-256
+`10562038653e7a1fbe2570c8e98151599e3cba2be5963dff2fdcc5a2eaffa37d`).
+Compilation, local workflow YAML parsing, and `git diff --check` passed. No
+live OSV requests or GitHub Actions execution occurred.
+
+**Readiness: READY FOR LIMITED USE WITH DOCUMENTED LIMITATIONS.** Local host
+inventory, repository review, and package inspection can be used with the
+reported coverage limits. Kali vulnerability assessment remains unsupported.
+Do not treat the APT integration as verified or enable it for production use
+until the five real Kali guest scenarios pass with local package-state and
+maintainer-script evidence.
+
+### Final critical-gap implementation pass (2026-10-29)
+
+- **Kali vulnerability assessment:** remains `unsupported`. Source review found
+  Kali's official package tracker provides package version/change data, but no
+  validated affected/fixed version advisory feed for this package inventory
+  mapping. Debian and Ubuntu OSV records are not applied to Kali. No Kali
+  coverage or `no_known_match` result is claimed.
+- **APT approval:** fixed terminal lifecycle ordering by opening/capturing
+  `/dev/tty` before the hook drops to `_apt` for package inspection. The
+  retained terminal is used for exact `INSTALL` approval; interactive input is
+  bounded to 300 seconds, and no terminal, timeout, EOF or invalid input is a
+  denial. The hook now prints planned package names and target versions before
+  scanning, including when an archive is missing. This is unit-tested, not
+  verified through APT itself.
+- **ClamAV performance:** added opt-in metadata/extraction/ClamAV elapsed
+  timing, child CPU/RSS high-water diagnostics, exit/timeout reporting, and
+  bounded stderr excerpts on errors. A harmless locally built `.deb` scan
+  completed with malware `no_detection`, complete malware coverage, 12.191s
+  ClamAV wall time, 12.161s child CPU, 989632 KiB child RSS high-water and
+  ClamAV exit 0. The CLI returned 1 because Kali vulnerability assessment is
+  unsupported. An empty-directory scan still used 11.892s wall / 11.875s CPU
+  and 989064 KiB high-water RSS. ClamAV debug output showed engine and database
+  loading. This demonstrates substantial local process initialization cost;
+  it does not establish or resolve the QEMU TCG multiplier. The 120-second
+  timeout remains bounded and unchanged.
+- **Verification:** final offline suite **459 passed, 7 skipped in 24.45s**;
+  focused vulnerability, APT hook/CLI, lifecycle and malware scanner tests
+  **249 passed in 2.01s**.
+  Five Kali guest scenarios were separately collected and skipped because no
+  disposable Kali VM or `/dev/kvm` is available; Docker daemon access is denied.
+  Compilation, `pip check`, `git diff --check`, workflow YAML parsing, wheel
+  build, fresh virtual-environment installation, installed CLI help and clean
+  environment `pip check` passed. Wheel SHA-256:
+  `1b0101d12a072bc77c197a2c213c08eef11c707053e45895b80b3d5247bf74c0`.
+  Live OSV requests and GitHub Actions were not run.
+- **Safety:** no host APT configuration or package database was changed; no
+  guest image or host package was installed; no commit, push, release, or
+  external project upload occurred. The ten pre-existing modified files were
+  preserved; this pass also modified the vulnerability assessor and its two
+  tests, alongside the earlier focused code/tests/docs changes.
+- **Files modified in the current working tree:** `README.md`,
+  `PROJECT_AUDIT.md`, `PROJECT_COMPLETION_CHECKLIST.md`,
+  `PROJECT_FINAL_REPORT.md`, `main.py`, `scanner/apt_hook.py`,
+  `scanner/malware_scanner.py`, `scanner/vulnerability_assessment.py`,
+  `tests/integration/test_apt_preinstall_guest.py`, `tests/test_apt_hook.py`,
+  `tests/test_malware_scanner.py`, `tests/test_debian_assessment.py`, and
+  `tests/test_vulnerability_assessment.py`. No files were deleted.
+
+**Final readiness:** READY FOR LIMITED USE WITH DOCUMENTED LIMITATIONS. Kali
+inventory and local `.deb` malware inspection are usable with their stated
+coverage limits. Kali vulnerability assessment is unsupported, and automatic
+APT approval/cancellation plus lifecycle behavior remain unverified in a real
+Kali guest. Do not treat APT integration as production-verified until the
+separate guest scenarios observe package state and maintainer-script order.

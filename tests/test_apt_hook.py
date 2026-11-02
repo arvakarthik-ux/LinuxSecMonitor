@@ -217,6 +217,8 @@ def test_clean_transaction_scans_every_archive_but_cancels_without_terminal(monk
     assert [path.name for path in scanned] == ["first package.deb", "second.deb"]
     assert output.count("Status: no_detection") == 2
     assert "protocol version 3 accepted" in output
+    assert "Planned package: demo — target 1 amd64; archive inspection required" in output
+    assert "Planned package: other — target 1 amd64; archive inspection required" in output
     assert "does not guarantee" in output
     assert "explicit terminal approval was not received" in output
 
@@ -423,6 +425,54 @@ def test_prompt_fails_closed_when_no_terminal_can_be_opened(monkeypatch):
     assert apt_hook._prompt_for_detection() is False
 
 
+def test_prompt_fails_closed_when_approval_terminal_is_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        apt_hook, "open",
+        lambda *args, **kwargs: pytest.fail("must not reopen the terminal after privilege drop"),
+        raising=False,
+    )
+    assert apt_hook._prompt_for_detection(apt_hook._NO_APPROVAL_TERMINAL) is False
+
+
+def test_prompt_fails_closed_when_terminal_approval_times_out(monkeypatch):
+    class SelectableTerminal(_Terminal):
+        def fileno(self):
+            return 42
+
+    calls = []
+    monkeypatch.setattr(
+        apt_hook.select, "select",
+        lambda readers, writers, errors, timeout: (calls.append(timeout) or ([], [], [])),
+    )
+    assert apt_hook._prompt_for_detection(SelectableTerminal("INSTALL\n")) is False
+    assert calls == [apt_hook.APPROVAL_TIMEOUT_SECONDS]
+
+
+def test_hook_opens_terminal_before_dropping_privileges(monkeypatch):
+    _install_path_validation(monkeypatch)
+    monkeypatch.delenv("APT_HOOK_INFO_FD", raising=False)
+    events = []
+    terminal = _Terminal("INSTALL\n")
+    monkeypatch.setattr(
+        apt_hook, "open",
+        lambda *args, **kwargs: (events.append("open") or terminal),
+        raising=False,
+    )
+    monkeypatch.setattr(apt_hook, "_drop_to_apt_sandbox_user", lambda: events.append("drop"))
+    monkeypatch.setattr(
+        apt_hook, "_prompt_for_detection",
+        lambda selected: (events.append("prompt") or selected is terminal),
+    )
+    output = StringIO()
+    result = apt_hook.run_apt_preinstall_hook(
+        stream=BytesIO(_protocol(_install_record("/cache/demo.deb"))),
+        scanner=lambda _path: (events.append("scan") or _assessment()),
+        output=output,
+    )
+    assert result == 0
+    assert events == ["open", "drop", "scan", "prompt"]
+
+
 def test_prompt_cancels_when_user_interrupts():
     class InterruptedTerminal:
         def write(self, value):
@@ -585,6 +635,25 @@ def test_archive_less_maintainer_script_actions_block_transaction(monkeypatch, a
     )
     assert code == 1
     assert "maintainer-script-capable action(s) have no matching archive" in output.getvalue()
+
+
+def test_missing_archive_report_keeps_expected_package_identity(monkeypatch):
+    monkeypatch.delenv("APT_HOOK_INFO_FD", raising=False)
+    monkeypatch.setattr(
+        apt_hook, "_safe_archive_path",
+        lambda _path: (_ for _ in ()).throw(FileNotFoundError("archive missing")),
+    )
+    output = StringIO()
+    result = apt_hook.run_apt_preinstall_hook(
+        stream=BytesIO(_protocol(_install_record("/cache/demo_1_amd64.deb", "demo"))),
+        scanner=lambda _path: pytest.fail("missing archive must not be scanned"),
+        output=output,
+    )
+    assert result == 1
+    assert "Planned package: demo — target 1 amd64; archive inspection required" in output.getvalue()
+    assert "Status: error" in output.getvalue()
+    assert "archive missing" in output.getvalue()
+    assert "transaction blocked" in output.getvalue()
 
 
 def test_configure_action_without_matching_archive_blocks_scanned_transaction(monkeypatch):

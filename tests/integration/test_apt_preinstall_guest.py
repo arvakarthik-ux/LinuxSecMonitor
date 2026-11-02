@@ -1,4 +1,4 @@
-"""Opt-in real APT transactions; run only inside a disposable Debian/Ubuntu guest.
+"""Opt-in real APT transactions; run only inside a disposable Kali/Debian/Ubuntu guest.
 
 Run one scenario per fresh guest snapshot with
 LINUXSECMONITOR_RUN_REAL_APT=1,
@@ -81,8 +81,11 @@ def _guest_preflight(scenario: str) -> tuple[Path, Path, dict[str, str]]:
         )
 
     release = _read_os_release()
-    if release.get("ID", "").lower() not in {"debian", "ubuntu"}:
-        pytest.fail("Real APT integration tests support Debian/Ubuntu disposable guests only")
+    if release.get("ID", "").lower() not in {"kali", "debian", "ubuntu"}:
+        pytest.fail(
+            "Real APT integration tests support Kali/Debian/Ubuntu "
+            "disposable guests only"
+        )
     required_commands = [_APT_CONFIG, _DPKG_QUERY]
     if scenario != "lifecycle":
         required_commands.extend((_APT, _DPKG, _DPKG_DEB, _DPKG_QUERY, _STRACE))
@@ -386,8 +389,10 @@ def _transaction_test(
             "cron": cron_marker.read_text(encoding="utf-8").strip() if cron_marker.is_file() else None,
         }
         output_text = transaction_output.decode("utf-8", "replace")
+        normalized_output_text = output_text.replace("\r\n", "\n")
         report = {
             "scenario": scenario,
+            "distribution_id": release.get("ID"),
             "distribution": release.get("PRETTY_NAME", release.get("ID", "unknown")),
             "distribution_version": release.get("VERSION_ID"),
             "apt_version": apt_version,
@@ -413,6 +418,11 @@ def _transaction_test(
             "real_clamav_backend": "Scanner: dpkg-deb + ClamAV clamscan" in output_text,
             "no_detection_status": "Status: no_detection" in output_text,
             "approval_received": "Explicit INSTALL approval received; APT may continue." in output_text,
+            "kali_vulnerability_unsupported_displayed": (
+                "Transaction vulnerability assessment:\nStatus: unsupported" in normalized_output_text
+                and "No authoritative vulnerability source supports this distribution"
+                in normalized_output_text
+            ),
             "initial_package_state_digest": hashlib.sha256(
                 "\n".join(f"{key}\t{value}" for key, value in sorted(initial_packages.items())).encode()
             ).hexdigest(),
@@ -446,6 +456,12 @@ def _transaction_test(
                 raise AssertionError("APT did not report a complete real ClamAV scan")
             if "Transaction vulnerability assessment:" not in output_text:
                 raise AssertionError("APT did not display the transaction vulnerability assessment")
+            if release.get("ID", "").lower() == "kali" and not report[
+                "kali_vulnerability_unsupported_displayed"
+            ]:
+                raise AssertionError(
+                    "Kali's unsupported vulnerability coverage was not shown before approval"
+                )
             if with_finding and not report["review_finding_displayed"]:
                 raise AssertionError("The expected maintainer-script review lead was not displayed")
         if decision == "CANCEL" and not with_incomplete_content:

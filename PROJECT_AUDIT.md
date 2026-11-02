@@ -425,3 +425,108 @@ Pre-push rerun: offline **453 passed, 7 skipped in 17.15s**; live OSV-enabled
 **455 passed, 5 skipped in 19.76s**. A fresh wheel build/venv install,
 installed CLI help, wheel module inspection, and isolated `pip check` passed.
 The five guest scenarios and actual GitHub Actions remain unverified.
+
+### Private local revalidation (2026-10-29)
+
+The current offline run passed **453 tests with 7 skips in 22.20s**. The five
+real-guest tests were collected independently and all skipped because this
+host is not an explicitly marked Debian/Ubuntu guest. The current ClamAV
+timeout was not re-run: QEMU is installed, but `/dev/kvm` and a disposable
+guest image are absent; Docker daemon access is denied. Earlier guest evidence
+still shows approximately one TCG-emulated CPU busy until the scanner's
+120-second bound. This supports CPU-bound TCG scanning as the likely cause,
+but does not separate ClamAV initialization/database work from the emulation
+cost.
+
+A wheel built from a temporary archive of tracked files (SHA-256
+`ec630fd1e1acc2b193d85f940b4cb8a7361c93d33d0790b86e69f48370ed7fd4`), installed
+in a fresh temporary venv, and passed CLI help and `pip check`. The existing
+venv dependency check, compileall, local workflow YAML parse, and both diff
+checks passed. No live OSV requests or GitHub Actions run occurred. No guest
+image was downloaded, no host APT configuration or package database changed,
+and no guest evidence is claimed from this round.
+
+### Kali as primary target (2026-10-29)
+
+The implementation audit confirms that `/etc/os-release` detection, `dpkg-query`
+inventory, diagnostics support, Debian archive parsing, ClamAV scanning, and the
+APT hook/lifecycle are distribution-compatible with Kali's package format.
+Kali vulnerability assessment is intentionally `unsupported`: there is no
+configured Kali-specific advisory provider or validated package/source/version
+mapping. Debian and Ubuntu OSV matches are not used for Kali. The APT hook may
+continue only after showing that limitation and receiving exact interactive
+`INSTALL` approval, while scan failures and incomplete coverage still block.
+
+The real-guest harness was changed to allow `ID=kali` and now requires evidence
+that Kali's unsupported vulnerability status is visible in the APT report.
+This harness change is not guest verification. The five Kali scenarios remain
+unrun. Current resource inspection found QEMU/qemu-img but no `/dev/kvm`, Kali
+image, conventional VM image directory, VM frontend, or Docker daemon access.
+The previous TCG ClamAV timeout remains unresolved; the 120-second limit is
+unchanged. No host APT configuration or package state was changed and no image
+was downloaded.
+
+Current local checks after the Kali harness change: offline suite **453
+passed, 7 skipped in 18.13s**; focused Kali-related inventory, diagnostics,
+vulnerability assessment, and CLI tests **227 passed in 19.75s**; guest
+harness collection **5 skipped in 0.03s**. The fresh wheel installed into a
+new venv and passed CLI help and `pip check` (SHA-256
+`10562038653e7a1fbe2570c8e98151599e3cba2be5963dff2fdcc5a2eaffa37d`).
+Compileall, local workflow YAML parsing, and `git diff --check` passed. No live
+OSV requests or GitHub Actions run occurred.
+
+### Focused critical-gap work (2026-10-29)
+
+Review found the APT hook attempted to open `/dev/tty` only when asking for
+approval, after permanently dropping from root to `_apt` for archive scanning.
+That ordering could make an otherwise valid interactive approval unavailable.
+The hook now opens and retains the terminal before the privilege drop, passes
+that handle to the final prompt, and treats a missing terminal as an explicit
+denial without trying to reopen it. Real file descriptors are readiness-checked
+with a 300-second limit before reading. The focused APT, malware and lifecycle
+tests passed **131/131**, including ordering, timeout, unavailable terminal,
+scanner timeout, and fail-closed cases. This remains unit evidence; actual APT
+approval/cancellation on Kali was not run.
+
+The local ClamAV performance diagnostic now reports metadata/extraction stages,
+ClamAV wall time, child CPU, completed-child RSS high-water mark, bounded
+stderr excerpts on scanner failures, and result/timeout. RSS is not a per-process
+memory time series. A harmless
+synthetic `.deb` was built and scanned without installation: build 0.032s,
+scan total 12.448s, ClamAV 12.413s wall / 12.383s CPU, exit 0, malware
+`no_detection` with complete malware coverage. The overall CLI exited 1 because
+Kali vulnerability assessment correctly remains unsupported. A second ClamAV
+scan of an empty directory took 11.892s wall / 11.875s CPU, exit 0, with
+989064 KiB child maximum RSS. `--debug` output showed initialization of the
+1.4.6 engine and loading of `/var/lib/clamav` databases before inspection.
+This measures a large per-process initialization/database cost on the host;
+there is no `clamd` or `clamdscan` executable in this environment. The old
+Debian TCG timeout was not reproduced, and its emulation multiplier remains
+unmeasured; no timeout was extended and no scan coverage was removed.
+
+Kali vulnerability matching remains deliberately unsupported after source
+review. Kali's [relationship documentation](https://www.kali.org/docs/policy/kali-linux-relationship-with-debian/)
+says most packages are imported as-is from Debian Testing, but some are forked
+or imported from other suites; the local dpkg inventory does not identify
+authoritative repository provenance. The [official Kali Package Tracker](https://pkg.kali.org/)
+exposes version/change data, and its derivative comparison documents
+per-package divergence, but it is not a vulnerability feed. The [Debian
+Security Tracker](https://security-tracker.debian.org/tracker/) is authoritative
+for Debian suites, not proof of the source patches in a given installed Kali
+package. Existing OSV mapping requires a numeric Debian release, while Kali is
+rolling. No reliable package subset mapping was established, so Debian/Ubuntu
+records remain inapplicable to Kali and the assessment is not reported as
+`no_known_match`.
+
+Final focused regression after these changes: **459 passed, 7 skipped in
+24.45s**; focused vulnerability, APT hook/CLI, lifecycle and malware scanner
+selection: **249 passed in 2.01s**. The five real-guest scenarios were separately collected and
+skipped because no disposable Kali guest was available. The remaining two
+skips are opt-in live OSV tests, which were not run. Compilation, the project
+environment's `pip check`, both Git diff whitespace checks, and local workflow
+YAML parsing passed. A wheel built from a temporary copy of the current
+tracked tree and working edits (SHA-256
+`1b0101d12a072bc77c197a2c213c08eef11c707053e45895b80b3d5247bf74c0`), installed
+in a fresh temporary virtual environment, and passed CLI help and `pip check`.
+Actual GitHub Actions was not run. No persistent host APT settings, host
+packages, VM resources, or Git history were changed.

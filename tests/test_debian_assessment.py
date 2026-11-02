@@ -492,7 +492,8 @@ def test_assessment_summary_handles_empty_results_and_unsupported_kali():
     assert kali["distribution"] == "Kali GNU/Linux Rolling"
     assert kali["release"] == "2025.1"
     assert kali["source"] is None
-    assert "not authoritative for Kali" in kali["error"]
+    assert "no validated Kali advisory source" in kali["error"]
+    assert "per-package Debian provenance/version mapping" in kali["error"]
 
 
 def test_debian_provider_queries_source_ecosystem_and_hydrates_record():

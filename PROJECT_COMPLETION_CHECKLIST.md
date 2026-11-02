@@ -9,17 +9,20 @@ NOT IMPLEMENTED. Unit tests alone do not establish real package-manager behavior
 
 ## Repository and verification baseline
 
-- [x] **COMPLETE — Repository state recorded.** Current branch is
-  `codex/linuxsecmonitor-completion`; HEAD is `2c1f341b75d2a3c4e61b699c1974c3ea9157f24f`.
-  Project files from the current development effort are staged, the APT
-  follow-up appended to `PROJECT_FINAL_REPORT.md` is unstaged, and
-  `kali-host-report.json` is untracked user data and must remain untouched.
-  No commit or push has been made.
-- [x] **COMPLETE — Offline test baseline rerun.** Command:
+- [x] **COMPLETE — Repository state rechecked (2026-10-29).** Repository root
+  is `/home/kali/LinuxSecMonitor`, branch is
+  `codex/linuxsecmonitor-completion`, and HEAD is
+  `ac139b08a48d7159663aa42a9e2ed3541db27d17`. At the start of the current
+  focused pass, ten files had unstaged modifications and there were no staged
+  or untracked files; all ten were preserved. This pass also modified the
+  vulnerability assessor and its two tests. No
+  staged files or untracked non-ignored files are present at final status.
+  Private host reports were not opened or modified. No commit or push occurred.
+- [x] **HISTORICAL BASELINE — Offline test run from earlier pass.** Command:
   `.venv/bin/python -B -m pytest -q -p no:cacheprovider`; result:
   **434 passed, 2 skipped in 20.78s**. The skipped tests are the opt-in live
   Debian/Ubuntu OSV integration tests. See the exact test files for scope.
-- [x] **COMPLETE — Live OSV suite rerun.** Command:
+- [x] **HISTORICAL BASELINE — Live OSV run from earlier pass.** Command:
   `LINUXSECMONITOR_LIVE_OSV=1 LINUXSECMONITOR_LIVE_DEBIAN_OSV=1 .venv/bin/python -B -m pytest -q -p no:cacheprovider`;
   result: **436 passed in 27.15s** with approved network access.
 - [x] **COMPLETE — Compilation and diff checks.**
@@ -36,37 +39,86 @@ NOT IMPLEMENTED. Unit tests alone do not establish real package-manager behavior
 | Linux host information and package inventory | PARTIAL | `scanner/system_info.py`, `scanner/package_scanner.py`; diagnostics added in `scanner/diagnostics.py` | 431-test offline suite; current-host `--doctor` evidence recorded in `PROJECT_FINAL_REPORT.md` | Verify actual supported Debian and Ubuntu releases; preserve distinction between unsupported, empty, and failed inventory. |
 | OSV vulnerability assessment | PARTIAL | Debian/Ubuntu assessment, bounded requests and Debian advisory cache in `scanner/vulnerability_assessment.py`; Kali explicitly unsupported; `.deb` CLI/manual-preinstall and APT hook now call the existing assessor | Current offline suite 434 passed/2 skipped; live-enabled suite 436 passed including two real OSV tests; APT aggregation/blocking behavior has mocked unit coverage; current Kali synthetic `.deb` reports unsupported | Debian/Ubuntu package CLI and APT runtime assessment still need actual distro validation. No claim of complete OSV coverage. |
 | `.deb` archive inspection | PARTIAL | `scanner/malware_scanner.py` captures binary and Debian source identity; `main.py` includes OSV in `--scan-deb` and `--preinstall-deb` | Focused package/CLI suite previously 123 passed; live Kali synthetic `.deb` scan reported ClamAV `no_detection`, OSV `unsupported`, exit 1; marker-script fixture remained absent | Debian/Ubuntu assessment needs actual distro runtime validation. Continue adversarial archive-path/size tests. |
-| APT pre-install hook | BLOCKED (integration) / UNVERIFIED (cancellation and approval) | Protocol v3 parser, identity/path validation, fail-closed malware handling, transaction-level OSV aggregation, exact `INSTALL` prompt in `scanner/apt_hook.py`; temporary config and marker procedures in `README.md` | APT parser/hook unit and subprocess suite now has 81 passing tests, including synthetic assessment error/review blocking. Direct hook execution is not an APT transaction. | Run clean allow, cancel marker, approval marker, dependencies, upgrade, multi-archive, failures, noninteractive and hook-order tests in a disposable Debian VM. No such VM is available; do not claim maintainer-script suppression. |
+| APT pre-install hook | IMPLEMENTED; UNIT TESTED; Kali guest E2E BLOCKED | Protocol v3 parser, identity/path validation, fail-closed malware handling, transaction-level vulnerability assessment, package/action summary, exact `INSTALL` prompt; terminal opens before dropping to `_apt` and approval wait is bounded at 300 seconds | Focused APT/lifecycle tests pass; direct hook execution is not an APT transaction. Kali's unsupported vulnerability status is shown and remains distinct from a clean result. | Run clean approval, cancellation, incomplete denial, multi-archive, failure and hook-order scenarios in a disposable Kali guest; no Kali guest is available here. |
 | Repository inspection and pre-execution | PARTIAL | Existing inventory/static scanners plus explicit `--safe-run` in `scanner/execution_guard.py` | Harmless marker child cancellation/approval and focused tests recorded in audit/final reports | This is an opt-in wrapper, not automatic interception or a sandbox. Document and test unsupported paths, repository mutation races, worktrees, submodules and bypasses. |
-| ClamAV integration | PARTIAL | `scanner/malware_scanner.py` includes availability, timeouts, bounded metadata, stale signature warning and incomplete states; ClamAV timeout now returns explicit `incomplete` status | Local Kali scans completed for harmless fixtures; Debian 12 under QEMU TCG timed out at 120 seconds and reported incomplete coverage | TCG throughput prevents a full real Debian scan here. Do not claim the real timeout is resolved; run on hardware acceleration. A no-detection result is not a safety guarantee. |
+| ClamAV integration | IMPLEMENTED; UNIT TESTED; TCG PERFORMANCE BLOCKED | `scanner/malware_scanner.py` includes availability, bounded subprocesses, stale-signature warnings, incomplete states, and opt-in per-stage timing/child CPU/RSS diagnostics | Latest harmless local Kali `.deb` completed malware inspection in 12.191s ClamAV wall / 12.161s child CPU, with 989632 KiB completed-child RSS high-water; empty-directory scan took 11.892s / 11.875s CPU and 989064 KiB RSS high-water. | ClamAV initialization/database loading dominates even an empty scan on this host. The previous TCG guest timeout has not been reproduced with new instrumentation and remains unresolved; no security coverage or timeout was weakened. |
 | Text and JSON reporting / CLI | PARTIAL | `main.py` supports host reports, `.deb`, repository scan, `--safe-run`, `--doctor`, JSON/text output; `.deb` reports now include a separate OSV result | Offline suite: **434 passed, 2 skipped**; live-enabled suite: **436 passed**; real synthetic Kali `.deb` scan recorded | Continue review of unsupported, incomplete and error exit semantics; verify secret/data minimization. |
 | Setup, enable/disable, uninstall and recovery | IMPLEMENTED; UNIT TESTED; target integration BLOCKED BY ENVIRONMENT | `scanner/apt_lifecycle.py` and `--apt-integration status/install/enable/disable/uninstall`; first-order `00` drop-in, dedicated file/receipt, strict ownership/hash checks, conflict refusal, idempotence and failed-install rollback | Temporary-root lifecycle tests, CLI root-refusal tests, and isolated `apt-config` order/config parsing tests; persistent host configuration untouched | Real root installation, file ownership/permissions on supported distributions and interruption recovery after process death remain unverified. Explicit APT config overrides can reorder/bypass the hook. |
 | Packaging and CI | PARTIAL | `pyproject.toml`, Python 3.11–3.14 workflow with pinned action SHAs | Local wheel/install smoke check recorded earlier; workflow YAML parsed | GitHub CI has not run; non-3.14 matrix jobs unverified. |
-| Kali / Debian / Ubuntu compatibility | PARTIAL | Kali package inventory supported; Kali OSV explicitly unsupported; Debian/Ubuntu OSV paths exist | Current environment: Kali Linux, Python 3.14.7, APT 3.3.3; offline suite and local package scan | No current real Debian/Ubuntu guest. Do not infer distro compatibility from Kali or mocks. |
+| Kali primary target | IMPLEMENTED; UNIT TESTED; GUEST E2E BLOCKED | Kali `os-release` detection, `dpkg-query` inventory, diagnostics, Debian `.deb` inspection, ClamAV, APT hook and lifecycle code | Kali-specific unit coverage and the current offline suite; no real Kali APT transaction or privileged lifecycle evidence | Kali OSV assessment is explicitly unsupported: no Kali-specific authoritative provider or validated package/version mapping is configured. Do not apply Debian/Ubuntu advisory matches to Kali. |
 | Security review and release readiness | PARTIAL — NOT READY for general deployment | Reports document race and enforcement limitations; current APT integration remains experimental | Staged diff reviewed earlier; latest `git diff --check` passed | Complete threat/coverage review and VM tests. No publish or persistent security configuration before explicit authorization. |
 
-## Disposable APT environment blocker
+## Disposable Kali APT environment blocker
 
-The validation host has QEMU binaries but no Debian disk image, `/dev/kvm`,
-VirtualBox tooling/device, usable Docker daemon, `strace`, `cloud-localds`, or
-ISO builder. DNS for `cloud.debian.org` failed during the prior preparation
-attempt. A fresh check also found no image under `/tmp` or `/var/tmp`. Do not
-run the required transaction test on the primary Kali host. A Debian VM/snapshot
-or working image/network capability is required to clear this blocker.
+The primary host currently has QEMU and `qemu-img`, but no `/dev/kvm`, no Kali
+image in the checked temporary or conventional VM-image locations, and no
+VirtualBox, libvirt, VMware, or container guest frontend. Docker is installed
+but daemon access is denied. The main Kali system must not be used for
+installation tests. A disposable Kali VM/snapshot with hardware acceleration
+or equivalent ClamAV throughput is required. No image was downloaded during
+this work.
 
-## Next safe work
+## Remaining required verification
 
-1. Resolve availability of an isolated Debian VM or snapshot; run the README's
-   cancellation and approval transactions with marker, dpkg status and
-   execution-trace evidence. Until then, APT integration remains UNVERIFIED.
-2. Continue adversarial `.deb` archive/path/resource review and repository
-   wrapper bypass coverage before controlled use.
-3. Validate supported Debian and Ubuntu runtime behavior, including package
-   assessment and lifecycle operations, in disposable guests.
-4. Re-run the complete suite, compilation, diff checks and security review
-   after further code changes. Do not publish or enable persistent hooks.
+The only release-critical verification still blocked is running the five
+real-APT and lifecycle scenarios in disposable Kali snapshots. No additional
+implementation feature is required by the frozen Kali-first scope. Secondary
+Debian/Ubuntu compatibility must not be inferred from Kali tests, but is not a
+prerequisite for limited Kali use.
 
 ## Fresh-session revalidation (2026-10-29)
+
+## Final focused implementation update (2026-10-29)
+
+- [x] **UNIT TESTED — Approval terminal lifecycle fixed.** The hook opens and
+  retains `/dev/tty` before permanently dropping privileges to `_apt`, avoiding
+  an attempt to open the user's terminal after the drop. Terminal input is
+  bounded to 300 seconds; unavailable terminal, timeout, EOF, or malformed
+  input denies approval. Focused APT, malware and lifecycle tests passed:
+  **249 passed in 2.01s** across focused vulnerability, APT hook/CLI, lifecycle
+  and malware scanner selection.
+- [x] **UNIT TESTED — ClamAV timings added.** `--diagnostics --scan-deb`
+  reports package metadata, archive extraction and ClamAV durations, child CPU
+  time, the completed-child RSS high-water mark, scanner exit/timeout status,
+  and a bounded stderr excerpt on scanner errors. RSS is not a memory time
+  series. A failing diagnostics callback cannot change the scan result.
+- [x] **MEASURED LOCALLY — Harmless package scan.** On Kali, ClamAV completed a
+  harmless synthetic `.deb` scan with `no_detection`, complete malware
+  coverage, and process exit 1 because Kali vulnerability assessment is
+  unsupported. Package creation took 0.032s; scan total was 12.448s; ClamAV
+  took 12.413s wall and 12.383s CPU. The package was never installed.
+- [x] **MEASURED LOCALLY — ClamAV startup cost.** A separate empty-directory
+  scan took 11.892s wall and 11.875s CPU, returned 0, loaded ClamAV 1.4.6
+  signature database build 28165, and had child maximum RSS 989064 KiB. This
+  indicates substantial per-process engine/database initialization cost on
+  the host; it does not measure or resolve the earlier QEMU TCG multiplier.
+- [x] **SOURCE REVIEW — Kali vulnerability data.** Kali's official Package
+  Tracker provides package change/version information, not validated Kali
+  affected/fixed-version advisories for this inventory mapping. Kali's
+  rolling-vs-Debian data shows divergent package versions. Kali assessment
+  therefore remains explicitly UNSUPPORTED; Debian/Ubuntu results are not
+  relabeled as Kali findings.
+- [ ] **BLOCKED — Real Kali APT approval/cancellation/lifecycle.** No Kali guest
+  image or `/dev/kvm` is available, and Docker daemon access is denied. The
+  existing five guest scenarios were not run. No host APT settings or installed
+  packages were changed.
+- [ ] **BLOCKED — Prior TCG timeout root cause.** Local measurements establish
+  high ClamAV database/engine cost even on an empty directory, but without a
+  suitable accelerated Kali guest they cannot quantify the TCG multiplier or
+  establish whether the old guest's complete timeout was solely emulation.
+- [x] **FINAL LOCAL REGRESSION —** `.venv/bin/python -B -m pytest -q -p
+  no:cacheprovider` — **459 passed, 7 skipped in 24.45s**. The five real guest
+  tests and two opt-in live OSV tests did not run. Compilation, `pip check`,
+  staged/unstaged diff checks and workflow YAML parsing passed.
+- [x] **FINAL PACKAGING —** Current tracked source and existing working edits
+  were copied to a temporary build tree; wheel built successfully, installed
+  into a fresh temporary virtual environment, and installed CLI `--help` and
+  `pip check` passed. Wheel SHA-256:
+  `1b0101d12a072bc77c197a2c213c08eef11c707053e45895b80b3d5247bf74c0`.
+- [ ] **NOT RUN —** No live OSV requests and no GitHub Actions execution.
+  Actual Kali APT cancellation/approval/lifecycle transactions remain
+  unverified; no commit, push, package installation, or persistent host APT
+  modification occurred.
 
 - [x] **COMPLETE — Repository state re-inspected.** Branch remains
   `codex/linuxsecmonitor-completion`. Existing staged and unstaged project
@@ -333,6 +385,7 @@ ENVIRONMENT**. The safe next environment is a fresh Debian 12/Ubuntu VM with
 working KVM or a physical/hosted hardware-accelerated runner; restore a clean
 snapshot before each scenario and use the README harness commands.
 
+
 Final rerun after the follow-up edits: offline **453 passed, 7 skipped in
 17.87s**; live OSV-enabled **455 passed, 5 skipped in 20.97s**. Compilation,
 both diff checks, `pip check`, YAML parsing, and read-only host integration
@@ -350,3 +403,72 @@ Final verdict: **IMPLEMENTED — INTEGRATION TESTS STILL BLOCKED**. The APT hook
 and lifecycle have unit/process-level coverage, but the security-tested MVP
 definition is not met until separate real Debian cancellation and approval
 transactions complete with package-state and maintainer-script evidence.
+
+## Revalidation on 2026-10-29
+
+- **UNIT TESTED — Offline suite:** `.venv/bin/python -m pytest -q -p
+  no:cacheprovider` — **453 passed, 7 skipped in 22.20s**.
+- **BLOCKED BY ENVIRONMENT — Real guest scenarios:** the five tests in
+  `tests/integration/test_apt_preinstall_guest.py` were collected separately;
+  **5 skipped in 0.01s** because no explicit marked supported guest was
+  available. Cancellation, both approval cases, incomplete-scan denial, and
+  lifecycle recovery therefore have no new guest evidence.
+- **UNIT TESTED — Packaging and local checks:** a wheel built from a temporary
+  archive of the tracked tree (SHA-256
+  `ec630fd1e1acc2b193d85f940b4cb8a7361c93d33d0790b86e69f48370ed7fd4`),
+  installed into a fresh virtual environment, and passed CLI `--help` plus
+  `pip check`. The project venv also passed `pip check`; compileall, local
+  Actions YAML parsing, and staged/unstaged `git diff --check` exited 0.
+  Live OSV tests were not run because they make external requests; GitHub
+  Actions was not run.
+- **BLOCKED BY ENVIRONMENT — Guest and ClamAV:** this host has QEMU and
+  `qemu-img`, but no `/dev/kvm` and no Debian/Ubuntu image under `/tmp` or
+  `/var/tmp`; Docker daemon access is denied. QEMU TCG is available, and prior
+  guest evidence showed ClamAV using roughly one emulated CPU through the
+  bounded 120-second timeout. This round did not reproduce the guest scan, so
+  the exact share of ClamAV work versus emulation remains unmeasured. No image
+  was downloaded and no host APT/package state changed.
+- **Repository state:** branch `codex/linuxsecmonitor-completion`, HEAD
+  `ac139b0`; the working tree was clean before these documentation updates.
+  No commit, push, or release occurred.
+
+Readiness remains **IMPLEMENTED — INTEGRATION TESTS STILL BLOCKED**. Use five
+fresh guest snapshots with KVM or equivalent throughput, root access, the
+documented test prerequisites, and local evidence storage to complete the
+blocked checks.
+
+## Kali primary-target update (2026-10-29)
+
+- Kali is the primary supported platform for host information, installed
+  package inventory, `.deb` inspection, ClamAV assessment, diagnostics, and
+  the opt-in APT integration. These implementation paths have unit coverage;
+  no disposable Kali guest transaction or privileged lifecycle run is yet
+  **INTEGRATION TESTED** or **VERIFIED ON TARGET OS**.
+- The guest harness now accepts Kali, Debian, and Ubuntu. On Kali it records
+  and requires visible `unsupported` vulnerability status before approval.
+  This is deliberate: Kali package versions and identifiers have not been
+  validated against an authoritative Kali advisory source. Debian/Ubuntu OSV
+  results must not be applied to Kali.
+- **UNIT TESTED — Current run:** offline suite **453 passed, 7 skipped in
+  18.13s**; Kali-related inventory/diagnostics/assessment/CLI tests **227
+  passed in 19.75s**; the five real-APT scenarios were collected and **5
+  skipped in 0.03s** because no marked guest was available.
+- **PACKAGING CHECKED — Current tree:** wheel built and installed into a fresh
+  temporary virtual environment; CLI help and `pip check` passed (SHA-256
+  `10562038653e7a1fbe2570c8e98151599e3cba2be5963dff2fdcc5a2eaffa37d`).
+  Compileall, workflow YAML parsing, and diff checks passed. Live OSV was not
+  run; GitHub Actions was not run.
+- The host has QEMU and `qemu-img`, but no `/dev/kvm`, local Kali VM image, or
+  installed VM frontend. Docker daemon access is denied. QEMU TCG is available;
+  prior ClamAV evidence hit the bounded 120-second timeout under TCG. No image
+  download, host APT change, or package installation was attempted.
+- Minimum remaining setup: provide a disposable Kali guest/snapshot with root
+  access, working APT/dpkg, ClamAV and usable signatures, `strace`, Python 3.11+
+  with the project and pytest installed in a root-owned runtime, and a private
+  evidence directory. Use one clean snapshot per scenario and keep evidence
+  local. Hardware acceleration or equivalent ClamAV throughput is needed to
+  avoid repeating the known TCG timeout.
+- **Final status:** IMPLEMENTED and UNIT TESTED for available local coverage;
+  no feature is VERIFIED IN A DISPOSABLE KALI ENVIRONMENT or VERIFIED END TO
+  END. Kali vulnerability matching is UNSUPPORTED. Real Kali APT/lifecycle
+  verification is BLOCKED by the missing guest and acceleration resources.
