@@ -116,13 +116,14 @@ def scan_repository(repository_path: str | Path) -> RepositoryScanResult:
     explicit rather than presenting partial data as complete.
     """
     try:
-        root = Path(repository_path).expanduser().absolute()
-        display_path = str(root)
-        if _is_symlink_or_junction(root):
+        path = Path(repository_path).expanduser()
+        if _is_symlink_or_junction(path):
             return _failure(
-                display_path,
+                str(path),
                 "Repository path must not be a symbolic link or directory junction.",
             )
+        root = path.resolve(strict=False)
+        display_path = str(root)
         if not root.is_dir():
             return _failure(display_path, "Repository path is not a readable directory.")
     except (OSError, TypeError, ValueError) as exc:

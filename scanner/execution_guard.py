@@ -8,11 +8,13 @@ review, so this module must never describe its scan as a safety guarantee.
 from __future__ import annotations
 
 import os
+import select
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, Sequence, TextIO
+from typing import BinaryIO, Callable, Sequence, TextIO
 
+from .child_environment import build_child_environment
 from .repository_malware_scanner import scan_repository_malware
 from .repository_scanner import scan_repository
 from .repository_security_scanner import scan_repository_security
@@ -82,22 +84,53 @@ def review_repository_for_execution(
     }
 
 
-def confirm_execution(terminal: TextIO | None = None) -> bool:
+def confirm_execution(terminal: TextIO | BinaryIO | None = None) -> bool:
     """Require an exact interactive RUN confirmation; fail closed without a TTY."""
     opened = None
+    is_binary = False
     try:
         if terminal is None:
-            opened = open("/dev/tty", "r+", encoding="utf-8", errors="replace")
+            opened = open("/dev/tty", "r+b", buffering=0)
             terminal = opened
-        terminal.write("Review complete. Type exactly RUN to start the command: ")
+            is_binary = True
+        elif hasattr(terminal, "mode") and "b" in getattr(terminal, "mode", ""):
+            is_binary = True
+
+        prompt = "Review complete. Type exactly RUN to start the command: "
+        if is_binary:
+            terminal.write(prompt.encode("utf-8"))
+        else:
+            terminal.write(prompt)
         terminal.flush()
-        answer = terminal.readline()
+
+        try:
+            descriptor = terminal.fileno()
+        except (AttributeError, OSError, ValueError):
+            descriptor = None
+        if descriptor is not None:
+            try:
+                readable, _, _ = select.select([descriptor], [], [], 300)
+            except (OSError, ValueError):
+                return False
+            if not readable:
+                return False
+
+        if is_binary:
+            line = terminal.readline()
+            if not line:
+                return False
+            answer = line.decode("utf-8", errors="replace")
+        else:
+            answer = terminal.readline()
         return answer.removesuffix("\n").removesuffix("\r") == "RUN"
     except (OSError, EOFError, KeyboardInterrupt):
         return False
     finally:
         if opened is not None:
-            opened.close()
+            try:
+                opened.close()
+            except OSError:
+                pass
 
 
 def run_reviewed_command(
@@ -105,7 +138,7 @@ def run_reviewed_command(
     repository: str | Path,
     command: Sequence[str],
     *,
-    terminal: TextIO | None = None,
+    terminal: TextIO | BinaryIO | None = None,
     runner: Callable = subprocess.run,
     json_output: bool = False,
 ) -> int:
@@ -124,15 +157,24 @@ def run_reviewed_command(
         return 3
 
     try:
+        # Resolve the repository once so the child's cwd and the PWD in its
+        # policy-built environment describe the same verified directory.
+        resolved_repository = os.fspath(
+            Path(repository).expanduser().resolve(strict=True)
+        )
+        # Explicit allowlist environment: the reviewed command must never
+        # inherit the full parent environment (see scanner.child_environment).
+        child_env = build_child_environment(cwd=resolved_repository)
         output_streams = (
             {"stdout": sys.stderr, "stderr": sys.stderr}
             if json_output else {}
         )
         completed = runner(
             list(command),
-            cwd=os.fspath(Path(repository).expanduser().resolve(strict=True)),
+            cwd=resolved_repository,
             check=False,
             shell=False,
+            env=child_env,
             **output_streams,
         )
     except (OSError, RuntimeError, ValueError) as exc:

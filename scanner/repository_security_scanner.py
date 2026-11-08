@@ -34,10 +34,46 @@ _TOKEN_PATTERNS = (
     ("slack-token-like-value", re.compile(rb"\bxox[baprs]-[A-Za-z0-9-]{20,}\b")),
 )
 _RISKY_COMMAND_PATTERNS = (
+    # Remote code execution via download and pipe to shell
     ("download-piped-to-shell", re.compile(rb"(?im)\b(?:curl|wget)\b[^\r\n|]*\|\s*(?:sudo\s+)?(?:ba)?sh\b")),
+    # Encoded command decoding (base64, powershell encodedcommand)
     ("encoded-command-decoding", re.compile(rb"(?im)\b(?:base64\s+(?:--decode|-d)|powershell\s+[^\r\n]*-enc(?:odedcommand)?)\b")),
+    # Shell evaluation (eval, exec with shell)
     ("shell-evaluation", re.compile(rb"(?im)(?:\beval\s+\$\(|\beval\s+\"\$\(|\bexec\s*\(\s*['\"](?:sh|bash)\b)")),
-    ("privileged-or-destructive-command", re.compile(rb"(?im)(?:\bsudo\s+(?:rm|chmod|chown|dd)\b|\brm\s+-rf\s+/(?:\s|$)|\bchmod\s+[0-7]*[2467]55\b)")),
+    # Python dynamic execution (eval, exec, compile)
+    ("python-dynamic-execution", re.compile(rb"(?im)\b(?:eval|exec|compile)\s*\([^)]*[\"'][^\"']*[\"'][^)]*\)")),
+    # Nested shell execution (bash -c, sh -c, /bin/sh -c)
+    ("nested-shell-execution", re.compile(rb"(?im)\b(?:ba|z|k|da)?sh\s+-c\s+")),
+    # Remote execution via curl/wget with direct interpreter execution
+    ("remote-code-execution", re.compile(rb"(?im)\b(?:curl|wget)\b[^\r\n]*\|\s*(?:python[23]?|perl|ruby|php|node|deno|bash|sh|zsh|fish)\b")),
+    # Persistence: cron/crontab modifications
+    ("persistence-cron", re.compile(rb"(?im)(?:crontab\s+(?:-e|-l|-r)|echo\s+[^|]*\|\s+crontab\s+-|\b(?:/etc/cron(?:\.d|daily|hourly|weekly|monthly)/|/var/spool/cron/))")),
+    # Persistence: systemd service/timer creation
+    ("persistence-systemd", re.compile(rb"(?im)(?:systemctl\s+(?:enable|start|daemon-reload)|/etc/systemd/system/|/lib/systemd/system/|\.service\s+\[Service\]|\.timer\s+\[Timer\])")),
+    # Persistence: shell profile modifications
+    ("persistence-shell-profile", re.compile(rb"(?im)(?:echo\s+[^|]*\|\s*tee\s+-a\s+(?:~?/?(?:\.bashrc|\.bash_profile|\.profile|\.zshrc|\.zprofile)|\$\{HOME\}/(?:\.bashrc|\.bash_profile|\.profile|\.zshrc|\.zprofile)))")),
+    # Persistence: SSH authorized_keys modifications
+    ("persistence-ssh-keys", re.compile(rb"(?im)(?:echo\s+[^|]*\|\s*tee\s+-a\s+(?:~?/?\.ssh/authorized_keys|\$\{HOME\}/\.ssh/authorized_keys)|ssh-copy-id)")),
+    # Credential theft: SSH private keys
+    ("credential-theft-ssh-keys", re.compile(rb"(?im)(?:cat|cp|scp|rsync)\b[^\r\n]*(?:~?/?\.ssh/(?:id_(?:rsa|dsa|ecdsa|ed25519)|known_hosts))")),
+    # Credential theft: browser credentials
+    ("credential-theft-browser", re.compile(rb"(?im)(?:sqlite3|cat|cp)\b[^\r\n]*(?:~?/?(?:\.mozilla|google-chrome|chromium|firefox|brave)/[^/]*(?:logins|signons|key4)\.db|Login\s*Data|Web\s*Data)")),
+    # Credential theft: environment tokens/secrets
+    ("credential-theft-env-secrets", re.compile(rb"(?im)(?:echo|printf|cat|env)\b[^\r\n]*(?:AWS|GITHUB|GITLAB|DOCKER|NPM|PYPI|HEROKU|AZURE|GCLOUD|KUBECONFIG|SSH|JWT|TOKEN|SECRET|PASSWORD|API_KEY)\b")),
+    # Destructive behavior: recursive deletion
+    ("destructive-recursive-deletion", re.compile(rb"(?im)\brm\s+-(?:r|R)(?:f|F)?\s+/")),
+    # Destructive behavior: disk/device overwrite
+    ("destructive-disk-overwrite", re.compile(rb"(?im)(?:dd\s+(?:if|of)=/(?:dev|proc)|mkfs|fdisk|parted|shred|wipefs)")),
+    # Obfuscation: base64 decode followed by execution
+    ("obfuscation-base64-exec", re.compile(rb"(?im)(?:base64\s+(?:--decode|-d)\s*\|\s*(?:ba|z|k|da)?sh|python[23]?|perl|ruby|php|node)")),
+    # Obfuscation: encoded payloads (hex, octal, escaped)
+    ("obfuscation-encoded-payload", re.compile(rb"(?im)(?:\\\\x[0-9a-f]{2}|\\\\u[0-9a-f]{4}|\\\\o[0-7]{3}){4,}")),
+    # Supply-chain: suspicious install hooks (pip, npm, cargo, etc.)
+    ("supply-chain-install-hooks", re.compile(rb"(?im)(?:pip\s+install|npm\s+install|yarn\s+add|cargo\s+add|composer\s+require|go\s+get)\b[^\r\n]*@")),
+    # Supply-chain: remote dependency execution
+    ("supply-chain-remote-dep", re.compile(rb"(?im)(?:git\+|https?://|ssh://)\S+(?:#|@)")),
+    # Privileged commands: sudo with sensitive operations
+    ("privileged-sensitive-command", re.compile(rb"(?im)(?:sudo\s+(?:cp|mv|chmod|chown|chgrp|mount|umount|iptables|ufw|firewall-cmd|systemctl|service|passwd|useradd|usermod|groupadd|groupmod))")),
 )
 _LIFECYCLE_KEYS = ("preinstall", "install", "postinstall", "prepare")
 _EXECUTION_FILES = {"setup.py", "makefile", "dockerfile", "build.rs"}
@@ -715,16 +751,13 @@ def scan_repository_security(
                                 result.limitations.append("Git configuration includes are not resolved and may change the active hook path.")
                             if malformed_config:
                                 result.limitations.append("Git configuration contains malformed or unsupported syntax; effective hook settings could not be fully reviewed.")
-                        if config_missing:
-                            result.limitations.append("The local Git configuration is missing; effective hook settings could not be fully reviewed.")
+                            if config_missing:
+                                result.note += " The local Git configuration is missing; effective hook settings could not be fully reviewed."
 
                         # System/global configuration and Git configuration
                         # environment overrides can also redirect hook lookup.
                         # Do not invoke Git or resolve untrusted include paths.
-                        _add_once(
-                            result.limitations,
-                            "System, global, and environment Git configuration is not resolved; alternate hook locations may be active.",
-                        )
+                        result.note += " System, global, and environment Git configuration is not resolved; alternate hook locations may be active."
 
                         hooks_info = None
                         try:

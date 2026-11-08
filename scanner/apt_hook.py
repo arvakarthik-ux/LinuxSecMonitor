@@ -588,23 +588,30 @@ def _scan_with_trusted_path(
             os.environ["PATH"] = original_path
 
 
-def _prompt_for_detection(terminal: TextIO | None = None) -> bool:
+def _prompt_for_detection(terminal: TextIO | BinaryIO | None = None) -> bool:
     """Require exact interactive approval before APT may continue."""
     opened = None
+    is_binary = False
     try:
         if terminal is _NO_APPROVAL_TERMINAL:
             return False
         if terminal is None:
-            opened = open("/dev/tty", "r+", encoding="utf-8", errors="replace")
+            opened = open("/dev/tty", "r+b", buffering=0)
             terminal = opened
-        terminal.write(
+            is_binary = True
+        elif hasattr(terminal, "mode") and "b" in getattr(terminal, "mode", ""):
+            is_binary = True
+
+        prompt = (
             "APT transaction review is complete. Type exactly INSTALL to "
             "continue; anything else aborts: "
         )
+        if is_binary:
+            terminal.write(prompt.encode("utf-8"))
+        else:
+            terminal.write(prompt)
         terminal.flush()
-        # Real terminal input must be bounded: EOF, no controlling terminal,
-        # and an unattended prompt all fail closed. Test doubles without a
-        # selectable file descriptor retain their simple synchronous behavior.
+
         try:
             descriptor = terminal.fileno()
         except (AttributeError, OSError, ValueError):
@@ -618,19 +625,29 @@ def _prompt_for_detection(terminal: TextIO | None = None) -> bool:
                 return False
             if not readable:
                 return False
-        answer = terminal.readline()
+
+        if is_binary:
+            line = terminal.readline()
+            if not line:
+                return False
+            answer = line.decode("utf-8", errors="replace")
+        else:
+            answer = terminal.readline()
         return answer.removesuffix("\n").removesuffix("\r") == "INSTALL"
     except (OSError, EOFError, KeyboardInterrupt):
         return False
     finally:
         if opened is not None:
-            opened.close()
+            try:
+                opened.close()
+            except OSError:
+                pass
 
 
 def run_apt_preinstall_hook(
     *,
     stream: BinaryIO | None = None,
-    terminal: TextIO | None = None,
+    terminal: TextIO | BinaryIO | None = None,
     scanner: Callable[[Path], MalwareAssessment] = scan_deb,
     output: TextIO | None = None,
 ) -> int:
@@ -728,17 +745,6 @@ def run_apt_preinstall_hook(
                 action, None, None,
                 f"Archive validation raised {type(exc).__name__}: {exc}",
             ))
-
-    # Open the controlling terminal while the hook still has its original
-    # credentials. The hook later drops permanently to _apt to inspect package
-    # data; opening /dev/tty after that transition may fail for the caller.
-    owns_terminal = False
-    if terminal is None and any(path is not None for _, path, _, _ in pending):
-        try:
-            terminal = open("/dev/tty", "r+", encoding="utf-8", errors="replace")
-            owns_terminal = True
-        except OSError:
-            terminal = _NO_APPROVAL_TERMINAL
 
     if any(path is not None for _, path, _, _ in pending):
         try:
@@ -890,6 +896,22 @@ def run_apt_preinstall_hook(
             "Maintainer-script review lead(s) require explicit approval before APT continues.",
             file=output_stream,
         )
+
+    # Open the controlling terminal after privilege drop, as _apt user.
+    # This ensures the terminal is never held with root privileges.
+    owns_terminal = False
+    if terminal is None and any(
+        result.get("status") in {"detected", "no_detection"}
+        and result.get("coverage_complete") is True
+        and unchanged
+        for _, result, unchanged in results
+    ):
+        try:
+            terminal = open("/dev/tty", "r+b", buffering=0)
+            owns_terminal = True
+        except OSError:
+            terminal = _NO_APPROVAL_TERMINAL
+
     approved = _prompt_for_detection(terminal)
     if owns_terminal and hasattr(terminal, "close"):
         try:

@@ -82,6 +82,41 @@ class _Terminal:
         return self.answer
 
 
+class _BinaryTerminal:
+    """Binary unbuffered terminal double for testing non-seekable I/O."""
+    def __init__(self, answer: bytes):
+        self.answer = answer
+        self.output = b""
+        self._closed = False
+
+    def write(self, value: bytes) -> int:
+        self.output += value
+        return len(value)
+
+    def flush(self) -> None:
+        return None
+
+    def readline(self) -> bytes:
+        return self.answer
+
+    def close(self) -> None:
+        self._closed = True
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def mode(self) -> str:
+        return "r+b"
+
+
+class _SelectableBinaryTerminal(_BinaryTerminal):
+    """Binary terminal with a selectable file descriptor for timeout testing."""
+    def fileno(self) -> int:
+        return 42
+
+
 def _install_path_validation(monkeypatch, *, changed=False):
     identity = apt_hook._FileIdentity(1, 2, 3, 4, 5)
     identity_checks = 0
@@ -448,7 +483,7 @@ def test_prompt_fails_closed_when_terminal_approval_times_out(monkeypatch):
     assert calls == [apt_hook.APPROVAL_TIMEOUT_SECONDS]
 
 
-def test_hook_opens_terminal_before_dropping_privileges(monkeypatch):
+def test_hook_opens_terminal_after_dropping_privileges(monkeypatch):
     _install_path_validation(monkeypatch)
     monkeypatch.delenv("APT_HOOK_INFO_FD", raising=False)
     events = []
@@ -470,7 +505,7 @@ def test_hook_opens_terminal_before_dropping_privileges(monkeypatch):
         output=output,
     )
     assert result == 0
-    assert events == ["open", "drop", "scan", "prompt"]
+    assert events == ["drop", "scan", "open", "prompt"]
 
 
 def test_prompt_cancels_when_user_interrupts():
@@ -485,6 +520,197 @@ def test_prompt_cancels_when_user_interrupts():
             raise KeyboardInterrupt
 
     assert apt_hook._prompt_for_detection(InterruptedTerminal()) is False
+
+
+def test_prompt_for_detection_binary_terminal_success():
+    """Test successful INSTALL approval with binary unbuffered terminal."""
+    terminal = _BinaryTerminal(b"INSTALL\n")
+    assert apt_hook._prompt_for_detection(terminal) is True
+    assert b"INSTALL to continue" in terminal.output
+
+
+def test_prompt_for_detection_binary_terminal_rejects_lowercase():
+    """Test that lowercase 'install' is rejected with binary terminal."""
+    terminal = _BinaryTerminal(b"install\n")
+    assert apt_hook._prompt_for_detection(terminal) is False
+
+
+def test_prompt_for_detection_binary_terminal_rejects_trailing_space():
+    """Test that 'INSTALL ' with trailing space is rejected with binary terminal."""
+    terminal = _BinaryTerminal(b"INSTALL \n")
+    assert apt_hook._prompt_for_detection(terminal) is False
+
+
+def test_prompt_for_detection_binary_terminal_rejects_empty():
+    """Test that empty input is rejected with binary terminal."""
+    terminal = _BinaryTerminal(b"\n")
+    assert apt_hook._prompt_for_detection(terminal) is False
+
+
+def test_prompt_for_detection_binary_terminal_eof():
+    """Test that EOF is rejected with binary terminal."""
+    terminal = _BinaryTerminal(b"")
+    assert apt_hook._prompt_for_detection(terminal) is False
+
+
+def test_prompt_for_detection_binary_terminal_timeout(monkeypatch):
+    """Test that binary terminal times out correctly."""
+    terminal = _SelectableBinaryTerminal(b"INSTALL\n")
+    calls = []
+    monkeypatch.setattr(
+        apt_hook.select, "select",
+        lambda readers, writers, errors, timeout: (calls.append(timeout) or ([], [], [])),
+    )
+    assert apt_hook._prompt_for_detection(terminal) is False
+    assert calls == [apt_hook.APPROVAL_TIMEOUT_SECONDS]
+
+
+def test_prompt_for_detection_binary_terminal_no_fileno():
+    """Test binary terminal without fileno falls back to synchronous read."""
+    class NoFilenoBinaryTerminal(_BinaryTerminal):
+        def fileno(self):
+            raise OSError("no fileno")
+
+    terminal = NoFilenoBinaryTerminal(b"INSTALL\n")
+    assert apt_hook._prompt_for_detection(terminal) is True
+
+
+def test_prompt_for_detection_binary_terminal_keyboard_interrupt():
+    """Test that KeyboardInterrupt is handled with binary terminal."""
+    class InterruptedBinaryTerminal(_BinaryTerminal):
+        def readline(self):
+            raise KeyboardInterrupt
+
+    assert apt_hook._prompt_for_detection(InterruptedBinaryTerminal(b"")) is False
+
+
+def test_prompt_for_detection_binary_terminal_cleanup_on_error(monkeypatch):
+    """Test terminal cleanup when an error occurs during prompt."""
+    class ErrorBinaryTerminal(_BinaryTerminal):
+        def write(self, value):
+            raise OSError("write failed")
+
+    terminal = ErrorBinaryTerminal(b"INSTALL\n")
+    assert apt_hook._prompt_for_detection(terminal) is False
+
+
+def test_run_hook_with_binary_terminal_success(monkeypatch):
+    """Test full hook run with binary terminal approval."""
+    _install_path_validation(monkeypatch)
+    monkeypatch.delenv("APT_HOOK_INFO_FD", raising=False)
+    terminal = _BinaryTerminal(b"INSTALL\n")
+    output = StringIO()
+    code = apt_hook.run_apt_preinstall_hook(
+        stream=BytesIO(_protocol(_install_record("/cache/demo.deb"))),
+        terminal=terminal,
+        scanner=lambda _path: _assessment(),
+        output=output,
+    )
+    assert code == 0
+    assert "Explicit INSTALL approval received" in output.getvalue()
+    assert terminal.closed is False  # hook doesn't close passed-in terminal
+
+
+def test_run_hook_with_binary_terminal_rejection(monkeypatch):
+    """Test full hook run with binary terminal rejection."""
+    _install_path_validation(monkeypatch)
+    monkeypatch.delenv("APT_HOOK_INFO_FD", raising=False)
+    terminal = _BinaryTerminal(b"no\n")
+    output = StringIO()
+    code = apt_hook.run_apt_preinstall_hook(
+        stream=BytesIO(_protocol(_install_record("/cache/demo.deb"))),
+        terminal=terminal,
+        scanner=lambda _path: _assessment(),
+        output=output,
+    )
+    assert code == 1
+    assert "explicit terminal approval was not received" in output.getvalue()
+
+
+def test_run_hook_opens_binary_terminal_after_privilege_drop(monkeypatch):
+    """Test that hook opens binary terminal after dropping privileges."""
+    _install_path_validation(monkeypatch)
+    monkeypatch.delenv("APT_HOOK_INFO_FD", raising=False)
+    events = []
+    opened_terminals = []
+
+    def mock_open(path, mode, buffering=None, **kwargs):
+        events.append(f"open:{path}:{mode}:{buffering}")
+        terminal = _BinaryTerminal(b"INSTALL\n")
+        opened_terminals.append(terminal)
+        return terminal
+
+    monkeypatch.setattr(apt_hook, "open", mock_open, raising=False)
+    monkeypatch.setattr(apt_hook, "_drop_to_apt_sandbox_user", lambda: events.append("drop"))
+    monkeypatch.setattr(
+        apt_hook, "_prompt_for_detection",
+        lambda selected: (events.append("prompt") or True),
+    )
+    output = StringIO()
+    result = apt_hook.run_apt_preinstall_hook(
+        stream=BytesIO(_protocol(_install_record("/cache/demo.deb"))),
+        scanner=lambda _path: (events.append("scan") or _assessment()),
+        output=output,
+    )
+    assert result == 0
+    assert events[0] == "drop"
+    assert events[1] == "scan"
+    assert any(e.startswith("open:/dev/tty:r+b:0") for e in events)
+    assert "prompt" in events
+    # Verify the opened terminal was closed
+    assert opened_terminals[0].closed is True
+
+
+def test_run_hook_binary_terminal_cleanup_on_prompt_failure(monkeypatch):
+    """Test that binary terminal is closed even when prompt fails."""
+    _install_path_validation(monkeypatch)
+    monkeypatch.delenv("APT_HOOK_INFO_FD", raising=False)
+    events = []
+    opened_terminals = []
+
+    def mock_open(path, mode, buffering=None, **kwargs):
+        events.append(f"open:{path}:{mode}:{buffering}")
+        terminal = _BinaryTerminal(b"no\n")
+        opened_terminals.append(terminal)
+        return terminal
+
+    monkeypatch.setattr(apt_hook, "open", mock_open, raising=False)
+    monkeypatch.setattr(apt_hook, "_drop_to_apt_sandbox_user", lambda: events.append("drop"))
+    output = StringIO()
+    result = apt_hook.run_apt_preinstall_hook(
+        stream=BytesIO(_protocol(_install_record("/cache/demo.deb"))),
+        scanner=lambda _path: (events.append("scan") or _assessment()),
+        output=output,
+    )
+    assert result == 1
+    assert opened_terminals[0].closed is True
+
+
+def test_privilege_drop_before_terminal_open(monkeypatch):
+    """Test that privilege drop occurs before terminal is opened."""
+    _install_path_validation(monkeypatch)
+    monkeypatch.delenv("APT_HOOK_INFO_FD", raising=False)
+    events = []
+
+    def mock_open(path, mode, buffering=None, **kwargs):
+        events.append(f"open:{path}")
+        return _BinaryTerminal(b"INSTALL\n")
+
+    monkeypatch.setattr(apt_hook, "open", mock_open, raising=False)
+    monkeypatch.setattr(
+        apt_hook, "_drop_to_apt_sandbox_user",
+        lambda: events.append("drop"),
+    )
+    output = StringIO()
+    apt_hook.run_apt_preinstall_hook(
+        stream=BytesIO(_protocol(_install_record("/cache/demo.deb"))),
+        scanner=lambda _path: (events.append("scan") or _assessment()),
+        output=output,
+    )
+    # drop should happen before open
+    drop_idx = events.index("drop")
+    open_idx = next(i for i, e in enumerate(events) if e.startswith("open:"))
+    assert drop_idx < open_idx
 
 
 @pytest.mark.parametrize("status", ["incomplete", "error", "unavailable"])

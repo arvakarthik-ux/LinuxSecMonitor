@@ -152,6 +152,169 @@ def test_safe_run_rejects_report_path_inside_repository(tmp_path):
     ], stdout=StringIO()) == 2
 
 
+def test_safe_run_cli_blocks_on_incomplete_scan(tmp_path, monkeypatch):
+    """Test that --safe-run blocks when scan is incomplete."""
+    monkeypatch.setattr(
+        main,
+        "review_repository_for_execution",
+        lambda *a, **k: {
+            "review_status": "blocked_incomplete",
+            "coverage_complete": False,
+            "command_status": "not_started",
+            "command_returncode": None,
+            "inventory": {},
+            "malware_assessment": {"status": "incomplete", "coverage_complete": False},
+            "repository_security_assessment": {"status": "completed", "coverage_complete": True},
+            "limitations": ["Incomplete scan"],
+        },
+    )
+    monkeypatch.setattr(main, "_render_safe_run_text", lambda result: "review preview")
+
+    exit_code = main.main([
+        "--safe-run", str(tmp_path), "--",
+        "true",
+    ], stdout=StringIO())
+
+    assert exit_code == 1
+
+
+def test_safe_run_cli_blocks_on_malware_detection(tmp_path, monkeypatch):
+    """Test that --safe-run blocks when malware is detected."""
+    monkeypatch.setattr(
+        main,
+        "review_repository_for_execution",
+        lambda *a, **k: {
+            "review_status": "blocked_detection",
+            "coverage_complete": True,
+            "command_status": "not_started",
+            "command_returncode": None,
+            "inventory": {},
+            "malware_assessment": {"status": "detected", "coverage_complete": True, "detections": [{"name": "Test", "path": "file"}]},
+            "repository_security_assessment": {"status": "completed", "coverage_complete": True},
+            "limitations": [],
+        },
+    )
+    monkeypatch.setattr(main, "_render_safe_run_text", lambda result: "review preview")
+
+    exit_code = main.main([
+        "--safe-run", str(tmp_path), "--",
+        "true",
+    ], stdout=StringIO())
+
+    assert exit_code == 1
+
+
+def test_safe_run_cli_cancellation_returns_three(tmp_path, monkeypatch):
+    """Test that --safe-run returns 3 on CANCEL."""
+    monkeypatch.setattr(
+        main,
+        "review_repository_for_execution",
+        lambda *a, **k: {
+            "review_status": "review_complete",
+            "coverage_complete": True,
+            "command_status": "not_started",
+            "command_returncode": None,
+            "inventory": {},
+            "malware_assessment": {"status": "no_detection", "coverage_complete": True},
+            "repository_security_assessment": {"status": "completed", "coverage_complete": True},
+            "limitations": [],
+        },
+    )
+    monkeypatch.setattr(main, "_render_safe_run_text", lambda result: "review preview")
+
+    def cancelled_runner(result, repository, command, *, json_output=False):
+        result["command_status"] = "cancelled"
+        result["command_returncode"] = None
+        return 3
+
+    monkeypatch.setattr(main, "run_reviewed_command", cancelled_runner)
+
+    exit_code = main.main([
+        "--safe-run", str(tmp_path), "--",
+        "true",
+    ], stdout=StringIO())
+
+    assert exit_code == 3
+
+
+def test_safe_run_cli_json_output_includes_command_outcome(tmp_path, monkeypatch):
+    """Test that --safe-run --json outputs full report including command outcome."""
+    seen = {}
+    monkeypatch.setattr(
+        main,
+        "review_repository_for_execution",
+        lambda *a, **k: {
+            "review_status": "review_complete",
+            "coverage_complete": True,
+            "command_status": "not_started",
+            "command_returncode": None,
+            "inventory": {},
+            "malware_assessment": {"status": "no_detection", "coverage_complete": True},
+            "repository_security_assessment": {"status": "completed", "coverage_complete": True},
+            "limitations": [],
+        },
+    )
+    monkeypatch.setattr(main, "_render_safe_run_text", lambda result: "review preview")
+
+    def approve(result, repository, command, *, json_output=False):
+        seen["json_output"] = json_output
+        result["command_status"] = "completed"
+        result["command_returncode"] = 0
+        return 0
+
+    monkeypatch.setattr(main, "run_reviewed_command", approve)
+    output = StringIO()
+
+    exit_code = main.main([
+        "--safe-run", str(tmp_path), "--json", "--",
+        "tool", "arg",
+    ], stdout=output)
+
+    assert exit_code == 0
+    assert seen["json_output"] is True
+    serialized = json.loads(output.getvalue())
+    assert serialized["command_status"] == "completed"
+    assert serialized["command_returncode"] == 0
+
+
+def test_safe_run_cli_output_write_failure_returns_two(tmp_path, monkeypatch):
+    """Test that --safe-run --output returns 2 on write failure."""
+    monkeypatch.setattr(
+        main,
+        "review_repository_for_execution",
+        lambda *a, **k: {
+            "review_status": "review_complete",
+            "coverage_complete": True,
+            "command_status": "not_started",
+            "command_returncode": None,
+            "inventory": {},
+            "malware_assessment": {"status": "no_detection", "coverage_complete": True},
+            "repository_security_assessment": {"status": "completed", "coverage_complete": True},
+            "limitations": [],
+        },
+    )
+    monkeypatch.setattr(main, "_render_safe_run_text", lambda result: "review preview")
+
+    def approve(result, repository, command, *, json_output=False):
+        result["command_status"] = "completed"
+        result["command_returncode"] = 0
+        return 0
+
+    monkeypatch.setattr(main, "run_reviewed_command", approve)
+    monkeypatch.setattr(
+        main.Path,
+        "write_text",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("mocked disk full")),
+    )
+
+    exit_code = main.main([
+        "--safe-run", str(tmp_path), "--json", "--output", str(tmp_path / "report.json"),
+        "--", "true",
+    ], stdout=StringIO())
+
+    assert exit_code == 2
+
+
 @pytest.mark.parametrize(
     "args",
     [["--apt-preinstall-hook", "--json"], ["--apt-preinstall-hook", "--diagnostics"],
@@ -1073,6 +1236,186 @@ def test_scan_repo_cli_reports_missing_path_in_text(tmp_path):
     assert exit_code == 1
     assert "Status: error" in output.getvalue()
     assert "not a readable directory" in output.getvalue()
+
+
+def test_review_repository_cli_runs_all_three_scanners(tmp_path, monkeypatch):
+    """Test that --review-repository runs inventory, malware, and security scanners."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "README.md").write_text("# Test\n")
+    (root / ".git").mkdir()
+    (root / ".git" / "config").write_text("[core]\n")
+
+    monkeypatch.setattr(
+        main,
+        "scan_repository_malware",
+        lambda path: RepositoryMalwareAssessment(
+            status="no_detection", scanner="ClamAV clamscan",
+            repository_path=str(path), files_scanned=1, bytes_scanned=10,
+            coverage_complete=True,
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "scan_repository_security",
+        lambda path, include_generated: RepositorySecurityAssessment(
+            status="completed", repository_path=str(path),
+            files_inspected=1, bytes_inspected=10, coverage_complete=True,
+        ),
+    )
+    output = StringIO()
+
+    exit_code = main.main(["--review-repository", str(root)], stdout=output)
+
+    assert exit_code == 0
+    report = output.getvalue()
+    assert "repository inventory" in report
+    assert "Repository malware assessment:" in report
+    assert "Repository static security review:" in report
+    assert "Status: no_detection" in report
+    assert "Review findings: None reported" in report
+
+
+def test_review_repository_cli_json_output(tmp_path, monkeypatch):
+    """Test that --review-repository --json outputs structured JSON."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname='demo'\n")
+    (root / ".git").mkdir()
+    (root / ".git" / "config").write_text("[core]\n")
+
+    monkeypatch.setattr(
+        main,
+        "scan_repository_malware",
+        lambda path: RepositoryMalwareAssessment(
+            status="no_detection", repository_path=str(path),
+            files_scanned=1, bytes_scanned=12, coverage_complete=True,
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "scan_repository_security",
+        lambda path, include_generated: RepositorySecurityAssessment(
+            status="completed", repository_path=str(path),
+            files_inspected=1, bytes_inspected=12, coverage_complete=True,
+        ),
+    )
+
+    exit_code = main.main(["--review-repository", str(root), "--json"], stdout=StringIO())
+
+    assert exit_code == 0
+
+
+def test_review_repository_cli_text_output_includes_assessments(tmp_path, monkeypatch):
+    """Test that --review-repository outputs text with all three assessments."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "README.md").write_text("# Test\n")
+    (root / ".git").mkdir()
+    (root / ".git" / "config").write_text("[core]\n")
+
+    monkeypatch.setattr(
+        main,
+        "scan_repository_malware",
+        lambda path: RepositoryMalwareAssessment(
+            status="no_detection", scanner="ClamAV clamscan",
+            repository_path=str(path), files_scanned=1, bytes_scanned=10,
+            coverage_complete=True,
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "scan_repository_security",
+        lambda path, include_generated: RepositorySecurityAssessment(
+            status="completed", repository_path=str(path),
+            files_inspected=1, bytes_inspected=10, coverage_complete=True,
+        ),
+    )
+    output = StringIO()
+
+    exit_code = main.main(["--review-repository", str(root)], stdout=output)
+
+    assert exit_code == 0
+    report = output.getvalue()
+    assert "Repository:" in report
+    assert "Files observed:" in report
+    assert "Repository malware assessment:" in report
+    assert "Repository static security review:" in report
+
+
+def test_review_repository_cli_json_output_file(tmp_path, monkeypatch):
+    """Test that --review-repository --json --output writes JSON to file."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "go.mod").write_text("module example\n")
+    (root / ".git").mkdir()
+    (root / ".git" / "config").write_text("[core]\n")
+    report_path = tmp_path / "review.json"
+
+    monkeypatch.setattr(
+        main,
+        "scan_repository_malware",
+        lambda path: RepositoryMalwareAssessment(
+            status="no_detection", repository_path=str(path),
+            files_scanned=1, bytes_scanned=12, coverage_complete=True,
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "scan_repository_security",
+        lambda path, include_generated: RepositorySecurityAssessment(
+            status="completed", repository_path=str(path),
+            files_inspected=1, bytes_inspected=12, coverage_complete=True,
+        ),
+    )
+
+    exit_code = main.main([
+        "--review-repository", str(root), "--json", "--output", str(report_path),
+    ], stdout=StringIO())
+
+    assert exit_code == 0
+    assert report_path.exists()
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "completed"
+    assert report["coverage_complete"] is True
+    assert report["files_scanned"] == 1
+    assert "manifests" in report
+    assert report["malware_assessment"]["status"] == "no_detection"
+    assert report["malware_assessment"]["coverage_complete"] is True
+    assert report["repository_security_assessment"]["status"] == "completed"
+    assert "vulnerability_assessment" not in report
+
+
+def test_review_repository_cli_validates_path_rejects_symlink(tmp_path, monkeypatch):
+    """Test that --review-repository rejects symlinks."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "README.md").write_text("# Test\n")
+    (root / ".git").mkdir()
+    (root / ".git" / "config").write_text("[core]\n")
+    symlink = tmp_path / "symlink_repo"
+    try:
+        symlink.symlink_to(root)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlink creation not supported")
+
+    output = StringIO()
+    exit_code = main.main(["--review-repository", str(symlink)], stdout=output)
+
+    assert exit_code == 1
+    assert "symbolic link" in output.getvalue() or "directory junction" in output.getvalue()
+
+
+def test_review_repository_cli_validates_path_rejects_non_directory(tmp_path):
+    """Test that --review-repository rejects non-directories."""
+    file_path = tmp_path / "not_a_dir.txt"
+    file_path.write_text("not a directory")
+
+    output = StringIO()
+    exit_code = main.main(["--review-repository", str(file_path)], stdout=output)
+
+    assert exit_code == 1
+    assert "not a readable directory" in output.getvalue() or "not a real directory" in output.getvalue()
 
 
 def test_repository_text_escapes_untrusted_manifest_path_controls():

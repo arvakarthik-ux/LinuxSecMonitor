@@ -250,7 +250,7 @@ def _run_apt_with_decision(
 ) -> tuple[int, bytes, bool, bool]:
     command = [
         str(_STRACE), "-f", "-qq", "-e", "trace=execve", "-o", str(trace), "--",
-        str(_APT), "-y", "--no-download", "--no-remove", "install", str(package),
+        str(_APT), "-y", "--no-remove", "install", str(package),
     ]
     pid, terminal_fd = pty.fork()
     if pid == 0:

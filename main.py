@@ -811,12 +811,11 @@ def _run_safe_repository_command(
     preview_stream.write(preview)
     preview_stream.flush()
 
-    if report.get("coverage_complete") is True:
-        command_exit = run_reviewed_command(
-            report, repository, command, json_output=json_output,
-        )
-    else:
-        command_exit = 1
+    # Always call run_reviewed_command so it updates the report with the
+    # correct command_status (blocked_incomplete, blocked_detection, cancelled, etc.)
+    command_exit = run_reviewed_command(
+        report, repository, command, json_output=json_output,
+    )
 
     if json_output:
         rendered = json.dumps(report, indent=2) + "\n"
@@ -1301,6 +1300,48 @@ def _finish_preinstall_report(
     return exit_code
 
 
+def _run_review_repository(
+    repository: Path,
+    *,
+    json_output: bool,
+    output_path: Path | None,
+    include_generated: bool,
+    stdout: TextIO,
+) -> int:
+    """Review a repository and report findings without gating execution."""
+    result = scan_repository(repository).to_dict()
+    assessment = scan_repository_malware(repository).to_dict()
+    security_assessment = scan_repository_security(
+        repository, include_generated=include_generated,
+    ).to_dict()
+    result["malware_assessment"] = assessment
+    result["repository_security_assessment"] = security_assessment
+    rendered = (
+        json.dumps(result, indent=2) + "\n"
+        if json_output else (
+            _render_repository_text(result) + "\n"
+            + _render_repository_malware_text(assessment) + "\n"
+            + _render_repository_security_text(security_assessment) + "\n"
+        )
+    )
+    if output_path:
+        try:
+            output_path.write_text(rendered, encoding="utf-8")
+        except OSError as exc:
+            print(f"Could not write JSON output: {exc}", file=sys.stderr)
+            return 2
+    else:
+        stdout.write(rendered)
+    return 0 if (
+        result.get("coverage_complete") is True
+        and assessment.get("status") == "no_detection"
+        and assessment.get("coverage_complete") is True
+        and security_assessment.get("status") == "completed"
+        and security_assessment.get("coverage_complete") is True
+        and not security_assessment.get("findings")
+    ) else 1
+
+
 def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
     """Run the CLI and return a process exit status."""
     parser = argparse.ArgumentParser(description="Collect basic Linux system and package inventory data.")
@@ -1325,6 +1366,10 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
     parser.add_argument(
         "--scan-repo", type=Path, metavar="REPOSITORY",
         help="Inventory a repository, scan staged files with ClamAV, and run bounded static checks.",
+    )
+    parser.add_argument(
+        "--review-repository", type=Path, metavar="REPOSITORY",
+        help="Review a repository (inventory, malware scan, static security) and report findings without gating execution.",
     )
     parser.add_argument(
         "--safe-run", type=Path, metavar="REPOSITORY",
@@ -1354,8 +1399,8 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
         parser.error("--output requires --json")
     if args.apt_integration and (args.output or args.diagnostics):
         parser.error("--apt-integration supports standard output only; --output and --diagnostics are not applicable")
-    if args.include_generated and not (args.scan_repo or args.safe_run):
-        parser.error("--include-generated requires --scan-repo or --safe-run")
+    if args.include_generated and not (args.scan_repo or args.review_repository or args.safe_run):
+        parser.error("--include-generated requires --scan-repo, --review-repository, or --safe-run")
     if args.command_args and not args.safe_run:
         parser.error("a command after -- requires --safe-run")
     safe_command = args.command_args
@@ -1363,11 +1408,11 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
         safe_command = safe_command[1:]
     selected_modes = sum(bool(mode) for mode in (
         args.scan_deb, args.preinstall_deb, args.apt_preinstall_hook,
-        args.scan_repo, args.safe_run, args.doctor, args.apt_integration,
+        args.scan_repo, args.review_repository, args.safe_run, args.doctor, args.apt_integration,
     ))
     if selected_modes > 1:
         parser.error(
-            "--scan-deb, --preinstall-deb, --apt-preinstall-hook, --scan-repo, --safe-run, --doctor, and --apt-integration "
+            "--scan-deb, --preinstall-deb, --apt-preinstall-hook, --scan-repo, --review-repository, --safe-run, --doctor, and --apt-integration "
             "cannot be used together"
         )
     if args.apt_preinstall_hook and (args.json or args.output or args.diagnostics):
@@ -1375,6 +1420,17 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
 
     if args.apt_preinstall_hook:
         return run_apt_preinstall_hook()
+    if args.review_repository:
+        if args.output and _output_is_inside_repository(args.output, args.review_repository):
+            print("Could not write JSON output inside the repository being scanned.", file=sys.stderr)
+            return 2
+        return _run_review_repository(
+            args.review_repository,
+            json_output=args.json,
+            output_path=args.output,
+            include_generated=args.include_generated,
+            stdout=stdout,
+        )
     if args.apt_integration:
         try:
             paths = {"apt_conf_dir": Path("/etc/apt/apt.conf.d"),
