@@ -453,3 +453,34 @@ def test_report_does_not_include_command_arguments_or_secrets():
     assert "password=123" not in report_str
     # Command arguments should not be serialized in the report
     assert "cmd" not in report_str or report_str.count("cmd") == 0
+
+
+# ---------------------------------------------------------------------------
+# 3A.5 focused tests: custom prompt support in confirm_execution
+# ---------------------------------------------------------------------------
+
+
+def test_confirm_execution_custom_prompt_is_displayed_and_run_remains_exact():
+    """A custom prompt replaces the default text; exact RUN stays mandatory."""
+    terminal = _Terminal("RUN\n")
+    assert execution_guard.confirm_execution(
+        terminal, prompt="Custom snapshot prompt: ") is True
+    assert terminal.output == "Custom snapshot prompt: "
+
+    terminal = _Terminal("run\n")
+    assert execution_guard.confirm_execution(
+        terminal, prompt="Custom snapshot prompt: ") is False
+
+    terminal = _Terminal("RUN \n")
+    assert execution_guard.confirm_execution(
+        terminal, prompt="Custom snapshot prompt: ") is False
+
+    terminal = _Terminal("")
+    assert execution_guard.confirm_execution(
+        terminal, prompt="Custom snapshot prompt: ") is False
+
+
+def test_confirm_execution_default_prompt_text_is_unchanged_when_prompt_is_none():
+    terminal = _Terminal("RUN\n")
+    assert execution_guard.confirm_execution(terminal) is True
+    assert terminal.output == "Review complete. Type exactly RUN to start the command: "

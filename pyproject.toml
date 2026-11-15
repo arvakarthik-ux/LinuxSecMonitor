@@ -18,4 +18,4 @@ linuxsecmonitor = "main:main"
 
 [tool.setuptools]
 py-modules = ["main"]
-packages = ["scanner"]
+packages = ["scanner", "src.wrapper"]

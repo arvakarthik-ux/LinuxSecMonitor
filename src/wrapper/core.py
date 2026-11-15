@@ -15,8 +15,16 @@ from scanner.child_environment import build_child_environment
 
 from .commands import CommandClassifier, Tier
 from .detection import RepositoryDetector, RepositoryInfo
+from .git_clone import parse_clone_invocation
 from .cache import ScanCache, CacheKey
 from .path import PathManager
+
+# Exact post-clone acceptance prompt (3A.5). This acknowledges a reviewed
+# snapshot only; it must never be presented as authorization for any command.
+POST_CLONE_PROMPT = (
+    "Post-clone review complete. Type exactly RUN to acknowledge this "
+    "reviewed snapshot (this does not authorize any later command): "
+)
 
 
 class WrapperTier(Enum):
@@ -71,6 +79,7 @@ class CommandWrapper:
         detector: Optional[RepositoryDetector] = None,
         cache: Optional[ScanCache] = None,
         path_manager: Optional[PathManager] = None,
+        terminal: Optional[object] = None,
     ):
         """
         Initialize the wrapper with a command and arguments.
@@ -83,6 +92,8 @@ class CommandWrapper:
             detector: Repository detector instance (created if not provided)
             cache: Scan cache instance (created if not provided)
             path_manager: PATH manager for trusted executable resolution (created if not provided)
+            terminal: Optional I/O terminal used only for the post-clone
+                acceptance prompt (3A.5); ignored by other execution tiers.
         """
         self.command_name = command_name
         self.argv = tuple(argv) if argv else (command_name,)
@@ -91,6 +102,7 @@ class CommandWrapper:
         self.detector = detector or RepositoryDetector()
         self.cache = cache or ScanCache()
         self.path_manager = path_manager or PathManager(Path.home() / ".local" / "bin")
+        self.terminal = terminal
 
     def should_intercept(self) -> bool:
         """Determine if this command should be intercepted."""
@@ -167,6 +179,9 @@ class CommandWrapper:
         if decision.is_passthrough:
             return self._execute_passthrough(decision)
 
+        if self._is_clone_invocation() and decision.tier == WrapperTier.TIER_1_DANGEROUS:
+            return self._execute_clone(decision)
+
         if decision.tier == WrapperTier.TIER_1_DANGEROUS:
             return self._execute_tier1(decision)
 
@@ -206,8 +221,8 @@ class CommandWrapper:
         print(f"[LinuxSecMonitor] TIER 1: Scanning repository before {' '.join(decision.argv)}", file=sys.stderr)
 
         if not decision.repository or not decision.repository.is_repository:
-            print("[LinuxSecMonitor] No repository context found; cannot enforce approval", file=sys.stderr)
-            return self._run_command(decision.argv)
+            print("[LinuxSecMonitor] BLOCKED: no repository context; cannot enforce required approval", file=sys.stderr)
+            return 1
 
         report = self._scan_repository(decision)
         if report.get("coverage_complete") is not True:
@@ -248,6 +263,193 @@ class CommandWrapper:
             decision.argv,
             working_directory=decision.repository.root if self.cwd == Path.cwd() else self.cwd,
         )
+
+    def _is_clone_invocation(self) -> bool:
+        """Whether argv is an exact ``git clone`` invocation."""
+        return (
+            Path(self.command_name).name.lower() == "git"
+            and len(self.argv) >= 2
+            and self.argv[1] == "clone"
+        )
+
+    def _execute_clone(self, decision: WrapperDecision) -> int:
+        """Execute ``git clone`` and review the result afterwards.
+
+        Clone contents cannot be inspected until the clone has completed, so
+        the clone itself runs first with the original argv, cwd, and
+        environment. Only a successful, non-bare clone at a verifiable worktree
+        root proceeds to the post-clone review; every other outcome fails
+        closed and leaves the clone on disk without claiming a review.
+        """
+        print(
+            "[LinuxSecMonitor] TIER 1: git clone runs now because its contents "
+            "cannot be inspected until the clone completes; the clone command "
+            "itself is not gated by this review",
+            file=sys.stderr,
+        )
+
+        returncode = self._run_command(decision.argv)
+        if returncode != 0:
+            # Preserve Git's exact exit status; do not scan or prompt.
+            return returncode
+
+        invocation = parse_clone_invocation(decision.argv, self.cwd)
+        if invocation.error is not None:
+            print(
+                f"[LinuxSecMonitor] BLOCKED: {invocation.error}. The clone "
+                "finished, but the wrapper cannot locate a reviewable "
+                "worktree without guessing; no review was performed and the "
+                "clone remains on disk",
+                file=sys.stderr,
+            )
+            return 1
+        if invocation.bare or invocation.mirror:
+            print(
+                "[LinuxSecMonitor] BLOCKED: a bare/mirror clone has no "
+                "reviewable worktree, so no worktree review can be claimed. "
+                "The clone remains on disk, unreviewed",
+                file=sys.stderr,
+            )
+            return 1
+        destination = invocation.destination
+        if destination is None:
+            print(
+                "[LinuxSecMonitor] BLOCKED: clone destination is unknown; no "
+                "review was performed and the clone remains on disk",
+                file=sys.stderr,
+            )
+            return 1
+
+        resolved_destination = destination.resolve(strict=False)
+        info = self.detector.detect(destination)
+        if (
+            not info.is_repository
+            or info.root != resolved_destination
+        ):
+            print(
+                "[LinuxSecMonitor] BLOCKED: the clone destination is not a "
+                "verifiable Git worktree repository root; no review was "
+                "performed and the clone remains on disk",
+                file=sys.stderr,
+            )
+            return 1
+
+        return self._review_cloned_repository(info.root)
+
+    def _review_cloned_repository(self, root: Path) -> int:
+        """Display the unified report for a fresh clone and require snapshot acceptance.
+
+        Acceptance explicitly acknowledges this reviewed snapshot only. It is
+        not obtained through the approval manager and not persisted anywhere;
+        it never authorizes any later command.
+        """
+        from .report import build_unified_report, render_terminal
+        from .scanners import ScannerOrchestrator, repository_content_hash
+        from scanner.execution_guard import confirm_execution
+
+        current_hash = repository_content_hash(root)
+        cache_key = CacheKey.from_repository(
+            root,
+            self.classifier.get_config_hash(),
+            self.classifier.get_scanner_version(),
+            self.classifier.get_malware_db_version(),
+        )
+
+        report: Optional[dict[str, object]] = None
+        cached = self.cache.get(cache_key)
+        if (
+            isinstance(cached, dict)
+            and cached.get("coverage_complete") is True
+            and cached.get("repository_changed_during_scan") is not True
+            and cached.get("repository_content_hash") == current_hash
+        ):
+            report = cached
+        else:
+            self.cache.invalidate(cache_key)
+            scan = ScannerOrchestrator(timeout_seconds=120.0).scan(root)
+            report = build_unified_report(scan)
+            report["scanner_versions"] = scan.get("scanner_versions", {})
+            if (
+                report.get("coverage_complete") is True
+                and report.get("repository_changed_during_scan") is not True
+                and report.get("repository_content_hash") == current_hash
+            ):
+                self.cache.set(cache_key, report)
+
+        final_hash = repository_content_hash(root)
+        blocked_reason = self._clone_review_block_reason(report, final_hash)
+        if blocked_reason is not None:
+            print(
+                f"[LinuxSecMonitor] BLOCKED: post-clone review failed "
+                f"({blocked_reason}); the clone remains on disk, unaccepted",
+                file=sys.stderr,
+            )
+            return 1
+
+        assert report is not None
+        print(render_terminal(report), file=sys.stderr)
+
+        accepted = confirm_execution(terminal=self.terminal, prompt=POST_CLONE_PROMPT)
+        if not accepted:
+            print(
+                "[LinuxSecMonitor] Clone remains on disk, unaccepted",
+                file=sys.stderr,
+            )
+            return 3
+
+        after_hash = repository_content_hash(root)
+        if after_hash != final_hash:
+            self.cache.invalidate(cache_key)
+            print(
+                "[LinuxSecMonitor] Repository changed after review; the "
+                "cached assessment was invalidated and no acceptance stands",
+                file=sys.stderr,
+            )
+            print(
+                "[LinuxSecMonitor] Clone remains on disk, unaccepted",
+                file=sys.stderr,
+            )
+            return 1
+
+        print(
+            "[LinuxSecMonitor] Post-clone snapshot review accepted; this grants "
+            "no authorization for any later command",
+            file=sys.stderr,
+        )
+        return 0
+
+    @staticmethod
+    def _clone_review_block_reason(
+        report: object,
+        current_hash: str,
+    ) -> Optional[str]:
+        """Return a fail-closed reason, or None when review may prompt."""
+        if not isinstance(report, dict) or not report:
+            return "assessment is missing"
+        if report.get("coverage_complete") is not True:
+            return "repository inspection is incomplete"
+        if report.get("repository_changed_during_scan") is True:
+            return "repository changed during scanning"
+        scanner_status = report.get("scanner_status")
+        if not isinstance(scanner_status, dict):
+            return "scanner status is unavailable"
+        for name, status in scanner_status.items():
+            if (
+                not isinstance(status, dict)
+                or status.get("coverage_complete") is not True
+                or status.get("errors")
+            ):
+                return f"{name} scanner assessment is incomplete"
+        malware_status = (scanner_status.get("malware") or {}).get("status") \
+            if isinstance(scanner_status.get("malware"), dict) else None
+        if malware_status == "detected" or report.get("malware_findings"):
+            return "malware detected"
+        scanned_hash = report.get("repository_content_hash")
+        if not scanned_hash:
+            return "assessment lacks a repository content hash"
+        if current_hash != scanned_hash:
+            return "repository content changed after scanning"
+        return None
 
     def _scan_repository(self, decision: WrapperDecision) -> dict[str, object]:
         """Use a cached complete assessment or run the bounded scanner set."""
@@ -297,10 +499,12 @@ class CommandWrapper:
 
             # Explicit allowlist environment policy shared with the
             # execution guard (scanner.child_environment). PWD is built from
-            # the same cwd passed to the child; PATH is validated trusted
-            # system directories; runtime overrides (VIRTUAL_ENV,
-            # NPM_CONFIG_PREFIX, CARGO_HOME, ...) are never re-injected.
+            # the same cwd passed to the child; prepend the managed shims to
+            # its trusted PATH without reusing the caller's PATH.
             env = build_child_environment(cwd=repo_cwd)
+            env["PATH"] = self.path_manager.ensure_wrapper_dir_in_path(
+                env["PATH"]
+            )
 
             completed = subprocess.run(
                 safe_argv,

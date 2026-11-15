@@ -5,7 +5,7 @@ Kali Linux is LinuxSecMonitor's primary supported target; Debian and Ubuntu are 
 ## Key features
 
 - Collects operating system, distribution and version when available, kernel version, CPU architecture, Python version, and hostname.
-- Primary target: Kali Linux package inventory with `dpkg-query`, local `.deb` inspection, ClamAV coverage reporting, and the opt-in APT hook/lifecycle. Real disposable Kali guest verification is still pending.
+- Primary target: Kali Linux package inventory with `dpkg-query`, local `.deb` inspection, ClamAV coverage reporting, and the opt-in APT hook/lifecycle. Disposable Kali guest verification was completed on 2026-11-09 in an isolated Docker guest: six automated scenarios plus a manual multi-package transaction; see [Disposable guest validation](#disposable-guest-validation).
 - Inventories installed Debian, Ubuntu, and Kali packages with `dpkg-query` where supported. Source package metadata is retained internally for Debian assessment.
 - Performs conservative, distribution-aware vulnerability assessment using Ubuntu and Debian OSV records. Kali vulnerability matching is explicitly unsupported.
 - Adds available OSV summaries, details, references, and Debian urgency as advisory context. Urgency is kept separate from severity.
@@ -87,8 +87,9 @@ and an available ClamAV signature database. Safe repository scanning requires
 POSIX no-follow directory-descriptor support; Windows can run the mocked tests,
 but repository malware assessment and static repository review report
 `unavailable` there. Kali Linux is the primary implementation target; its
-disposable-guest APT behavior remains unverified. LinuxSecMonitor does not
-install ClamAV or download/update signatures.
+disposable-guest APT behavior was verified in an isolated Docker guest on
+2026-11-09 (see [Disposable guest validation](#disposable-guest-validation)).
+LinuxSecMonitor does not install ClamAV or download/update signatures.
 
 The WSL instructions apply when WSL is running a supported Debian, Ubuntu, or Kali Linux distribution; WSL itself is not a separate package-inventory target.
 
@@ -887,14 +888,18 @@ still continue after the malware checks pass. A vulnerability finding is
 reported for the user's decision and does not itself prevent an explicit
 approval. OSV coverage is limited to the configured data sources and package
 mappings; this is not a comprehensive vulnerability guarantee. Real APT
-cancellation and approval remain unverified until the documented disposable
-Kali transaction tests pass.
+cancellation and approval were verified in the isolated Docker Kali guest on
+2026-11-09 across six scenarios; see
+[Disposable guest validation](#disposable-guest-validation).
 
 This is an experimental hook integration, not a permanent APT policy and not
 an automatic APT configuration change. APT's v3 stream has no transaction
 record count or checksum, so a stream truncated exactly at a valid record
 boundary cannot be detected from the protocol alone. Validate hook invocation
-and behavior in a disposable Kali VM before considering any broader use.
+and behavior in a disposable Kali guest (VM, or an isolated local container
+meeting the conditions below in
+[Disposable guest validation](#disposable-guest-validation)) before considering
+any broader use.
 
 The documented command supplies temporary `-o` settings for one APT process;
 it does not install or alter a permanent hook configuration. There is therefore
@@ -949,9 +954,11 @@ other APT configuration. If the hook was edited, replaced, or became a
 symlink, removal stops and preserves it for manual review. If installation is
 interrupted, its own partial receipt/hook writes are rolled back when possible;
 inspect `--apt-integration status` and the two paths before recovery. Status
-`conflict` requires manual investigation. These commands have unit coverage
-against temporary directory roots; persistent system installation and the APT
-transaction behavior have not been verified in the current environment.
+`conflict` requires manual investigation. These lifecycle commands have unit
+coverage against temporary directory roots. Persistent host system installation
+remains unverified; APT guest transaction behavior was verified in the isolated
+Docker Kali guest on 2026-11-09 (see
+[Disposable guest validation](#disposable-guest-validation)).
 
 To stop a blocked transaction, let the hook fail closed and inspect its report
 and APT error. Do not remove unrelated APT hook configuration during recovery.
@@ -1051,9 +1058,10 @@ Distribution detection reads `/etc/os-release` on Linux. The package scanner che
 
 Kali is the primary implementation target for system information, `dpkg-query`
 inventory, Debian archive parsing, ClamAV scanning, diagnostics, and the
-optional APT integration. These code paths have unit coverage, but the APT
-hook and privileged lifecycle have not yet been verified in a disposable Kali
-guest. Vulnerability assessment on Kali deliberately reports `unsupported`;
+optional APT integration. These code paths have unit coverage; the APT hook and
+privileged lifecycle were verified in an isolated Docker Kali guest on
+2026-11-09 (see [Disposable guest validation](#disposable-guest-validation)).
+Vulnerability assessment on Kali deliberately reports `unsupported`;
 `--scan-deb` therefore does not return a conclusive vulnerability result, and
 APT displays the unsupported limitation before any explicit approval. This is
 not Kali vulnerability coverage and is not a `no_known_match` result.
@@ -1084,9 +1092,11 @@ The APT hook opens the controlling terminal before dropping its archive-scanning
 process to the `_apt` user, then reuses that already-open terminal for the
 approval decision. A real terminal prompt waits at most 300 seconds. No
 terminal, EOF, invalid input, an interrupted read, or timeout is a denial; the
-hook never infers approval from missing input. This behavior has unit coverage,
-but the terminal/privilege sequence and cancellation timing still require
-verification inside an actual disposable Kali APT transaction.
+hook never infers approval from missing input. This behavior has unit coverage
+and was verified in the isolated Docker Kali guest on 2026-11-09, including
+exact approval (`safe-approve`, `finding-approve`) and cancellation
+(`clean-cancel`, `finding-cancel`) flows; see
+[Disposable guest validation](#disposable-guest-validation).
 
 Kali's [relationship documentation](https://www.kali.org/docs/policy/kali-linux-relationship-with-debian/)
 says most packages are imported as-is from Debian Testing, with some packages
@@ -1147,9 +1157,17 @@ guest results.
 ### Automated real APT transaction tests (disposable guest only)
 
 `tests/integration/test_apt_preinstall_guest.py` provides opt-in tests for a
-clean package approval, a maintainer-script review lead that is canceled, the
-same kind of review lead that is approved, incomplete-coverage denial, and
-lifecycle recovery/preservation. The transaction scenarios use ordinary
+clean package approval, clean cancellation, an EICAR-signature detection with
+maintainer-script review that is canceled, the same detected package that is
+approved, incomplete-coverage denial, and lifecycle recovery/preservation: six
+automated scenarios. EICAR is the harmless standard antivirus test signature,
+not live malware. Finding-cancel and finding-approve put its exact test string
+in the `.deb` payload; a standalone ClamAV scan of the generated payload must
+identify an EICAR signature before either APT transaction is run. Their APT
+evidence records the detection signature name separately from the heuristic
+maintainer-script review lead. A
+separate manual multi-package transaction verifies that one transaction-level
+approval covers two archives. The transaction scenarios use ordinary
 `apt-get install`, the installed LinuxSecMonitor lifecycle, a real ClamAV scan,
 OSV assessment, a PTY-backed terminal prompt, `strace`, package database
 snapshots, and per-scenario evidence files. It refuses to run unless the guest
@@ -1159,8 +1177,12 @@ evidence directory. The test installs, disables, re-enables, and uninstalls
 only its own APT integration; it removes only the unique fixture package and
 markers it creates.
 
-Do not run this on the main Kali host. Use a fresh disposable Kali VM snapshot
-for each primary-target scenario. Kali's vulnerability status must be shown as
+Do not run this on the main Kali host. Use a fresh disposable Kali VM snapshot,
+or a fresh isolated local Docker/Podman container from a local Kali image when
+VM/KVM is unavailable, for each primary-target scenario. A container must have
+no host mounts and no privileged mode, run one scenario per fresh container, and
+be removed afterward; keep the base image unchanged. The VM remains primary
+where available. Kali's vulnerability status must be shown as
 `unsupported`; the Kali transaction tests must not present it as a clean
 assessment. The Kali provider path makes no OSV request. The approved scenario installs its purpose-built test package
 briefly and the harness purges only that unique package after it records the
@@ -1182,7 +1204,8 @@ sudo chown root:root /run/linuxsecmonitor-disposable-apt-test
 sudo chmod 0644 /run/linuxsecmonitor-disposable-apt-test
 ```
 
-Run exactly one transaction command on a fresh snapshot, choosing one scenario:
+Run exactly one transaction command on a fresh guest (VM snapshot or fresh
+container), choosing one scenario:
 
 ```bash
 sudo env \
@@ -1195,22 +1218,96 @@ sudo env \
   -k cancellation
 ```
 
-Use `safe-approve` with `-k safe_package_approval`, `finding-approve` with
-`-k finding_approval`, or `incomplete-block` with
-`-k incomplete_coverage_blocks` on separate fresh snapshots. The incomplete
-fixture contains an in-package symlink and must be rejected before dpkg. Run
-the lifecycle case on a separate fresh snapshot with scenario `lifecycle` and
-`-k lifecycle_recovery`; it covers install, repeated install, disable, recovery
-by enable, repeated enable, uninstall, and preservation of unrelated config.
-Review the JSON summary,
-`.apt.log`, and `.execve.log` files in the evidence directory. The integration
-tests remain unverified until each command is run successfully on its target
-OS. Without `LINUXSECMONITOR_RUN_REAL_APT=1` and the exact scenario name, all
-five tests are skipped in the ordinary suite. Lifecycle recovery models the
-owned-receipt/missing-hook state; it does not inject a process kill between
-individual installer writes.
+Use `safe-approve` with `-k safe_package_approval`, `clean-cancel` with
+`-k clean_package_cancellation`, `finding-approve` with `-k finding_approval`,
+or `incomplete-block` with `-k incomplete_coverage_blocks` on separate fresh
+guests. The incomplete fixture contains an in-package symlink and must be
+rejected before dpkg. Run the lifecycle case on a separate fresh guest with
+scenario `lifecycle` and `-k lifecycle_recovery`; it covers install, repeated
+install, disable, recovery by enable, repeated enable, uninstall, and
+preservation of unrelated config. For G1 finding-cancel and G3 finding-approve,
+require a complete ClamAV scan whose APT report has `Status: detected` and a
+detection name containing `Eicar`; do not count the maintainer-script review
+lead as malware evidence. G1 must cancel and leave package state and script
+markers unchanged; G3 must explicitly approve the same EICAR-signature finding
+and show only its approved maintainer script running. Review the JSON summary,
+`.apt.log`, and `.execve.log` files in the evidence directory. The Kali
+scenarios were run successfully in the isolated Docker guest on 2026-11-09
+(see below); Debian and Ubuntu scenarios remain unverified until each command is
+run successfully on its target OS. Without `LINUXSECMONITOR_RUN_REAL_APT=1` and
+the exact scenario name, all six tests are skipped in the ordinary suite.
+Lifecycle recovery models the owned-receipt/missing-hook state; it does not
+inject a process kill between individual installer writes.
+
+For the revision-3 P2 gate scenarios, run
+`python tests/integration/apt_guest_scenario_runner.py G1` through `G5`
+sequentially from the project root. The tracked runner requires the exact
+locally available Kali 2026.3 image and its recorded provenance; it does not
+pull or rebuild the image. Each invocation creates one fresh, non-privileged
+container on Docker's bridge network without host mounts, prepares the marker
+and private evidence directory, runs only its selected pytest scenario, copies
+the JSON/APT/execve evidence to a unique private `/tmp` directory, then removes
+the container and verifies its absence. It fails unless the image, source test,
+scenario outcome, guest release, and isolation checks match the recorded
+contract.
 
 Use separate disposable Debian and Ubuntu VMs for real-host validation. Take a VM snapshot first and run the scanner as a normal, non-root user. The scanner is read-only, but the JSON command writes `scan.json` in the project directory. Debian 12 validation is complete as recorded below; Ubuntu validation is still pending.
+
+### Kali guest verification update (2026-11-09; cleanup completed 2026-11-13)
+
+The host had no KVM/libvirt/VM image available, so APT guest verification used a
+fresh isolated local Docker container instead of a VM. The guest image was
+`lsm-apt-guest-kali:2026.3-apt-v1` (image ID
+`sha256:a0b8eb8743012c85709832702eb5ddaea9be4289ecdd185442780e96d4ff11e0`),
+built from `ghcr.io/usestrix/strix-sandbox:1.3.0`. Containers had no host mounts
+and no privileged mode, and each scenario ran in a fresh container. Containers
+are rolled back by removal; cleanup was still pending when this record was
+written. The base container was `lsm-apt-guest-kali-base` and the base image was
+unchanged. Guest versions were apt 3.2.0, Python 3.14.8, strace 7.2, and ClamAV
+1.4.6 with signatures 28178, corroborated by the read-only guest environment
+evidence file `/tmp/opencode/lsm-apt-evidence/guest-environment-2026-11-09.txt`
+(sha256 `ab3b3a502bf2b2ab630b340bd53d580553657d7b4da345f5fd33d802f9926e48`).
+
+Cleanup update (2026-11-13): with explicit user authorization, the seven
+scenario containers and base container were each checked by exact name and full
+container ID. All matched, were exited, and had no mounts or binds. The eight
+containers were removed by ID and then verified absent by both name and ID;
+the exact IDs are recorded in `.unlazy/apt-hook-complete/status.log`. No other
+containers or the base image were changed.
+
+All six automated scenarios passed: safe-approve, clean-cancel, finding-cancel,
+finding-approve, incomplete-block, and lifecycle. Results: safe-approve installed
+the fixture and the harness's post-cleanup assertions passed; clean-cancel and
+finding-cancel blocked before package scripts; finding-approve ran only the
+approved maintainer script; incomplete-block rejected the archive before dpkg;
+lifecycle install/disable/enable/uninstall preserved unrelated configuration.
+The single-scenario JSONs do not contain a post-cleanup package-state field; for
+those six scenarios the post-cleanup result is asserted by the test harness. A
+manual multi-package transaction also succeeded: both archives and packages were
+announced, one transaction-level `INSTALL` approval covered both, both were
+unpacked/configured, and both were purged afterward (recorded in the
+multi-package JSON). APT 3.2 did not prompt for local no-dependency fixtures; a
+repository package (`sl`) did prompt and aborted on `n`. No `-y` was used. APT
+plan simulation (`apt-get -s --no-remove`) was used as additional harness
+evidence, not as a substitute for the actual hook prompt.
+
+Evidence is recorded in `.unlazy/apt-hook-complete/status.log`. Host copies are
+under `/tmp/opencode/lsm-apt-evidence/` for safe-approve, clean-cancel,
+finding-cancel, finding-approve, incomplete-block, lifecycle, and multi-package;
+guest originals are under `/var/tmp/linuxsecmonitor-evidence`. The multi-package
+JSON sha256 is
+`f29abffdf1480ad05b68196e78ddceeefcc2485bf4d48414d0a4c160a22d1c47`. Rollback
+is container removal; cleanup was pending at the time of this record. The seven
+scenario containers and the base container were still running when this record
+was written.
+
+Limitations: Kali vulnerability assessment remains explicitly `unsupported`, so
+these results do not provide Kali vulnerability coverage; the multi-package
+transaction was manual, not an automated scenario; local APT prompt behavior can
+differ when a transaction has no dependencies; the base image and host state
+were untouched; and this is not CI automation. The containers were removed in
+the 2026-11-13 cleanup update above. No application source code was changed for
+this verification.
 
 ### Debian VM checklist (completed)
 
@@ -1256,10 +1353,15 @@ These results are observations from that Debian VM, not guarantees for other hos
 
 The CLI exit code reflects package inventory and report writing. OSV retrieval can fail after a successful inventory; in that case the report should still show the inventory result and identify the assessment error. `no_known_match` only means no matching record was found in the queried data; it does not mean the system or package is safe. Kali package inventory is supported, but Kali vulnerability assessment remains explicitly unsupported; Debian or Ubuntu records are not authoritative for Kali.
 
-### Controlled Kali validation (guest verification pending)
+### Controlled Kali validation procedure (abort-only probe)
+
+APT guest verification is recorded in the [Kali guest verification update
+(2026-11-09)](#kali-guest-verification-update-2026-11-09); the procedure below
+remains a read-only/abort-only probe and is not a substitute for that
+verification.
 
 Kali is the primary supported platform for system information, `dpkg-query`
-inventory, local `.deb` scanning, and the planned APT integration. Kali
+inventory, local `.deb` scanning, and the optional APT integration. Kali
 vulnerability assessment remains explicitly unsupported; tests must preserve
 that status. Unit tests and host-side checks do not validate APT protocol
 behavior in a guest. Use a disposable Kali VM or snapshot, run scan commands as
@@ -1571,8 +1673,9 @@ for Kali), ClamAV signature state, repository static-review status, coverage,
 and exit codes. Do not treat `no_detection` as safety proof. Do not run a
 scanner-enabled or installation-allowing hook test until the abort-only probe
 has established the installed APT's protocol-v3 behavior and the local hook
-order. The probe does not establish a universal pre-execution barrier. No real
-Kali validation is recorded here.
+order. The probe does not establish a universal pre-execution barrier. This
+probe section records no real Kali APT transaction validation; see the 2026-11-09
+guest verification update.
 
 ### Optional live OSV integration tests
 
@@ -1697,6 +1800,11 @@ LinuxSecMonitor/
 
 ## Local verification status (2026-10-29)
 
+_Historical status recorded 2026-10-29. It is superseded for APT guest
+verification by the [Kali guest verification update
+(2026-11-09)](#kali-guest-verification-update-2026-11-09); the measured numbers
+below are unchanged._
+
 The offline test suite was rerun with Python 3.14.7: **453 passed, 7 skipped
 in 18.13s**. Kali-related package inventory, diagnostics, assessment, and CLI
 tests passed: **227 passed in 19.75s**. The five opt-in guest tests were
@@ -1706,21 +1814,25 @@ requests. A wheel built from the current tracked tree, installed into a fresh
 temporary virtual environment, and passed CLI help and `pip check`. Local
 Actions YAML parsing succeeded; GitHub Actions was not run.
 
-Real Kali guest verification remains blocked here: QEMU and `qemu-img` are
-installed, but `/dev/kvm` and a local Kali disk image are absent. No existing
-VirtualBox, libvirt, VMware, or container guest frontend was found. Docker is
-present, but this account cannot access its daemon socket. No guest was started
-and no image was downloaded. Provide a disposable Kali guest with hardware
-acceleration (or equivalent scan throughput), root access, ClamAV with usable
-signatures, `strace`, and the documented evidence/runtime paths; restore a
-clean snapshot for each scenario before claiming end-to-end verification.
+At the time of this status, real Kali guest verification was blocked here: QEMU
+and `qemu-img` are installed, but `/dev/kvm` and a local Kali disk image are
+absent. No existing VirtualBox, libvirt, VMware, or container guest frontend was
+found. Docker was present, but this account could not access its daemon socket.
+No guest was started and no image was downloaded. The later 2026-11-09 Docker
+guest verification supersedes this limitation for APT guest validation.
 
 The real-APT harness accepts Kali, Debian, and Ubuntu. On Kali, it verifies
 that the transaction report states vulnerability assessment is `unsupported`
 and displays that no authoritative provider is configured before prompting.
-This behavior is implemented but remains unverified in a Kali guest.
+At the time of this status, this behavior was implemented but unverified in a
+Kali guest; it was verified in the isolated Docker Kali guest on 2026-11-09.
 
-### Final focused verification update (2026-10-29)
+### Final focused verification update (2026-10-29; historical)
+
+_Historical record. It predates the 2026-11-09 guest verification; its measured
+results are unchanged and are superseded only for APT guest validation by the
+[Kali guest verification update
+(2026-11-09)](#kali-guest-verification-update-2026-11-09)._
 
 The current local offline run passed **459 tests with 7 skipped in 24.45s**;
 the five disposable-guest scenarios and two opt-in live OSV tests did not run.
@@ -1750,8 +1862,10 @@ or performance improvement is claimed.
 The APT hook prints planned transaction package names and target versions
 before scanning, so an unavailable archive can still be identified in the
 failure report. The APT approval terminal is captured before dropping the scanner process to
-`_apt`; the actual retained-terminal prompt has a 300-second bound. This fixes
+`_apt`; the actual retained-terminal prompt has a 300-second bound. This fixed
 the identified privilege-order risk in the implementation and is covered by
-unit tests, but approval, cancellation, maintainer-script ordering, and
-lifecycle behavior still require a disposable Kali transaction to be
-**VERIFIED END TO END**.
+unit tests. Approval, cancellation, maintainer-script ordering, and lifecycle
+behavior were subsequently **VERIFIED END TO END** in the isolated Docker Kali
+guest on 2026-11-09; see
+[Kali guest verification update
+(2026-11-09)](#kali-guest-verification-update-2026-11-09).

@@ -1,0 +1,47 @@
+# Gates: C10 APT regression scenarios
+
+OWNS: tests/integration/test_apt_preinstall_guest.py, tests/integration/apt_guest_scenario_runner.py, README.md
+
+Scope: verify all five Kali Rolling 2026.3 APT acceptance scenarios and review their guest outcomes for C10.
+
+- [x] G3.3.1: finding-cancel scenario detects EICAR and cancels before package installation
+  CHECK: python tests/integration/apt_guest_scenario_runner.py G1
+  EXPECT: LSM_GATE_G1_PASSED
+  CWD: /home/kali/LinuxSecMonitor
+  EVIDENCE: automatic-evidence=v1; definition-sha256=c4419597b3681f1d734fdfac64e2b874e8133a1ffc7be59f9cd0e9dd35519eed; exit=0; EXPECT=matched; output-sha256=4b4d31805b1eaa7376846439e073acdf7f02de2bd3b7e74d80cfc659fd85039e; output-bytes=65; shell=/bin/sh; cwd=/home/kali/LinuxSecMonitor; path=1e35329a0108/13 entries
+
+- [x] G3.3.2: incomplete-block scenario prevents a transaction without prompting
+  CHECK: python tests/integration/apt_guest_scenario_runner.py G2
+  EXPECT: LSM_GATE_G2_PASSED
+  CWD: /home/kali/LinuxSecMonitor
+  EVIDENCE: automatic-evidence=v1; definition-sha256=852678bb85138bd1bc48abd7c398219f558bc0e3906d2facb2491440676ebc19; exit=0; EXPECT=matched; output-sha256=65ab44c0e23590cc2a06bba1bf198cc0dcdc9e2127e75e9ac6caa84d8a7e3516; output-bytes=65; shell=/bin/sh; cwd=/home/kali/LinuxSecMonitor; path=1e35329a0108/13 entries
+
+- [x] G3.3.3: finding-approve scenario detects EICAR and installs only after approval
+  CHECK: python tests/integration/apt_guest_scenario_runner.py G3
+  EXPECT: LSM_GATE_G3_PASSED
+  CWD: /home/kali/LinuxSecMonitor
+  EVIDENCE: automatic-evidence=v1; definition-sha256=74e660430e6625c4d4d6160dccf992845e4ef47ec8df367d01c12b4f97d479ef; exit=0; EXPECT=matched; output-sha256=9463eb205d41288169a7e73566a315c7620eaadffce4b3671fff5e828869a710; output-bytes=65; shell=/bin/sh; cwd=/home/kali/LinuxSecMonitor; path=1e35329a0108/13 entries
+
+- [x] G3.3.4: safe-approve scenario completes a clean scan and installs only after approval
+  CHECK: python tests/integration/apt_guest_scenario_runner.py G4
+  EXPECT: LSM_GATE_G4_PASSED
+  CWD: /home/kali/LinuxSecMonitor
+  EVIDENCE: automatic-evidence=v1; definition-sha256=57d0fba14eeac5cdffff529d81d42fab93d5e8e12ac684f7de6a14ca3cf4178a; exit=0; EXPECT=matched; output-sha256=50b0e052e1c2a76a8dd341842bed46832ed914ce5eee3c1619de317759cd50a8; output-bytes=65; shell=/bin/sh; cwd=/home/kali/LinuxSecMonitor; path=1e35329a0108/13 entries
+
+- [x] G3.3.5: lifecycle scenario verifies install, disable, enable, and uninstall recovery
+  CHECK: python tests/integration/apt_guest_scenario_runner.py G5
+  EXPECT: LSM_GATE_G5_PASSED
+  CWD: /home/kali/LinuxSecMonitor
+  EVIDENCE: automatic-evidence=v1; definition-sha256=c2ece14811d118f1cf38c4c727ed96025549ddf23754d73ceb1d25c67776a93d; exit=0; EXPECT=matched; output-sha256=ba66e0b3101b9e32b42be87f5560983b9c92dc4cb83e49e1123da6ba0a03657e; output-bytes=65; shell=/bin/sh; cwd=/home/kali/LinuxSecMonitor; path=1e35329a0108/13 entries
+
+HISTORY: Previous G3.3.1 CHECK/EVIDENCE (superseded by the tracked runner): CHECK=python /tmp/opencode/lsm-apt-evidence/repo-preexec-r3-build/run_scenario.py G1; EXPECT=LSM_GATE_G1_PASSED; EVIDENCE=automatic-evidence=v1; definition-sha256=154cae668fdb9b26e91eebfd00a720c4d32297f399386a489f3e138a8f040074; exit=0; EXPECT=matched; output-sha256=2b38566de93b8efa6352bb2c3bcdbaf85fc92daded3805f0a2ae26e20b787dac; output-bytes=19; shell=/bin/sh; cwd=/home/kali/LinuxSecMonitor; path=1e35329a0108/13 entries
+HISTORY: Previous G3.3.2 CHECK/EVIDENCE (superseded by the tracked runner): CHECK=python /tmp/opencode/lsm-apt-evidence/repo-preexec-r3-build/run_scenario.py G2; EXPECT=LSM_GATE_G2_PASSED; EVIDENCE=automatic-evidence=v1; definition-sha256=2747e2ec4db03273460ef016a6d09a5d54c7a9a6339f490b0b380d02a942f405; exit=0; EXPECT=matched; output-sha256=97bcf4f07082361c5d845175ae9cec3b9e4cc489e733cdaad585b7d90bce53a5; output-bytes=19; shell=/bin/sh; cwd=/home/kali/LinuxSecMonitor; path=1e35329a0108/13 entries
+HISTORY: Previous G3.3.3 CHECK/EVIDENCE (superseded by the tracked runner): CHECK=python /tmp/opencode/lsm-apt-evidence/repo-preexec-r3-build/run_scenario.py G3; EXPECT=LSM_GATE_G3_PASSED; EVIDENCE=automatic-evidence=v1; definition-sha256=582494e5ecf1539379cf72212e548f1b8441a5eeeedd02d6fe658c849995b522; exit=0; EXPECT=matched; output-sha256=94d12177b428a9f7069435b6bf02f6743019617eb4249a00204c53b8f8aad3e3; output-bytes=19; shell=/bin/sh; cwd=/home/kali/LinuxSecMonitor; path=1e35329a0108/13 entries
+HISTORY: Previous G3.3.4 CHECK/EVIDENCE (superseded by the tracked runner): CHECK=python /tmp/opencode/lsm-apt-evidence/repo-preexec-r3-build/run_scenario.py G4; EXPECT=LSM_GATE_G4_PASSED; EVIDENCE=automatic-evidence=v1; definition-sha256=d26c7bd3cc53c958b4a3f3a369ddcdc4af3b27918275266af37765425b1bef2d; exit=0; EXPECT=matched; output-sha256=d7b17e1b765f7ccc73deacd35059cd7e27b30ec1cce1180b45b0bd83043b1381; output-bytes=19; shell=/bin/sh; cwd=/home/kali/LinuxSecMonitor; path=1e35329a0108/13 entries
+HISTORY: Previous G3.3.5 CHECK/EVIDENCE (superseded by the tracked runner): CHECK=python /tmp/opencode/lsm-apt-evidence/repo-preexec-r3-build/run_scenario.py G5; EXPECT=LSM_GATE_G5_PASSED; EVIDENCE=automatic-evidence=v1; definition-sha256=11feea340f5c9c41fb6d16fcb5f0f51ec7ebe6a1dea8341f0875afd2c8311004; exit=0; EXPECT=matched; output-sha256=c3d242473f08553d415f074a0801060cc1865232c998c3b6f4c149fe534bb459; output-bytes=19; shell=/bin/sh; cwd=/home/kali/LinuxSecMonitor; path=1e35329a0108/13 entries
+
+- [x] G3.3.6: manual review confirms recorded Kali guest outcomes match the contract
+  EVIDENCE: manual-verification=completed; independently reviewed the fresh sequential tracked-runner C10 --reverify artifacts in /tmp/linuxsecmonitor-g1-l_pi6q_l, /tmp/linuxsecmonitor-g2-17smdlxm, /tmp/linuxsecmonitor-g3-c4gmxgpg, /tmp/linuxsecmonitor-g4-94yyne67, and /tmp/linuxsecmonitor-g5-_741ypb5 against C10 and the README. All guests reported Kali Rolling 2026.3 from approved image sha256:2baea3e59a5708abb354e4ecaa2589d7c97022773bc2771c0ba7241a9dd117d1 with matching provenance labels. G1 real ClamAV detected Eicar-Test-Signature; CANCEL blocked APT (exit 100), package remained absent, and no script markers ran. G2 incomplete coverage blocked before prompting (exit 100), package remained absent, and package-state changes were empty. G3 real ClamAV detected Eicar-Test-Signature and explicit INSTALL proceeded (exit 0) with only the expected fixture postinst and inert cron markers. G4 completed a real no-detection scan and proceeded only after explicit INSTALL (exit 0). G5 verified conflict preservation, install/disable/enable/uninstall transitions, unchanged APT configuration and package state, and no cleanup errors. Before/after inspection showed bridge networking, no mounts, binds, or devices, and privileged=false; every container was removed and absence verified. The five pytest scenarios passed sequentially.
+  HISTORY: Previous G3.3.6 evidence (verbatim): manual-verification=completed; independently reviewed the final fresh --reverify artifacts in /tmp/opencode/lsm-apt-evidence/repo-preexec-c10-fresh-20261114-2014/cycle-20261114T145816Z-fc7e8260 against C10 and the README. Image sha256:2baea3e59a5708abb354e4ecaa2589d7c97022773bc2771c0ba7241a9dd117d1 labels matched the recorded base, parent, source-context and source-revision provenance; each guest reported Kali Rolling 2026.3. G1 complete real ClamAV scan detected Eicar-Test-Signature, CANCEL blocked APT (exit 100), package absent, no script markers, and vulnerability status unsupported. G2 incomplete coverage blocked before prompting (exit 100), with package absent and no state changes; it did not present a vulnerability assessment. G3 complete real ClamAV scan detected Eicar-Test-Signature, showed unsupported vulnerability status, and proceeded only after INSTALL; the expected fixture postinst ran. G4 completed a real no-detection scan, showed unsupported vulnerability status, and proceeded only after INSTALL. G5 verified lifecycle install/disable/enable/uninstall transitions, conflict preservation, unchanged APT configuration and package state, and no cleanup errors. For every container, before/after inspection showed no mounts or binds, privileged=false and bridge networking; no Docker socket was present. Each container was removed and absence verified.
+  HISTORY: Initial fresh-cycle manual review (before --reverify): /tmp/opencode/lsm-apt-evidence/repo-preexec-c10-fresh-20261114-2014/cycle-20261114T145431Z-2ae1755f; superseded by the final fresh --reverify review above.
+  HISTORY: Prior G3.3.6 evidence (verbatim): manual-verification=completed; reused from repo-preexec/GATES.md:N6, which records review of fresh Kali Rolling 2026.3 G1-G5 results from image sha256:2baea3e59a5708abb354e4ecaa2589d7c97022773bc2771c0ba7241a9dd117d1; G1 detected Eicar-Test-Signature and canceled with package absent; G2 blocked incomplete coverage with package absent; G3 detected Eicar-Test-Signature and installed only after INSTALL approval with the expected postinst marker; G4 completed a no-detection scan and installed only after INSTALL approval; G5 verified install/disable/enable/uninstall recovery and unrelated configuration preservation; all five containers were removed. The archived records cited by N6 are not present in the current environment. node-1.3:N5's APT unit-test result was reviewed as supplemental only; it does not substitute for these guest scenarios.

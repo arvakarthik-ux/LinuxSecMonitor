@@ -2,7 +2,7 @@
 
 Run one scenario per fresh guest snapshot with
 LINUXSECMONITOR_RUN_REAL_APT=1,
-LINUXSECMONITOR_REAL_APT_SCENARIO=safe-approve|finding-cancel|finding-approve|incomplete-block|lifecycle,
+LINUXSECMONITOR_REAL_APT_SCENARIO=safe-approve|clean-cancel|finding-cancel|finding-approve|incomplete-block|lifecycle,
 LINUXSECMONITOR_SYSTEM_CLI=/root-owned/runtime/bin/linuxsecmonitor, and
 LINUXSECMONITOR_APT_EVIDENCE_DIR=/root-owned/evidence.
 """
@@ -36,6 +36,10 @@ _DPKG_QUERY = Path("/usr/bin/dpkg-query")
 _STRACE = Path("/usr/bin/strace")
 _DISPOSABLE_MARKER = Path("/run/linuxsecmonitor-disposable-apt-test")
 _APT_PROMPT = b"Type exactly INSTALL to continue;"
+_APT_CONFIRM_PROMPT = b"Do you want to continue?"
+_EICAR_SIGNATURE = (
+    b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+)
 _MAX_TERMINAL_OUTPUT = 2 * 1024 * 1024
 _TRANSACTION_TIMEOUT = 180
 
@@ -44,6 +48,27 @@ class _AptHarnessTimeout(TimeoutError):
     def __init__(self, output: bytes):
         super().__init__(f"APT transaction exceeded {_TRANSACTION_TIMEOUT} seconds")
         self.output = output
+
+
+def _eicar_signature_names(output_text: str) -> list[str]:
+    normalized_output = output_text.replace("\r\n", "\n")
+    return [
+        match.group(1)
+        for match in re.finditer(
+            r"^Detection: (\S+) at .*/eicar\.txt$",
+            normalized_output,
+            re.MULTILINE,
+        )
+        if "eicar" in match.group(1).casefold()
+    ]
+
+
+def test_eicar_signature_parser_handles_lf_and_crlf() -> None:
+    detection = "Detection: Eicar-Test-Signature at payload/usr/share/doc/eicar.txt"
+    expected = ["Eicar-Test-Signature"]
+
+    assert _eicar_signature_names(f"{detection}\n") == expected
+    assert _eicar_signature_names(f"{detection}\r\n") == expected
 
 
 def _enabled_for(scenario: str) -> bool:
@@ -209,7 +234,8 @@ def _osv_hook_prerequisites() -> None:
 
 
 def _build_fixture(
-    root: Path, package_name: str, *, with_finding: bool, with_incomplete_content: bool = False,
+    root: Path, package_name: str, *, with_finding: bool,
+    with_incomplete_content: bool = False, with_eicar: bool = False,
 ) -> tuple[Path, Path, Path]:
     package_root = root / "pkg"
     control = package_root / "DEBIAN"
@@ -223,6 +249,8 @@ def _build_fixture(
         encoding="utf-8",
     )
     (payload / "README").write_text("Harmless local integration fixture.\n", encoding="utf-8")
+    if with_eicar:
+        (payload / "eicar.txt").write_bytes(_EICAR_SIGNATURE)
     postinst_marker = root / "postinst-ran"
     cron_marker = Path("/etc/cron.d") / f"linuxsecmonitor-e2e-{package_name.removeprefix('linuxsecmonitor-e2e-')}"
     if with_finding:
@@ -245,12 +273,47 @@ def _build_fixture(
     return package, postinst_marker, cron_marker
 
 
+def _verify_apt_plan(package: Path, package_name: str) -> str:
+    simulation = _run(
+        [str(_APT), "-s", "--no-remove", "install", str(package)],
+        timeout=60,
+    )
+    if simulation.returncode != 0:
+        raise RuntimeError(
+            f"APT plan simulation failed with exit status {simulation.returncode}: "
+            f"{simulation.stderr[-1000:]}"
+        )
+    install_lines = [
+        line for line in simulation.stdout.splitlines() if line.startswith("Inst ")
+    ]
+    if (
+        len(install_lines) != 1
+        or not re.match(rf"Inst {re.escape(package_name)}(?:\s|$)", install_lines[0])
+    ):
+        raise RuntimeError(
+            "APT simulation did not plan exactly the fixture package installation: "
+            + "; ".join(install_lines[:10])
+        )
+    if any(line.startswith("Remv ") for line in simulation.stdout.splitlines()):
+        raise RuntimeError("APT simulation unexpectedly planned package removal")
+    if "1 newly installed" not in simulation.stdout or "0 to remove" not in simulation.stdout:
+        raise RuntimeError(
+            "APT simulation summary did not report one installation and zero removals: "
+            + simulation.stdout[-1000:]
+        )
+    return simulation.stdout
+
+
+def _apt_transaction_arguments(package: Path) -> list[str]:
+    return [str(_APT), "--no-remove", "install", str(package)]
+
+
 def _run_apt_with_decision(
     package: Path, trace: Path, decision: str | None,
-) -> tuple[int, bytes, bool, bool]:
+) -> tuple[int, bytes, bool, bool, bool]:
     command = [
         str(_STRACE), "-f", "-qq", "-e", "trace=execve", "-o", str(trace), "--",
-        str(_APT), "-y", "--no-remove", "install", str(package),
+        *_apt_transaction_arguments(package),
     ]
     pid, terminal_fd = pty.fork()
     if pid == 0:
@@ -258,6 +321,7 @@ def _run_apt_with_decision(
         os.execve(command[0], command, _clean_environment())
     output = bytearray()
     decision_sent = False
+    apt_confirmation_sent = False
     deadline = time.monotonic() + _TRANSACTION_TIMEOUT
     child_status: int | None = None
     try:
@@ -274,13 +338,19 @@ def _run_apt_with_decision(
                     output.extend(chunk)
                     if len(output) > _MAX_TERMINAL_OUTPUT:
                         raise RuntimeError("APT terminal output exceeded its evidence size limit")
+                    if not apt_confirmation_sent and _APT_CONFIRM_PROMPT in output:
+                        os.write(terminal_fd, b"y\n")
+                        apt_confirmation_sent = True
                     if decision is not None and not decision_sent and _APT_PROMPT in output:
                         os.write(terminal_fd, decision.encode("ascii") + b"\n")
                         decision_sent = True
             waited, status = os.waitpid(pid, os.WNOHANG)
             if waited == pid:
                 child_status = status
-        return os.waitstatus_to_exitcode(child_status), bytes(output), decision_sent, False
+        return (
+            os.waitstatus_to_exitcode(child_status), bytes(output),
+            decision_sent, False, apt_confirmation_sent,
+        )
     except BaseException:
         try:
             os.killpg(pid, signal.SIGKILL)
@@ -341,6 +411,8 @@ def _transaction_test(
     trace = root / "execve.raw"
     apt_exit: int | None = None
     decision_sent = False
+    apt_confirmation_sent = False
+    apt_plan_simulation = ""
     after_packages: dict[str, str] = {}
     marker_contents: dict[str, str | None] = {}
     cleanup_errors: list[str] = []
@@ -354,9 +426,11 @@ def _transaction_test(
         package, postinst_marker, cron_marker = _build_fixture(
             root, package_name, with_finding=with_finding,
             with_incomplete_content=with_incomplete_content,
+            with_eicar=scenario in {"finding-cancel", "finding-approve"},
         )
         if postinst_marker.exists() or cron_marker.exists():
             raise AssertionError("Fixture maintainer-script markers existed before the transaction")
+        apt_plan_simulation = _verify_apt_plan(package, package_name)
         initial_packages = _package_state()
         initial_config = _apt_configuration_digest()
         trace_fd = os.open(
@@ -378,11 +452,13 @@ def _transaction_test(
 
         apt_version = _run([str(_APT), "--version"]).stdout.splitlines()[0]
         try:
-            apt_exit, transaction_output, decision_sent, timed_out = _run_apt_with_decision(
-                package, trace, decision,
-            )
+            (
+                apt_exit, transaction_output, decision_sent, timed_out,
+                apt_confirmation_sent,
+            ) = _run_apt_with_decision(package, trace, decision)
         except _AptHarnessTimeout as exc:
             apt_exit, transaction_output, decision_sent, timed_out = 124, exc.output, False, True
+            apt_confirmation_sent = _APT_CONFIRM_PROMPT in exc.output
         after_packages = _package_state()
         marker_contents = {
             "postinst": postinst_marker.read_text(encoding="utf-8").strip() if postinst_marker.is_file() else None,
@@ -403,6 +479,11 @@ def _transaction_test(
             "decision_sent": decision_sent,
             "apt_exit_status": apt_exit,
             "apt_timed_out": timed_out,
+            "apt_plan_verified": True,
+            "apt_plan_simulation": apt_plan_simulation,
+            "apt_confirmation_prompt_seen": apt_confirmation_sent,
+            "apt_assume_yes_used": False,
+            "apt_arguments": _apt_transaction_arguments(package),
             "package_state_before": initial_packages.get(package_name, "absent"),
             "package_state_after": after_packages.get(package_name, "absent"),
             "package_state_changes": sorted(
@@ -411,7 +492,9 @@ def _transaction_test(
             ),
             "maintainer_script_markers": marker_contents,
             "hook_report_displayed": "APT Pre-Install-Pkgs protocol version 3 accepted." in output_text,
+            "detected_status_displayed": "Status: detected" in output_text,
             "review_finding_displayed": "startup-persistence-write" in output_text,
+            "eicar_signature_names": _eicar_signature_names(output_text),
             "scan_complete": "Coverage complete: yes" in output_text,
             "scan_incomplete": "Coverage complete: no" in output_text,
             "incomplete_block_displayed": "at least one archive had incomplete coverage" in output_text,
@@ -428,6 +511,7 @@ def _transaction_test(
             ).hexdigest(),
             "apt_config_digest_before": initial_config,
         }
+        report["eicar_signature_detected"] = bool(report["eicar_signature_names"])
         _write_evidence(evidence_dir, evidence_name, report, transaction_output, trace)
 
         if with_incomplete_content:
@@ -451,9 +535,16 @@ def _transaction_test(
             if (
                 not report["scan_complete"]
                 or not report["real_clamav_backend"]
-                or not report["no_detection_status"]
+                or (
+                    scenario in {"finding-cancel", "finding-approve"}
+                    and not report["detected_status_displayed"]
+                )
+                or (
+                    scenario not in {"finding-cancel", "finding-approve"}
+                    and not report["no_detection_status"]
+                )
             ):
-                raise AssertionError("APT did not report a complete real ClamAV scan")
+                raise AssertionError("APT did not report the expected complete real ClamAV scan result")
             if "Transaction vulnerability assessment:" not in output_text:
                 raise AssertionError("APT did not display the transaction vulnerability assessment")
             if release.get("ID", "").lower() == "kali" and not report[
@@ -464,6 +555,11 @@ def _transaction_test(
                 )
             if with_finding and not report["review_finding_displayed"]:
                 raise AssertionError("The expected maintainer-script review lead was not displayed")
+            if scenario in {"finding-cancel", "finding-approve"}:
+                if not report["detected_status_displayed"] or not report["eicar_signature_names"]:
+                    raise AssertionError(
+                        "ClamAV did not report an EICAR-signature detection in the package payload"
+                    )
         if decision == "CANCEL" and not with_incomplete_content:
             if apt_exit == 0 or _installed(package_name):
                 raise AssertionError("APT did not honor cancellation")
@@ -541,6 +637,11 @@ def _transaction_test(
 @pytest.mark.skipif(not _enabled_for("safe-approve"), reason="Select safe-approve in a fresh disposable guest")
 def test_real_apt_safe_package_approval():
     _transaction_test("safe-approve", with_finding=False, decision="INSTALL")
+
+
+@pytest.mark.skipif(not _enabled_for("clean-cancel"), reason="Select clean-cancel in a fresh disposable guest")
+def test_real_apt_clean_package_cancellation_prevents_install():
+    _transaction_test("clean-cancel", with_finding=False, decision="CANCEL")
 
 
 @pytest.mark.skipif(not _enabled_for("finding-cancel"), reason="Select finding-cancel in a fresh disposable guest")

@@ -116,14 +116,32 @@ def log_audit(entry: AuditEntry) -> None
 **Depends**: 3A.1
 **Tier**: mechanical
 
-**Files to Create**:
-- `src/wrapper/commands/git.py` - Git-specific logic
+**Amendment (implemented shape)**: the originally planned
+`src/wrapper/commands/git.py` path is unimplementable as written — a
+`commands/` package would collide with the existing `src/wrapper/commands.py`
+module. The Git-specific logic therefore lives in
+`src/wrapper/git_clone.py` (a pure, side-effect-free `git clone`
+argv/destination parser for Git 2.53 semantics). `scanner/execution_guard.py`
+receives only optional prompt support (`confirm_execution(..., *, prompt=...)`);
+`tests/test_execution_guard.py` receives one focused prompt test.
 
-**Acceptance Gates**:
+**Files to Create**:
+- `src/wrapper/git_clone.py` - Pure Git clone argv/destination parser
+ - `src/wrapper/core.py` (modified) - clone routing, post-clone review, Tier 1 no-repo fix
+ - `scanner/execution_guard.py` (modified) - optional custom prompt parameter
+ - `tests/test_git_integration.py` (modified) - parser plus real local clone workflow tests
+ - `tests/test_execution_guard.py` (modified) - focused custom-prompt test
+
+**Acceptance Gates** (post-clone objective):
 - G1: `git checkout`, `merge`, `pull`, `rebase` classified Tier 1
-- G2: `git clone` triggers post-clone scan
-- G3: `git status`, `log`, `diff` classified Tier 3 (passthrough)
-- G4: Bypass detection for `--no-verify`, absolute paths
+- G2: `git clone` executes first, then is reviewed: unified report displayed,
+  fail-closed on incomplete coverage/scanner errors/changed-during-scan/
+  malware/report hash mismatch, exact `RUN` acceptance against the reviewed
+  snapshot, no approval-manager involvement, no persisted acceptance
+- G3: `git status`, `log`, `diff` classified Tier 2 (warn), `git config`/`init`
+  passthrough; bare/mirror clones are never claimed as reviewable worktrees
+- G4: Bypass detection for `--no-verify`, absolute paths; Tier 1 with no
+  repository context blocks instead of executing
 
 ---
 
@@ -343,8 +361,7 @@ src/wrapper/
 ├── __init__.py
 ├── core.py
 ├── commands.py
-├── commands/
-│   └── git.py
+├── git_clone.py   # 3A.5 (amended): replaces planned commands/git.py
 ├── detection.py
 ├── cache.py
 ├── install.py

@@ -84,8 +84,19 @@ def review_repository_for_execution(
     }
 
 
-def confirm_execution(terminal: TextIO | BinaryIO | None = None) -> bool:
-    """Require an exact interactive RUN confirmation; fail closed without a TTY."""
+def confirm_execution(
+    terminal: TextIO | BinaryIO | None = None,
+    *,
+    prompt: str | None = None,
+) -> bool:
+    """Require an exact interactive RUN confirmation; fail closed without a TTY.
+
+    When ``prompt`` is provided it replaces the default prompt verbatim (the
+    caller owns the wording, e.g. the post-clone snapshot acknowledgement);
+    every other behavior is unchanged: timeout, EOF, interrupt, and anything
+    other than the exact token ``RUN`` fail closed. When ``prompt`` is None
+    the default prompt text is used exactly as before.
+    """
     opened = None
     is_binary = False
     try:
@@ -96,11 +107,15 @@ def confirm_execution(terminal: TextIO | BinaryIO | None = None) -> bool:
         elif hasattr(terminal, "mode") and "b" in getattr(terminal, "mode", ""):
             is_binary = True
 
-        prompt = "Review complete. Type exactly RUN to start the command: "
+        prompt_text = (
+            "Review complete. Type exactly RUN to start the command: "
+            if prompt is None
+            else prompt
+        )
         if is_binary:
-            terminal.write(prompt.encode("utf-8"))
+            terminal.write(prompt_text.encode("utf-8"))
         else:
-            terminal.write(prompt)
+            terminal.write(prompt_text)
         terminal.flush()
 
         try:

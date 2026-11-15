@@ -1342,6 +1342,24 @@ def _run_review_repository(
     ) else 1
 
 
+def _run_wrapper_integration_install(*, stdout: TextIO) -> int:
+    """Install the user-scoped command wrappers required by P2."""
+    try:
+        from src.wrapper.config import WrapperConfig
+        from src.wrapper.install import WrapperInstaller
+        result = WrapperInstaller(WrapperConfig()).install()
+    except Exception as exc:
+        print(f"Wrapper integration install failed: {exc}", file=sys.stderr)
+        return 1
+    lines = [
+        f"Wrapper install: {'succeeded' if result.success else 'failed'}",
+        result.message,
+    ]
+    lines.extend(f"Error: {error}" for error in result.errors)
+    stdout.write("\n".join(lines) + "\n")
+    return 0 if result.success else 1
+
+
 def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
     """Run the CLI and return a process exit status."""
     parser = argparse.ArgumentParser(description="Collect basic Linux system and package inventory data.")
@@ -1387,6 +1405,12 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
               "actions require root; inspect the target paths before use."),
     )
     parser.add_argument(
+        "--wrapper-integration",
+        choices=("install",),
+        metavar="ACTION",
+        help="Install the user-scoped LinuxSecMonitor command wrappers.",
+    )
+    parser.add_argument(
         "command_args", nargs=argparse.REMAINDER,
         help=argparse.SUPPRESS,
     )
@@ -1408,11 +1432,12 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
         safe_command = safe_command[1:]
     selected_modes = sum(bool(mode) for mode in (
         args.scan_deb, args.preinstall_deb, args.apt_preinstall_hook,
-        args.scan_repo, args.review_repository, args.safe_run, args.doctor, args.apt_integration,
+        args.scan_repo, args.review_repository, args.safe_run, args.doctor,
+        args.apt_integration, args.wrapper_integration,
     ))
     if selected_modes > 1:
         parser.error(
-            "--scan-deb, --preinstall-deb, --apt-preinstall-hook, --scan-repo, --review-repository, --safe-run, --doctor, and --apt-integration "
+            "--scan-deb, --preinstall-deb, --apt-preinstall-hook, --scan-repo, --review-repository, --safe-run, --doctor, --apt-integration, and --wrapper-integration "
             "cannot be used together"
         )
     if args.apt_preinstall_hook and (args.json or args.output or args.diagnostics):
@@ -1485,6 +1510,8 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
                           f"Hook: {result['hook_path']}\n"
                           f"State: {result['state_path']}\n")
         return 0 if result["status"] in {"enabled", "disabled", "not_installed"} else 1
+    if args.wrapper_integration:
+        return _run_wrapper_integration_install(stdout=stdout)
     if args.doctor:
         result = collect_diagnostics()
         rendered = (

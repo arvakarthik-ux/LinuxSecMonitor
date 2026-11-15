@@ -36,41 +36,52 @@ class InstallResult:
 
 
 # Wrapper script template
-WRAPPER_TEMPLATE = '''#!/usr/bin/env python3
+WRAPPER_TEMPLATE = '''#!{sys_executable}
+# LinuxSecMonitor managed wrapper v1
 """LinuxSecMonitor wrapper for {command}."""
 
-import os
 import sys
 from pathlib import Path
 
-# Add the wrapper module to path
-wrapper_root = "{wrapper_root}"
-wrapper_dir = "{wrapper_dir}"
-if wrapper_root and wrapper_root not in sys.path:
-    sys.path.insert(0, wrapper_root)
+_RECOVERY = (
+    "Recovery: reinstall with 'python -m pip install linuxsecmonitor' or "
+    "remove the wrappers with 'linuxsecmonitor --wrapper-integration uninstall'."
+)
 
-from src.wrapper.core import CommandWrapper
-from src.wrapper.path import PathManager
+
+def _fail(reason: str) -> int:
+    print(
+        "[LinuxSecMonitor] the {command} wrapper could not start: "
+        + reason
+        + "\\nThis is the LinuxSecMonitor command wrapper; it never falls back "
+        "to executing the unwrapped command.\\n"
+        + _RECOVERY,
+        file=sys.stderr,
+    )
+    return 127
+
 
 def main():
-    # Get the command name from the script name
-    # Script is named lsmonitor-<command> or symlinked as <command>
-    script_name = Path(__file__).name
-    if script_name.startswith("lsmonitor-"):
-        command = script_name[10:]  # Remove "lsmonitor-" prefix
-    else:
-        # Fallback: use the basename (symlink name)
-        command = script_name
+    try:
+        from src.wrapper.core import CommandWrapper
+        from src.wrapper.path import PathManager
 
-    # Build argv: command + all arguments passed to wrapper
-    argv = [command] + sys.argv[1:]
+        # Derive the wrapper directory from this script's own location so no
+        # checkout path is ever baked into the generated shim.
+        script_path = Path(__file__).resolve()
+        script_name = script_path.name
+        if script_name.startswith("lsmonitor-"):
+            command = script_name[10:]  # Remove "lsmonitor-" prefix
+        else:
+            command = script_name  # Fallback: basename (symlink name)
 
-    # Create path manager for trusted executable resolution
-    path_manager = PathManager(Path(wrapper_dir))
+        argv = [command] + sys.argv[1:]
+        path_manager = PathManager(script_path.parent)
+        wrapper = CommandWrapper(command, argv, path_manager=path_manager)
+        return wrapper.execute()
+    except Exception as exc:
+        return _fail(type(exc).__name__ + ": " + str(exc))
 
-    # Create and execute wrapper
-    wrapper = CommandWrapper(command, argv, path_manager=path_manager)
-    return wrapper.execute()
 
 if __name__ == "__main__":
     sys.exit(main())
@@ -170,9 +181,6 @@ class WrapperInstaller:
         """Install wrapper scripts for all configured commands."""
         errors = []
 
-        # Determine wrapper root for the template
-        wrapper_root = str(Path(__file__).parent.parent.parent)
-
         for command in self.config.wrapper_commands:
             wrapper_path = self.path_manager.get_wrapper_path(command)
             command_path = self.path_manager.get_command_path(command)
@@ -185,8 +193,7 @@ class WrapperInstaller:
                 with wrapper_path.open("w") as f:
                     f.write(WRAPPER_TEMPLATE.format(
                         command=command,
-                        wrapper_root=wrapper_root,
-                        wrapper_dir=str(self.wrapper_dir)
+                        sys_executable=sys.executable,
                     ))
 
                 # Make executable

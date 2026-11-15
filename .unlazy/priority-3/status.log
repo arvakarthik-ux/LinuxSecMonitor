@@ -1,0 +1,3 @@
+3A.5 amendment: post-clone review ownership expanded
+3A.5 verification complete: G1-G16 fresh MET; focused 155 passed/1 skipped; directly affected 122 passed; remaining wrapper+preexec regression 184 passed; post-implementation audit approved; scope-wide reverify partial outside 3A.5
+priority-3 full-scope reverify 2026-11-09: 48/48 fresh MET (3A.1 9, 3A.2 9, 3A.3 5, 3A.4 9 incl G4, 3A.5 16); scope --reverify exit 0; 3A.5 G1-G16 current; APT guest validation remains separate

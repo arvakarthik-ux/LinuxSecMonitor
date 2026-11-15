@@ -15,11 +15,11 @@ Decide before fan-out:
 - Wave policy: single wave for all leaves (independent verification)
 - Toolchain: Python 3.11+, pytest, clamscan (for integration), apt-config (for lifecycle validation)
 - Conventions: fail-closed parsing, root-owned paths, _apt sandbox user, atomic writes, terminal escape sequences
-- Manual review: disposable guest integration verification (requires physical Kali/Debian/Ubuntu guest)
+- Manual review: disposable guest integration verification (requires a physical/virtual Kali/Debian/Ubuntu guest, or — when VM/KVM is unavailable — a fresh isolated local Docker/Podman container from a local Kali/Debian/Ubuntu image with no host mounts, no privileged mode, one container per scenario, rollback by removal, an unchanged base image, and evidence recorded in status.log)
 
 ## Current contract inventory
 
-Contract revision: 1. Before fan-out, reread the original request and current amendments. Record every independently omittable required outcome and every constraint that changes acceptance; do not copy credentials, private text, or unrelated context.
+Contract revision: 4. Before fan-out, reread the original request and current amendments. Record every independently omittable required outcome and every constraint that changes acceptance; do not copy credentials, private text, or unrelated context.
 
 | ID | Required outcome or constraint | Owner | Observing gate or manual review | Disposition | Revision |
 |---|---|---|---|---|---|
@@ -39,7 +39,17 @@ Contract revision: 1. Before fan-out, reread the original request and current am
 | C14 | CLI --apt-preinstall-hook dispatches to run_apt_preinstall_hook with stdin/stdout | leaf-3.1 | G3.1.1 | ACTIVE | 1 |
 | C15 | CLI --apt-integration {status,install,enable,disable,uninstall} works with JSON/text output | leaf-3.1 | G3.1.2 | ACTIVE | 1 |
 | C16 | End-to-end transaction blocks on incomplete coverage, error, unavailable, detection, mismatch | leaf-3.2 | G3.2.1 | ACTIVE | 1 |
-| C17 | Real disposable guest verification (Kali/Debian/Ubuntu) confirms hook executes in APT | leaf-3.3 | G3.3.1 (manual) | ACTIVE | 1 |
+| C17 | Real disposable guest verification (Kali/Debian/Ubuntu) confirms hook executes in APT | leaf-3.3 | G3.3.1 (manual) | ACTIVE | 2 |
+
+**Revision 2 amendment (2026-11-09):** The user explicitly reopened leaf 1.3.3 / manual gate G3.3.1 after its prior ABANDONED state. No documented Unlazy reopen procedure exists, so this amendment records the reopening without creating a new leaf or scope identifier. The original ABANDON reason is preserved verbatim in `status.log`. The leaf state moves from ABANDONED to IN-FLIGHT pending parent reverify; REOPENED is an event, not a state. Guest verification used a fresh isolated Docker Kali guest basis, and an independent `lsm-security-auditor` audit returned APPROVE WITH CONDITIONS (documentation/gate amendments only, no product security defect). No scope expansion. After parent node-1.3 reverify returned `ALL MET` and the lease was released on 2026-11-09, leaf 1.3.3 is VERIFIED; root GATES N1/N5/N6 remain pending only for pre-existing node-1.1/1.2 manual lease/outcome gates, not this leaf.
+
+**Revision 3 amendment (2026-11-09):** Historical lease-release evidence for leaf-1.1.1, leaf-1.1.2, leaf-1.1.3, leaf-1.2.1, leaf-1.2.2, and leaf-1.2.3 is unavailable. The recorded search found no authentic lease files or release events; absence is not proof of release. No release is inferred, reconstructed, or fabricated. The release-recording rule above leaves node-1.1:N1.5, node-1.2:N1.5, and root N5 unmet, and prevents root N1 from reaching ALL MET. Node-1.1:N1.6, node-1.2:N1.6, and root N6 remain unmet and unrecorded. The honest branch disposition is ABANDONED with a visible handoff, not VERIFIED and not complete. This disposition changes no contract row C1-C17, leaf state, gate checkbox, gate evidence, or historical ABANDON record. ABANDONED does not mean the APT hook/lifecycle scope or product is complete.
+
+**Revision 4 amendment (2026-11-12):** The user explicitly authorized this scope-level exception to P1's recorded terminal abandonment, reopening P1 solely for fresh verification under the existing acceptance criteria. The prior root `ABANDON:` record and full handoff wording are preserved verbatim as `HISTORY` in `GATES.md` and `status.log`; that historical record is no longer operative for this authorized verification cycle. P1 is REOPENED FOR FRESH VERIFICATION and remains incomplete. No C1-C17 acceptance criterion, gate ID, or dependency is changed; this amendment itself provides no gate evidence and claims no gate met.
+
+The exact outstanding gates are `node-1.1:N1.5`, `node-1.1:N1.6`, `node-1.2:N1.5`, `node-1.2:N1.6`, root `GATES.md:N1`, `GATES.md:N5`, and `GATES.md:N6`. In addition, `leaf-1.3.3:G3.3.1` is reopened and unmet pending resolution of the guest cleanup/rollback condition: the leaf records that its seven scenario containers and base container were still running. No container was removed by this amendment. The prior guest results remain historical and are not counted as complete evidence until the cleanup condition is resolved under separate authorization or fresh guest evidence satisfies the existing procedure.
+
+Recovery order, with no scope expansion and only in a separately authorized verification task: (1) in sequential order, freshly claim and reverify leaves 1.1.1–1.1.3 and 1.2.1–1.2.3; their declared ownership overlaps, so do not run them concurrently. (2) At each parent, reverify its child ledgers and integration outcomes and complete the branch-level manual review for N1.6. Only after that parent verification and review, release each exact newly claimed leaf lease and append its release event; these prospective events can satisfy the prospective release requirement in N1.5, but are not and must never be represented as the missing historical releases. Record N1.5 from those new events, then reverify the node. (3) Resolve the leaf-1.3.3 cleanup condition without changing its acceptance criteria, then reverify node-1.3 and complete the root-level manual review. (4) Only after all three nodes and their manual outcomes are ready, reverify root N1/N5/N6 and the remaining root gates. A gate that cannot be satisfied by fresh evidence under its unchanged criterion must remain unmet and be returned for a separate user decision; do not reinterpret historical evidence or release records.
 
 Use stable ids. On an amendment, increment the revision and reconcile every affected row before dispatch or completion credit. `ACTIVE` is complete only with a current owner and observation. `ABANDONED`, `DEFERRED`, and `OWNER_DECISION` are honest non-completion; only explicit user authority may use `REMOVED_BY_USER`.
 
@@ -87,7 +97,7 @@ This is the single authoritative PLAN table for leaf operation. It is authoritat
 | 1.2.3 | scanner/apt_lifecycle.py (_atomic_write, _read_state, integration_status), tests/test_apt_lifecycle.py (atomic/state tests) | - | mechanical | 1 | VERIFIED |
 | 1.3.1 | main.py (CLI --apt-preinstall-hook, --apt-integration), tests/test_apt_hook_cli.py, tests/test_main.py (apt CLI tests) | - | mechanical | 1 | VERIFIED |
 | 1.3.2 | scanner/apt_hook.py (run_apt_preinstall_hook full flow), tests/test_apt_hook.py (full transaction tests) | - | mechanical | 1 | VERIFIED |
-| 1.3.3 | tests/integration/test_apt_preinstall_guest.py, README.md (guest verification notes) | - | judgment | 1 | ABANDONED |
+| 1.3.3 | tests/integration/test_apt_preinstall_guest.py, README.md (guest verification notes) | - | judgment | 1 | VERIFIED |
 
 `Owns` is a derived planning mirror of the complete glob set in the leaf ledger. The ledger's `OWNS:` header is the command-time authority read by `--claim`. Normalize both into sets and require equality before marking the row `READY` and again before each claim. On disagreement, fail closed, correct and log the plan or ledger, and recheck; never guess ownership. A successful claim does not prove the mirror agreed with the ledger.
 
