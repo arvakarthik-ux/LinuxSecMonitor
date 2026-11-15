@@ -196,6 +196,11 @@ class TestGetShellName:
         shell = get_shell_name()
         assert shell in ("bash", "zsh", "fish", "opencode", "sh")
 
+    def test_get_shell_name_fallback_without_psutil(self, monkeypatch):
+        monkeypatch.delenv("SHELL", raising=False)
+        with patch("builtins.__import__", side_effect=ImportError):
+            assert get_shell_name() == "bash"
+
 
 class TestVerifyNoRecursion:
     """Tests for recursion prevention."""

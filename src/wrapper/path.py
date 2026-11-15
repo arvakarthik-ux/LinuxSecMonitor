@@ -265,7 +265,9 @@ def get_shell_name() -> str:
         import psutil
         parent = psutil.Process(os.getppid())
         return Path(parent.name()).name.lower()
-    except (ImportError, psutil.NoSuchProcess):
+    except ImportError:
+        pass
+    except psutil.NoSuchProcess:
         pass
 
     return "bash"  # Default fallback
