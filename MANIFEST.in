@@ -1,0 +1,2 @@
+include lsm_build_backend.py
+include MANIFEST.in

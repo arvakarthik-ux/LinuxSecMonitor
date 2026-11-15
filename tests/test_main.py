@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from p4_1_home_rc_guard import guard_primary_home_rc
 import main
 from scanner.package_scanner import Package, PackageScanResult
 from scanner.malware_scanner import MalwareAssessment, MalwareDetection
@@ -2328,3 +2329,104 @@ def test_build_result_uses_internal_source_metadata_without_changing_inventory_j
     assert result["package_scan"]["packages"] == [
         {"name": "openssh-server", "version": "1:9.2p1-2"}
     ]
+
+
+def test_wrapper_integration_status_text_reports_core_fields(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    output = StringIO()
+
+    exit_code = main.main(["--wrapper-integration", "status"], stdout=output)
+
+    text = output.getvalue()
+    assert exit_code == 0
+    assert "Shell: bash" in text
+    assert "Wrapper directory:" in text
+    assert str(tmp_path / ".local" / "bin") in text
+    assert "Shim status:" in text
+    assert "Shell RC file:" in text
+    assert "Shell RC marker:" in text
+    assert "PATH precedence:" in text
+    assert "git resolution:" in text
+
+
+def test_wrapper_integration_status_json_includes_reported_fields(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    output = StringIO()
+
+    exit_code = main.main(["--wrapper-integration", "status", "--json"], stdout=output)
+
+    report = json.loads(output.getvalue())
+    assert exit_code == 0
+    assert report["shell"] == "bash"
+    assert report["wrapper_dir"] == str(tmp_path / ".local" / "bin")
+    assert "rc_configured" in report
+    assert report["rc_file"] == str(tmp_path / ".bashrc")
+    assert "shim_status" in report
+    assert "path_precedence" in report
+    assert "git_resolution" in report
+
+
+def test_wrapper_integration_rejects_unknown_action():
+    with pytest.raises(SystemExit) as error:
+        main.main(["--wrapper-integration", "bogus"], stdout=StringIO())
+    assert error.value.code == 2
+
+
+def test_wrapper_integration_rejects_conflicting_modes(tmp_path):
+    with pytest.raises(SystemExit) as error:
+        main.main(
+            ["--wrapper-integration", "status", "--scan-repo", str(tmp_path)],
+            stdout=StringIO(),
+        )
+    assert error.value.code == 2
+
+    with pytest.raises(SystemExit) as error:
+        main.main(
+            ["--wrapper-integration", "status", "--output", "x.json"],
+            stdout=StringIO(),
+        )
+    assert error.value.code == 2
+
+    with pytest.raises(SystemExit) as error:
+        main.main(
+            ["--wrapper-integration", "install", "--diagnostics"],
+            stdout=StringIO(),
+        )
+    assert error.value.code == 2
+
+
+def test_wrapper_integration_fails_closed_when_install_package_is_missing(
+    monkeypatch, capsys,
+):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "src.wrapper.install", None)
+
+    exit_code = main.main(["--wrapper-integration", "status"], stdout=StringIO())
+
+    assert exit_code == 1
+    assert "Recovery" in capsys.readouterr().err
+
+
+def test_wrapper_integration_fails_closed_when_install_module_is_broken(
+    monkeypatch, capsys,
+):
+    import builtins
+
+    original_import = builtins.__import__
+
+    def broken_import(name, *args, **kwargs):
+        if name == "src.wrapper.install":
+            raise RuntimeError("simulated broken wrapper module")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", broken_import)
+    exit_code = main.main(["--wrapper-integration", "status"], stdout=StringIO())
+
+    assert exit_code == 1
+    error = capsys.readouterr().err
+    assert "simulated broken wrapper module" in error
+    assert "Recovery" in error
+    assert "Traceback" not in error

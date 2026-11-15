@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from p4_1_home_rc_guard import guard_primary_home_rc
 from src.wrapper.config import WrapperConfig, load_config
 
 

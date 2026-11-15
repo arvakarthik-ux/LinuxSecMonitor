@@ -1342,21 +1342,117 @@ def _run_review_repository(
     ) else 1
 
 
-def _run_wrapper_integration_install(*, stdout: TextIO) -> int:
-    """Install the user-scoped command wrappers required by P2."""
+def _render_wrapper_status_text(report: dict) -> str:
+    """Render every status field as plain text (field coverage for the CLI)."""
+    precedence = report.get("path_precedence") or {}
+    git_info = report.get("git_resolution") or {}
+    lines = [
+        f"Shell: {report.get('shell')}",
+        f"Wrapper directory: {report.get('wrapper_dir')} "
+        + ("(exists)" if report.get("wrapper_dir_exists") else "(missing)"),
+        f"Shim status: {report.get('shim_status')}",
+        f"Shell RC file: {report.get('rc_file')}",
+        "Shell RC marker: "
+        + ("present" if report.get("rc_configured") else "absent")
+        + (
+            f" (error: {report['rc_error']})"
+            if report.get("rc_error") else ""
+        ),
+    ]
+    for entry in report.get("wrappers", []):
+        lines.append(
+            f"  {entry.get('command')}: shim={entry.get('shim_path')} "
+            f"[{entry.get('shim_state')}] link={entry.get('path_link')} "
+            + ("[present]" if entry.get("path_link_present") else "[missing]")
+        )
+    lines.extend([
+        "PATH precedence: "
+        f"index={precedence.get('index')} "
+        f"in_path={precedence.get('in_path')} "
+        f"ahead_of_system_dirs={precedence.get('ahead_of_system_dirs')}",
+        "git resolution: "
+        f"{git_info.get('path')} "
+        f"(via wrapper: {'yes' if git_info.get('via_wrapper') else 'no'})",
+        f"Installed wrappers: {report.get('installed_wrappers')}",
+        f"Missing wrappers: {report.get('missing_wrappers')}",
+        f"Total commands: {report.get('total_commands')}",
+    ])
+    if report.get("recovery"):
+        lines.append(f"Recovery: {report['recovery']}")
+    return "\n".join(lines)
+
+
+def _run_wrapper_integration(action: str, *, json_output: bool, stdout: TextIO) -> int:
+    """Install, inspect, or remove the user-scoped LinuxSecMonitor wrapper.
+
+    The wrapper package is imported lazily so a missing or broken
+    installation fails closed with a recovery hint instead of a traceback.
+    """
     try:
         from src.wrapper.config import WrapperConfig
         from src.wrapper.install import WrapperInstaller
-        result = WrapperInstaller(WrapperConfig()).install()
     except Exception as exc:
-        print(f"Wrapper integration install failed: {exc}", file=sys.stderr)
+        print(
+            f"Wrapper integration {action} failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        print(
+            "The LinuxSecMonitor wrapper package is missing or broken; "
+            "no changes were made.",
+            file=sys.stderr,
+        )
+        print(
+            "Recovery: reinstall with 'python -m pip install linuxsecmonitor' "
+            "or remove the shims with "
+            "'linuxsecmonitor --wrapper-integration uninstall'.",
+            file=sys.stderr,
+        )
         return 1
-    lines = [
-        f"Wrapper install: {'succeeded' if result.success else 'failed'}",
-        result.message,
-    ]
-    lines.extend(f"Error: {error}" for error in result.errors)
-    stdout.write("\n".join(lines) + "\n")
+
+    installer = WrapperInstaller(WrapperConfig())
+
+    if action == "status":
+        try:
+            report = installer.status()
+        except Exception as exc:
+            print(f"Wrapper integration status failed: {exc}", file=sys.stderr)
+            return 1
+        stdout.write(
+            json.dumps(report, indent=2) + "\n" if json_output
+            else _render_wrapper_status_text(report) + "\n"
+        )
+        return 0
+
+    try:
+        result = installer.install() if action == "install" else installer.uninstall()
+    except Exception as exc:
+        print(f"Wrapper integration {action} failed: {exc}", file=sys.stderr)
+        return 1
+
+    if json_output:
+        payload = {
+            "action": action,
+            "success": result.success,
+            "message": result.message,
+            "errors": result.errors,
+            "modified_files": [str(path) for path in result.modified_files],
+            "backed_up_files": [str(path) for path in result.backed_up_files],
+            "retained_files": [str(path) for path in result.retained_files],
+        }
+        stdout.write(json.dumps(payload, indent=2) + "\n")
+    else:
+        lines = [
+            f"Wrapper {action}: {'succeeded' if result.success else 'failed'}",
+            result.message,
+        ]
+        lines.extend(f"Error: {error}" for error in result.errors)
+        lines.extend(
+            f"Left in place: {path}" for path in result.retained_files
+        )
+        lines.extend(
+            f"Modified: {path}" for path in result.modified_files
+        )
+        stdout.write("\n".join(lines) + "\n")
     return 0 if result.success else 1
 
 
@@ -1406,9 +1502,13 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
     )
     parser.add_argument(
         "--wrapper-integration",
-        choices=("install",),
+        choices=("status", "install", "uninstall"),
         metavar="ACTION",
-        help="Install the user-scoped LinuxSecMonitor command wrappers.",
+        help=("Show or manage the user-scoped LinuxSecMonitor command wrapper "
+              "(supported shells: bash, zsh, fish; no root required). If the "
+              "installed package is missing or broken, recover with "
+              "'python -m pip install linuxsecmonitor' or remove the shims "
+              "with 'linuxsecmonitor --wrapper-integration uninstall'."),
     )
     parser.add_argument(
         "command_args", nargs=argparse.REMAINDER,
@@ -1423,6 +1523,8 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
         parser.error("--output requires --json")
     if args.apt_integration and (args.output or args.diagnostics):
         parser.error("--apt-integration supports standard output only; --output and --diagnostics are not applicable")
+    if args.wrapper_integration and (args.output or args.diagnostics):
+        parser.error("--wrapper-integration supports standard output only; --output and --diagnostics are not applicable")
     if args.include_generated and not (args.scan_repo or args.review_repository or args.safe_run):
         parser.error("--include-generated requires --scan-repo, --review-repository, or --safe-run")
     if args.command_args and not args.safe_run:
@@ -1511,7 +1613,9 @@ def main(argv: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
                           f"State: {result['state_path']}\n")
         return 0 if result["status"] in {"enabled", "disabled", "not_installed"} else 1
     if args.wrapper_integration:
-        return _run_wrapper_integration_install(stdout=stdout)
+        return _run_wrapper_integration(
+            args.wrapper_integration, json_output=args.json, stdout=stdout,
+        )
     if args.doctor:
         result = collect_diagnostics()
         rendered = (

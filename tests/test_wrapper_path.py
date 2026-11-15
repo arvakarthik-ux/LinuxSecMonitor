@@ -9,6 +9,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+from p4_1_home_rc_guard import guard_primary_home_rc
 from src.wrapper.path import PathManager, PathResolution, find_shell_rc_file, get_shell_name
 
 
@@ -192,9 +193,9 @@ class TestGetShellName:
 
     def test_get_shell_name_fallback(self, monkeypatch):
         monkeypatch.delenv("SHELL", raising=False)
-        # Should fallback to a known shell (bash, zsh, fish, or current)
+        # Fallback detection must not expose unsupported parent processes.
         shell = get_shell_name()
-        assert shell in ("bash", "zsh", "fish", "opencode", "sh")
+        assert shell in ("bash", "zsh", "fish")
 
     def test_get_shell_name_fallback_without_psutil(self, monkeypatch):
         monkeypatch.delenv("SHELL", raising=False)

@@ -263,10 +263,12 @@ def get_shell_name() -> str:
     # Fallback: check parent process
     try:
         import psutil
-        parent = psutil.Process(os.getppid())
-        return Path(parent.name()).name.lower()
     except ImportError:
-        pass
+        return "bash"
+    try:
+        parent_shell = Path(psutil.Process(os.getppid()).name()).name.lower()
+        if parent_shell in {"bash", "zsh", "fish"}:
+            return parent_shell
     except psutil.NoSuchProcess:
         pass
 
